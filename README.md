@@ -1,164 +1,94 @@
-# Revora — PDF Düzenleyici
+<p align="center">
+  <img src="assets/revora.png" width="128" alt="Revora PDF logo">
+</p>
 
-PDF içindeki yazıları, orijinal font/boyut/kalınlık/opaklığı koruyarak (Windows'ta
-zaten kurulu olan gerçek font dosyalarını kullanarak) düzenlemenizi; çizgi ve
-tabloları fareyle yönetmenizi; sayfa, filigran ve form işlemlerini yapmanızı sağlar.
+<h1 align="center">Revora PDF</h1>
 
-## Çalıştırma
+<p align="center">
+  A Windows PDF editor that edits the <b>existing</b> text of a PDF with its original fonts.<br>
+  Offline, private, open source.
+</p>
 
-`run.bat`'e çift tıklayın (ya da komut satırında `python main.py`). Bir PDF'i
-`run.bat`'in ya da açık pencerenin üzerine sürükleyip bırakarak da açabilirsiniz.
+<p align="center">
+  <a href="https://revorapdf.com">revorapdf.com</a> ·
+  <a href="README.tr.md">Türkçe</a> ·
+  <a href="LICENSE">AGPL-3.0</a>
+</p>
 
-İlk kurulumda bir kez: `pip install -r requirements.txt`
+---
 
-Üstteki üç mod: **Metin** · **Çizgi / Kutu** · **Yeni metin**.
+Most free PDF tools "edit" text by covering it with a white box and typing on top.
+Revora changes the text itself: it finds the font the PDF uses among the fonts installed
+in Windows and rewrites the text with the same font, size, weight, color and opacity.
 
-## 1) Metin düzenleme (Metin modu)
+## Features
 
-- Bir yazıya **tıklayın** → kırmızı çerçeveyle seçilir, sağ panele gelir.
-- **Tutup sürükleyin** → yazı taşınır. Sürüklerken **Shift** basılıysa yalnızca
-  yatay ya da dikey gider. İnce ayar için **ok tuşları** (1 pt, Shift ile 5 pt).
-- Yeni yazıyı sağdaki kutuya yazıp **Değişikliği uygula** (ya da **Ctrl+Enter**).
-  Kutuda **Enter** yeni satır açar — **çok satırlı** metin artık doğru yazılır;
-  satırlar arası mesafe "Satır aralığı" ile ayarlanır.
-- **Opaklık**: yarı saydam yazılar (ör. filigranlar) düzenlenirken orijinal
-  saydamlığı korunur; isterseniz değiştirebilirsiniz.
-- **Delete** → seçili yazıyı siler (alttaki/üstteki yazılara dokunmaz).
-- **Çift tık** → yazıyı doğrudan düzenlemeye başlar. Sağ tık → menü.
+**Text**
+- Click any text to edit it, drag to move it, rotate it, change its opacity
+- Multi-line text with line spacing; add new text anywhere on the page
+- Deleting a piece of text leaves the text above and below it untouched
 
-Dev, eğik filigranlar artık yalnızca kendi harflerinin üzerine tıklayınca
-seçilir; altındaki tablo yazılarına tıklamak onları seçer.
+**Lines and tables**
+- Select table lines as real objects: move, resize, bend, recolor, make dashed
+- Box-select a whole table grid and move it at once; new lines snap to corners
 
-## 2) Çizgi / Kutu modu (tablolar, çerçeveler)
+**Markup** (stays editable after saving, also shows correctly in other PDF readers)
+- Arrows, boxes, circles, notes with shadows/outlines, numbered badges
+- Pen and highlighter (the highlighter snaps to words and creates real PDF highlights)
+- Magnifier / detail view, eraser, your own note templates
+- Signatures: draw once or load a photo of your paper signature (background removed)
+- Images, logos and stamps with rotation
+- Blur that **really removes** the text underneath (redaction), not just covers it
 
-Çizgiler tek tek, gerçek nesneler olarak düzenlenir — beyaz kutu boyanmaz,
-renk/kalınlık/kesiklilik korunur.
+**Pages and documents**
+- Reorder pages by dragging thumbnails, rotate, delete, duplicate, insert blank pages
+- Insert pages from another PDF, merge and split PDFs
+- Watermarks, form filling, OCR for scanned pages (requires the free Tesseract)
+- Images → PDF (keeps JPEG quality, fixes phone photo orientation)
+- PDF pages → PNG/JPG (up to 600 dpi), extract embedded photos at full resolution
 
-**Seç aracı:**
-- Bir çizgiye **tıklayın** → seçilir (fareyle üzerine gelince vurgulanır).
-- **Shift+tık** → seçime ekle/çıkar.
-- Boş bir yerden **sürükleyerek kutu çizin** → kutunun tamamen içinde kalan tüm
-  çizgiler seçilir (bir tablonun tüm ızgarası gibi). **Ctrl+A**: sayfadaki hepsi.
-- Seçimi **sürükleyerek taşıyın** (ızgara çizgilerinin arasındaki boşluktan da
-  tutabilirsiniz). Shift: yalnızca yatay/dikey.
-- **Tutamaçlar** (küçük kareler) ile boyutlandırın. Tek bir çizgide iki ucu
-  ayrı ayrı sürüklenir; yatay/dikey çizgi yatay/dikey kalır (Alt: serbest).
-- Sağ panelden koordinatları elle girebilir, **kalınlık / renk / kesikli**
-  stilini değiştirebilirsiniz. **Delete** siler.
+**General**
+- Works fully offline: no account, no cloud, your files never leave your computer
+- English and Turkish interface, dark theme
+- Undo/redo, zoom up to 800%, remembers the last page of each file
 
-**Çizgi / Dikdörtgen araçları:** sürükleyerek yeni çizgi ya da dikdörtgen
-çizin. Uçlar yakındaki çizgi köşelerine ve çizgilerin üzerine **yapışır**
-(turuncu halka), neredeyse yatay/dikey çizgiler otomatik düzeltilir.
-**Esc** ile Seç aracına dönülür.
+## Download
 
-## 3) Boş alana yeni metin (Yeni metin modu)
+Revora PDF will be available on the **Microsoft Store**. Store purchases support the
+development; you can also build it yourself from this source code (see below).
 
-Sayfada bir yere tıklayın → yeşil işaretçi çıkar. Yazdıkça **önizleme sayfada
-görünür**. İşaretçiyi fareyle sürükleyerek ya da ok tuşlarıyla konumlayın,
-yazı tipi/boyut/renk/opaklık seçin, **Ctrl+Enter** ile ekleyin.
+## Build from source
 
-## 4) İşaretle modu (ok, kalem, vurgu, numara, imza...)
+Requirements: Windows 10/11, [Python](https://www.python.org/) 3.11 or newer.
 
-Üstteki çubuktan bir araç seçin; alt satırda o aracın (ya da seçili nesnenin)
-ayarları çıkar. Eklenen her şey ayrı bir nesnedir: kaydedip açtıktan sonra da
-seçilip taşınabilir, boyutlandırılabilir, silinebilir. Son kullanılan ayarlar
-hatırlanır.
+```bash
+pip install -r requirements.txt
+python main.py
+```
 
-- **Ok, Çizgi, Kutu, Daire, Not** — sürükleyerek çizin; tutamaçlarla düzenleyin.
-- **Kalem (P)** — serbest çizim; titreme yumuşatılır. Shift: düz çizgi.
-- **Fosforlu kalem (H)** — yazının üstünden başlarsanız kelimelere oturur ve
-  gerçek bir PDF vurgusu olur (Adobe/Edge'de de vurgu olarak görünür). Türü
-  çubuktan seçilir: **Vurgu / Altı çizili / Üstü çizili**. Tek tık: tek kelime.
-  Boş yerde serbest fosforlu çizer (alttaki yazı soluklaşmaz).
-- **Numara (1)** — her tıklamada sıradaki numaralı rozet (1, 2, 3...).
-  Seçili rozetin numarası, boyutu ve renkleri çubuktan değişir.
-- **Silgi (E)** — üstünden geçtiğiniz işaretlemeler kırmızıyla gösterilir,
-  bırakınca silinir (tek Ctrl+Z ile geri gelir).
-- **Büyüteç (M), Bulanıklaştır (B)** — detay görünümü ve güvenli karartma.
-- **İmza (S)** — imzanızı bir kez fareyle atın (ya da kâğıttaki imzanın
-  fotoğrafını yükleyin, beyaz arka planı kaldırılır); kaydedilir. Sonra listeden
-  tek tıkla sayfaya koyarsınız.
-- **Görüntü ekle (G)** — logo, kaşe, fotoğraf. Köşeden boyutlandırınca oran
-  korunur (Shift: serbest).
+Or double-click `run.bat`.
 
-## 5) Sayfa işlemleri
+To build the installer (`installer\Revora_Kurulum.exe`) run `build_exe.bat`.
+It needs [Inno Setup](https://jrsoftware.org/isdl.php) installed.
 
-Soldaki küçük resimlerde fareyle bir sayfanın **üstüne gelin**: altında
-**+** (arkasına boş sayfa), **sola / sağa döndür** ve **sil** düğmeleri çıkar.
-Listenin üstünde **çoğalt**, **boş sayfa ekle** ve **başka PDF'ten sayfa ekle**
-düğmeleri var. Tüm işlemler için **sağ tık** ya da üstteki **Sayfa** menüsü.
-Küçük resimleri **sürükleyerek** sayfa sırasını değiştirebilirsiniz.
+OCR is optional and needs [Tesseract](https://github.com/UB-Mannheim/tesseract/wiki).
 
-## 6) PDF İşlemleri menüsü
+## Translations
 
-- **PDF Birleştir / PDF Ayır** — ayrı pencerelerde (önceki gibi).
-- **Filigran ekle** — metin, yazı tipi, boyut, açı, renk, opaklık; tüm
-  sayfalara, bu sayfaya ya da bir aralığa (ör. `1-3, 5`).
-- **Form doldur** — PDF'te doldurulabilir form alanları varsa hepsi bir
-  listede açılır (metin, onay kutusu, açılır liste).
-- **OCR** — taranmış (resim) sayfalardaki yazıyı tanır ve görünmez bir metin
-  katmanı ekler: sayfa aynı görünür ama metin seçilebilir/aranabilir olur.
-  Bunun için ücretsiz **Tesseract** programının kurulu olması gerekir
-  (program ilk kullanımda nasıl kurulacağını gösterir).
+Interface texts are in `locales/` (the key is the Turkish source text).
+`python tools/i18n_check.py` reports missing translations;
+`python tools/i18n_check.py --template de-DE` creates a template for a new language.
 
-## 7) Kaydetme ve geri alma
+## License
 
-- **Ctrl+S** kaydet (ilk seferde orijinalin üzerine yazmak için onay ister),
-  **Ctrl+Shift+S** farklı kaydet.
-- **Ctrl+Z** geri al, **Ctrl+Y** yinele (son 30 adım).
-- Kaydedilmemiş değişiklik varken pencere başlığında **•** görünür; kapatırken
-  ya da başka dosya açarken sorulur.
+Revora PDF is free software, licensed under the
+[GNU Affero General Public License v3.0](LICENSE).
+It is provided "as is", without any warranty.
 
-## 8) Yakınlaştırma / gezinme
+It is built on [PyMuPDF / MuPDF](https://github.com/pymupdf/PyMuPDF) (AGPL-3.0),
+[Qt for Python / PySide6](https://www.qt.io/qt-for-python) (LGPL-3.0) and
+[QtAwesome](https://github.com/spyder-ide/qtawesome) (MIT).
 
-- **Ctrl + fare tekerleği**: imlecin olduğu noktaya yakınlaştır.
-- **Ctrl + sürükle** ya da **orta tuşla sürükle**: sayfayı kaydır.
-- **PgUp / PgDn**: önceki/sonraki sayfa. **Ctrl+0**: genişliğe sığdır.
+## Contact
 
-## 9) Ayarlar
-
-Sağ üstteki **dişli** (ya da **Ctrl+,**): **dil** (Türkçe / English; değişiklik
-program yeniden başlatılınca geçerli olur, "Şimdi yeniden başlat" düğmesi var),
-tüm **klavye kısayolları**, **Hakkında** ve **Destek ol**. Program hep koyu
-temayla açılır (açık tema 1.2.0'dan sonra kaldırıldı).
-
-## 10) Dağıtım: kurulum dosyası
-
-`build_exe.bat`'e çift tıklayın (2-3 dakika). Sonuç:
-**`installer\Revora_Kurulum.exe`** — başkasına sadece bu tek dosyayı verin.
-
-Çift tıklayınca Türkçe kurulum sihirbazı açılır ve önce kurulum kipi sorulur:
-**"Yalnızca geçerli kullanıcı için"** (yönetici şifresi istemez) ya da **"Tüm
-kullanıcılar için"** (Program Files'a kurar, yönetici izni ister). Başlat menüsüne eklenir, isteğe bağlı olarak
-masaüstü kısayolu ve PDF'lere sağ tıklayınca "Revora ile aç" seçeneği eklenir.
-Kaldırmak için: **Ayarlar > Uygulamalar > Revora > Kaldır**.
-
-Kurulum dosyası için bu bilgisayarda ücretsiz **Inno Setup** kurulu olmalı
-(yoksa betik sadece `dist\Revora` klasörünü üretir). Revora'yı kuracak
-kişinin hiçbir şey kurmasına gerek yok.
-
-**Yeni sürüm çıkarırken** `Revora.iss` içindeki `AppVersion` satırını artırın
-(ör. `1.1.0`) ve `build_exe.bat`'i çalıştırın. Yeni kurulum eskisinin
-üzerine güncellenir; ayarlar korunur.
-
-**Logoyu değiştirmek için** `assets\revora.png` dosyasını yenisiyle
-değiştirip (kare, şeffaf arka planlı PNG, en az 512×512) yeniden paketleyin;
-Windows ikonu otomatik üretilir. Windows eski ikonu önbellekte tutabilir;
-exe'nin adını değiştirmek ya da başka klasöre kopyalamak genelde çözer.
-
-## Font eşleşmesi hakkında
-
-Program, PDF'teki yazı tipini (ör. "Tahoma", "Arial") Windows'un font
-klasöründen (`C:\Windows\Fonts`) bulup kullanır; böylece tüm Türkçe
-karakterler doğru çıkar. PDF çok nadir bir font kullanıyorsa en yakın font
-kullanılır ve bir uyarı gösterilir.
-
-Taranmış (resim) belgelerde gerçek metin nesnesi olmadığından yazılar
-düzenlenemez; OCR ile yalnızca aranabilir/seçilebilir hale getirilebilir.
-
-## Lisans
-
-Revora özgür ve açık kaynak bir yazılımdır: **GNU Affero Genel Kamu Lisansı
-sürüm 3 (AGPL-3.0)** ile dağıtılır, tam metin `LICENSE` dosyasındadır.
-Kaynak kodu: https://github.com/revorapdf/revora · Web: https://revorapdf.com ·
-İletişim: revorapdf@gmail.com
+[revorapdf.com](https://revorapdf.com) · revorapdf@gmail.com
