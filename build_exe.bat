@@ -51,6 +51,9 @@ REM alir; hepsini toplamak paketi yuzlerce MB buyutup acilisi yavaslatir.
     "main.py"
 if errorlevel 1 goto :error
 
+REM build_store.bat "store" ile cagirir: Inno kurulumu yerine Microsoft Store paketi (MSIX)
+if /i "%~1"=="store" goto :store
+
 echo.
 echo Kurulum dosyasi olusturuluyor (Inno Setup)...
 set ISCC=
@@ -73,6 +76,21 @@ echo ============================================
 echo BASARILI
 echo Kurulum dosyasi: %CD%\installer\Revora_Kurulum.exe
 echo Baskasina sadece bu dosyayi verin; cift tiklayinca Revora kurulur.
+echo ============================================
+echo.
+explorer "%CD%\installer"
+pause
+exit /b 0
+
+:store
+echo.
+echo Microsoft Store paketi (MSIX) olusturuluyor...
+%PY% tools\make_msix.py
+if errorlevel 1 goto :error
+echo.
+echo ============================================
+echo BASARILI - Partner Center'a bu .msix dosyasini yukleyin:
+dir /b "installer\*.msix"
 echo ============================================
 echo.
 explorer "%CD%\installer"

@@ -438,7 +438,8 @@ class MarkupMixin:
         self.mk_outline = tb("mdi6.format-text-variant-outline",
                              _t("Kontur: harflerin etrafına dış çizgi (renkli zeminde bile okunur)"))
         self.mk_outline_color = markup_bar.SwatchButton([0, 0, 0], _t("Kontur rengi"))
-        self.mk_preset = spin(QComboBox(), 96, _t("Hazır görünümler"))
+        # 96 px'te "Yellow note" gibi adlar kesiliyordu (Store ekran goruntusunde fark edildi)
+        self.mk_preset = spin(QComboBox(), 124, _t("Hazır görünümler"))
         self.mk_preset.view().setMinimumWidth(250)     # uzun sablon adlari / komutlar sigsin
         self.mk_preset.setMaxVisibleItems(60)          # kaydirmadan hepsi (en alttaki "sil" gizlenmesin)
         self._mk_fill_presets()

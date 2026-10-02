@@ -25,9 +25,20 @@ from PySide6.QtCore import Qt, QRect, QRectF, QPointF, QPoint, QSize, QSettings,
 
 # DIL: arayuz modulleri (modul seviyesindeki sabitleriyle) yuklenmeden ONCE secilmeli
 import i18n
+
+
+def _default_language():
+    """Kayitli dil yoksa (Store kurulumu, ilk acilis): Windows Turkce ise Turkce,
+    degilse Ingilizce. (Inno kurulumu secilen dili kayda yazar, o oncelikli.)"""
+    from PySide6.QtCore import QLocale
+    langs = QLocale.system().uiLanguages()
+    return i18n.SOURCE if langs and langs[0].lower().startswith("tr") else "en-US"
+
+
 # (REVORA_LANG ortam degiskeni: test / deneme icin kayitli ayari ezer)
 i18n.set_language(os.environ.get("REVORA_LANG")
-                  or QSettings("PdfEdit", "PdfEdit").value("language", i18n.SOURCE, type=str))
+                  or QSettings("PdfEdit", "PdfEdit").value("language", "", type=str)
+                  or _default_language())
 from i18n import _t
 
 import fitz
@@ -3676,11 +3687,26 @@ class MainWindow(QMainWindow, MarkupMixin):
             self.status(_t("OCR tamamlandı: {n} kelime tanındı.", n=dlg.result_words))
 
 
+def _is_packaged():
+    """Store (MSIX) paketinden mi calisiyoruz? Paketsiz surecte Windows
+    APPMODEL_ERROR_NO_PACKAGE (15700) dondurur."""
+    if sys.platform != "win32":
+        return False
+    try:
+        import ctypes
+        n = ctypes.c_uint32(0)
+        return ctypes.windll.kernel32.GetCurrentPackageFullName(ctypes.byref(n), None) != 15700
+    except Exception:
+        return False
+
+
 def main():
     # Kaynaktan (python main.py) calisirken Windows gorev cubugu uygulamayi
     # python.exe sayip Python ikonunu gosterir; kendi kimligimizi verince
     # Revora ikonu gorunur. Pencere olusturulmadan once yapilmali.
-    if sys.platform == "win32":
+    # Store (MSIX) paketinde YAPILMAZ: kimligi paket verir; elle verilen kimlik
+    # gorev cubuguna sabitlemeyi / ikon gruplamasini bozar.
+    if sys.platform == "win32" and not _is_packaged():
         try:
             import ctypes
             ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID("Revora.PDFDuzenleyici")

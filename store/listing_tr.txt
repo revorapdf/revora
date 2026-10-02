@@ -1,0 +1,88 @@
+REVORA PDF - MICROSOFT STORE SAYFASI (Türkçe / tr-tr)
+Her bölümü Partner Center > Store listings > Turkish içindeki aynı adlı kutuya yapıştırın.
+=====================================================================================
+
+[Product name]
+Revora PDF
+
+[Short description]  (en çok 1000 karakter; Store sayfasının en üstünde görünür)
+PDF'teki mevcut yazıyı orijinal yazı tipi, boyutu ve rengiyle düzenleyin; beyaz kutu yok, hile yok. Tablo çizgilerini taşıyın ve biçimlendirin, not, vurgu ve imza ekleyin, sayfaları yönetin. Tamamen çevrimdışı çalışır; dosyalarınız bilgisayarınızdan çıkmaz.
+
+[Description]  (en çok 10.000 karakter)
+Çoğu PDF aracı yazıyı "düzenlerken" eskisinin üstüne beyaz bir kutu koyup yenisini yazar. Revora PDF ise yazının kendisini değiştirir.
+
+Herhangi bir yazıya tıklayın ve yazın. Revora, PDF'in kullandığı yazı tipini Windows'ta kurulu yazı tipleri arasında bulur ve değişikliğinizi aynı yazı tipi, boyut, kalınlık, renk ve saydamlıkla yazar; sonuç orijinal belge gibi görünür. Türkçe karakterler bozulmaz.
+
+YAZI DÜZENLEME
+- Tıklayıp düzenleyin, sürükleyip taşıyın, döndürün, saydamlığını değiştirin
+- Satır aralığı ayarlanabilen çok satırlı metin
+- Sayfada istediğiniz yere canlı önizlemeyle yeni yazı ekleyin
+- Tek bir yazıyı, üstündeki ve altındakine dokunmadan silin
+
+ÇİZGİLER VE TABLOLAR
+- Tablo çizgilerini gerçek nesne olarak seçin: taşıyın, boyutlandırın, bükün, rengini değiştirin, kesikli yapın
+- Bütün bir tablo ızgarasını kutu içine alıp tek seferde taşıyın
+- Yeni çizgi ve kutular mevcut köşelere yapışır
+
+KAYDETTİKTEN SONRA DA DÜZENLENEBİLEN İŞARETLEME
+- Gölge ve konturlu ok, kutu, daire ve notlar
+- Kalem ve fosforlu kalem; fosforlu kalem kelimelere oturur ve gerçek PDF vurgusu oluşturur
+- Numaralı rozetler, büyüteç/detay görünümü, silgi ve kendi not şablonlarınız
+- İmza: bir kez çizin ya da kâğıttaki imzanızın fotoğrafını yükleyin (arka planı kaldırılır)
+- Resim, logo ve kaşe ekleme, döndürme
+- Alttaki yazıyı gerçekten silen bulanıklaştırma (sadece üstünü örtmez)
+- Her şey kaydettikten sonra da seçilip değiştirilebilir ve diğer PDF okuyucularda doğru görünür
+
+SAYFALAR VE BELGELER
+- Küçük resimleri sürükleyerek sayfaları sıralayın; döndürün, silin, çoğaltın, boş sayfa ekleyin
+- Başka PDF'ten sayfa ekleyin, PDF birleştirin ve ayırın
+- Filigran ekleme ve form doldurma
+- Resimlerden PDF (JPEG kalitesi korunur, telefon fotoğraflarının yönü düzeltilir)
+- Sayfaları 600 dpi'a kadar PNG/JPG olarak kaydedin; gömülü fotoğrafları tam çözünürlükte çıkarın
+- Taranmış sayfalar için OCR (ücretsiz Tesseract OCR programı gerekir)
+
+GİZLİLİK ÖNCELİKLİ
+Hesap yok, abonelik yok, bulut yok. Revora tamamen çevrimdışı çalışır ve belgelerinizi hiçbir yere yüklemez.
+
+7 gün ücretsiz deneyin, sonra bir kez satın alın ve hep sizin olsun; abonelik yok.
+
+Revora PDF açık kaynak bir yazılımdır (GNU AGPL-3.0). Kaynak kodu: https://github.com/revorapdf/revora
+
+[What's new in this version]
+Microsoft Store'daki ilk sürüm.
+
+[Product features]  (her satır bir madde, en çok 200 karakter; en fazla 20)
+PDF'teki mevcut yazıyı orijinal yazı tipi, boyut, renk ve saydamlıkla düzenleyin
+Yazıyı beyaz kutu olmadan taşıyın, döndürün, silin
+Tablo çizgilerini gerçek nesne olarak taşıyın, boyutlandırın, bükün, biçimlendirin
+Kaydettikten sonra da düzenlenebilen ok, kutu, not, kalem ve fosforlu kalem
+Kelimelere oturan gerçek PDF vurgusu
+İmza: bir kez çizin ya da imzanızın fotoğrafını yükleyin
+Alttaki yazıyı gerçekten silen bulanıklaştırma
+Sayfaları sıralayın, döndürün, ekleyin, çoğaltın, silin
+PDF birleştirme ve ayırma, filigran, form doldurma
+Resimlerden PDF, PDF sayfalarından PNG/JPG
+Tamamen çevrimdışı; dosyalarınız bilgisayarınızdan çıkmaz
+Tek seferlik satın alma, abonelik yok
+Türkçe ve İngilizce arayüz
+
+[Search terms]  (en fazla 7, her biri en çok 30 karakter)
+PDF düzenleyici
+PDF yazı düzenleme
+PDF editor
+PDF imzalama
+PDF birleştirme
+PDF karartma
+çevrimdışı PDF
+
+[Copyright and trademark info]
+© 2026 Revora PDF
+
+[Additional license terms]
+Revora PDF özgür ve açık kaynak bir yazılımdır; GNU Affero Genel Kamu Lisansı sürüm 3 (AGPL-3.0) ile lisanslanmıştır. Kaynak kodu: https://github.com/revorapdf/revora
+
+[Developed by]
+Revora PDF
+
+[System requirements - Minimum]
+Windows 10 sürüm 1809 veya üzeri, 64 bit

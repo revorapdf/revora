@@ -20,3 +20,6 @@ run_log.txt
 venv/
 .idea/
 .vscode/
+
+# Claude Code yerel onizleme ayari
+/.claude/launch.json
