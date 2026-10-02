@@ -1,0 +1,4 @@
+# Satir sonlari: depoda tek bicim, iki bilgisayar arasinda sahte "degisti" farki olmasin
+* text=auto
+# .bat dosyalari Windows satir sonuyla kalmali
+*.bat text eol=crlf

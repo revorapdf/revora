@@ -1,0 +1,40 @@
+﻿Revora — PDF Düzenleyici
+========================
+
+Revora, PDF'teki yazıları orijinal yazı tipi, boyut ve renkleriyle düzenlemenizi;
+tablo çizgilerini fareyle yönetmenizi; işaretleme, sayfa, filigran ve form
+işlemlerini tek programda yapmanızı sağlar.
+
+Lisans
+------
+Revora özgür ve açık kaynak bir yazılımdır; GNU Affero Genel Kamu Lisansı
+sürüm 3 (AGPL-3.0) ile dağıtılır. Lisansın tam metni kurulum klasöründeki
+LICENSE.txt dosyasındadır. Program "olduğu gibi" sunulur, hiçbir garanti verilmez.
+
+• Kaynak kodu: https://github.com/revorapdf/revora
+• Web: https://revorapdf.com
+• İletişim: revorapdf@gmail.com
+
+Kurulum seçenekleri
+-------------------
+• Sadece kendiniz için kurarsanız yönetici izni gerekmez.
+• "PDF dosyalarına sağ tıklayınca Revora ile aç" seçeneği isteğe bağlıdır;
+  varsayılan PDF programınızı değiştirmez.
+• Program dili sonradan Ayarlar > Dil bölümünden değiştirilebilir.
+
+Kullanılan açık kaynak bileşenler
+---------------------------------
+Revora aşağıdaki açık kaynak yazılımları kullanır. Her biri kendi lisansıyla
+dağıtılır; lisans metinleri belirtilen adreslerde bulunur.
+
+• PyMuPDF / MuPDF (Artifex Software) — GNU AGPL-3.0
+  https://github.com/pymupdf/PyMuPDF
+• Qt for Python (PySide6) ve Qt (The Qt Company) — GNU LGPL-3.0
+  https://www.qt.io/licensing
+• QtAwesome — MIT; içerdiği Font Awesome ve Material Design ikon yazı tipleri
+  kendi açık kaynak lisanslarıyladır
+  https://github.com/spyder-ide/qtawesome
+• Python — Python Software Foundation License
+  https://docs.python.org/3/license.html
+• PyInstaller (paketleme) — GPL-2.0, dağıtıma izin veren istisnayla
+  https://pyinstaller.org

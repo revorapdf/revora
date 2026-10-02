@@ -1,0 +1,22 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+
+# PyInstaller (paketleme ciktilari - dagitim, depoya girmez)
+/build/
+/dist/
+/installer/
+*.spec
+
+# Teshis / gecici
+run_log.txt
+
+# Test PDF'leri ve ciktilari (kendi test dosyalarin depoya girmesin)
+*.pdf
+
+# Ortam
+.venv/
+venv/
+.idea/
+.vscode/

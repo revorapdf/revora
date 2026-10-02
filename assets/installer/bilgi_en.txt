@@ -1,0 +1,41 @@
+﻿Revora — PDF Editor
+===================
+
+Revora lets you edit the text in PDFs with the original font, size and colors;
+manage table lines with the mouse; and do markup, page, watermark and form tasks
+in one program.
+
+License
+-------
+Revora is free and open source software, distributed under the GNU Affero
+General Public License version 3 (AGPL-3.0). The full license text is in the
+LICENSE.txt file in the installation folder. The program is provided "as is",
+without any warranty.
+
+• Source code: https://github.com/revorapdf/revora
+• Web: https://revorapdf.com
+• Contact: revorapdf@gmail.com
+
+Installation options
+--------------------
+• Installing only for yourself does not require administrator rights.
+• The "Open with Revora" option on the right-click menu of PDF files is optional;
+  it does not change your default PDF program.
+• The program language can be changed later in Settings > Language.
+
+Open source components used
+---------------------------
+Revora uses the following open source software. Each is distributed under its own
+license; the license texts are available at the addresses below.
+
+• PyMuPDF / MuPDF (Artifex Software) — GNU AGPL-3.0
+  https://github.com/pymupdf/PyMuPDF
+• Qt for Python (PySide6) and Qt (The Qt Company) — GNU LGPL-3.0
+  https://www.qt.io/licensing
+• QtAwesome — MIT; the bundled Font Awesome and Material Design icon fonts are
+  under their own open source licenses
+  https://github.com/spyder-ide/qtawesome
+• Python — Python Software Foundation License
+  https://docs.python.org/3/license.html
+• PyInstaller (packaging) — GPL-2.0 with an exception that permits distribution
+  https://pyinstaller.org
