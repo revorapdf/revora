@@ -52,32 +52,17 @@ in Windows and rewrites the text with the same font, size, weight, color and opa
 - English and Turkish interface, dark theme
 - Undo/redo, zoom up to 800%, remembers the last page of each file
 
-## Download
+## Get Revora PDF
 
-Revora PDF will be available on the **Microsoft Store**. Store purchases support the
-development; you can also build it yourself from this source code (see below).
+Revora PDF is available on the **Microsoft Store**: signed by Microsoft, installs in one
+click, updates automatically, 7-day free trial. Buying it supports the development.
 
-## Build from source
+## Source code
 
-Requirements: Windows 10/11, [Python](https://www.python.org/) 3.11 or newer.
-
-```bash
-pip install -r requirements.txt
-python main.py
-```
-
-Or double-click `run.bat`.
-
-To build the installer (`installer\Revora_Kurulum.exe`) run `build_exe.bat`.
-It needs [Inno Setup](https://jrsoftware.org/isdl.php) installed.
-
-OCR is optional and needs [Tesseract](https://github.com/UB-Mannheim/tesseract/wiki).
-
-## Translations
-
-Interface texts are in `locales/` (the key is the Turkish source text).
-`python tools/i18n_check.py` reports missing translations;
-`python tools/i18n_check.py --template de-DE` creates a template for a new language.
+This repository contains the complete source code of the version sold on the Microsoft
+Store, as required by the license. It is a Python 3.11+ / PySide6 / PyMuPDF application
+(dependencies in `requirements.txt`); the Store package is produced by `build_store.bat`.
+No prebuilt binaries are provided here and no build support is offered.
 
 ## License
 
