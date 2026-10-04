@@ -28,7 +28,7 @@ resim ↔ PDF. Ayrıntılar: [revorapdf.com/tr](https://revorapdf.com/tr/)
 
 ## Revora PDF'i edinin
 
-Revora PDF **Microsoft Store**'da: Microsoft tarafından imzalı, tek tıkla kurulur,
+Revora PDF **[Microsoft Store](https://apps.microsoft.com/detail/9nvq2dcd165x?hl=tr-TR&gl=TR)**'da: Microsoft tarafından imzalı, tek tıkla kurulur,
 kendiliğinden güncellenir, 7 gün ücretsiz denenebilir. Satın almak geliştirmeyi destekler.
 
 ## Kaynak kodu

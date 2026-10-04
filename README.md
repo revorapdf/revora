@@ -54,7 +54,7 @@ in Windows and rewrites the text with the same font, size, weight, color and opa
 
 ## Get Revora PDF
 
-Revora PDF is available on the **Microsoft Store**: signed by Microsoft, installs in one
+Revora PDF is available on the **[Microsoft Store](https://apps.microsoft.com/detail/9nvq2dcd165x)**: signed by Microsoft, installs in one
 click, updates automatically, 7-day free trial. Buying it supports the development.
 
 ## Source code
