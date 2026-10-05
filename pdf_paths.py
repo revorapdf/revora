@@ -245,9 +245,14 @@ def hit_test(items, p, tol, page_rect):
     return cand
 
 
-def items_in_rect(items, rect):
-    """Tamamen dikdortgenin icinde kalan yollar (kutu ile secim)."""
+def items_in_rect(items, rect, touch=False):
+    """Kutu ile secim. touch=False: TAMAMI dikdortgenin icinde kalan yollar;
+    touch=True: dikdortgene DEGEN yollar (sinir kutusu kesisen; ince cizgi dahil)."""
     r = fitz.Rect(rect).normalize()
+    if touch:
+        return [it for it in items
+                if it.bbox.x0 <= r.x1 and it.bbox.x1 >= r.x0
+                and it.bbox.y0 <= r.y1 and it.bbox.y1 >= r.y0]
     return [it for it in items
             if r.x0 <= it.bbox.x0 and it.bbox.x1 <= r.x1
             and r.y0 <= it.bbox.y0 and it.bbox.y1 <= r.y1]

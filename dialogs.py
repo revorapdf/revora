@@ -338,3 +338,212 @@ class OcrDialog(QDialog):
             return
         prog.setValue(len(pages))
         self.accept()
+
+
+# ---------------------------------------------------------------- parola
+class PasswordDialog(QDialog):
+    """Belgeye acma parolasi koy / degistir. Sonuc: self.password (bos olamaz)."""
+
+    def __init__(self, parent, has_password=False):
+        super().__init__(parent)
+        self.setWindowTitle(_t("Parolayı değiştir") if has_password else _t("Parola koy"))
+        self.password = None
+        v = QVBoxLayout(self)
+        v.setContentsMargins(20, 16, 20, 16)
+        v.setSpacing(10)
+        info = QLabel(_t("Belge, yalnızca bu parolayı bilenler tarafından açılabilir. "
+                         "Parola, belgeyi kaydettiğinizde geçerli olur."))
+        info.setWordWrap(True)
+        v.addWidget(info)
+        form = QFormLayout()
+        self.ed1, self.ed2 = QLineEdit(), QLineEdit()
+        for e in (self.ed1, self.ed2):
+            e.setEchoMode(QLineEdit.Password)
+            e.setMinimumWidth(240)
+        form.addRow(_t("Parola"), self.ed1)
+        form.addRow(_t("Parola (tekrar)"), self.ed2)
+        v.addLayout(form)
+        self.chk_show = QCheckBox(_t("Parolayı göster"))
+        self.chk_show.toggled.connect(lambda on: [e.setEchoMode(QLineEdit.Normal if on else QLineEdit.Password)
+                                                  for e in (self.ed1, self.ed2)])
+        v.addWidget(self.chk_show)
+        warn = QLabel(_t("Parolayı unutursanız belge AÇILAMAZ; kurtarmanın bir yolu yoktur."))
+        warn.setObjectName("fieldLabel")
+        warn.setWordWrap(True)
+        v.addWidget(warn)
+        bb = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        bb.button(QDialogButtonBox.Ok).setText(_t("Parolayı ayarla"))
+        bb.button(QDialogButtonBox.Cancel).setText(_t("Vazgeç"))
+        bb.accepted.connect(self._apply)
+        bb.rejected.connect(self.reject)
+        v.addWidget(bb)
+
+    def _apply(self):
+        a, b = self.ed1.text(), self.ed2.text()
+        if not a:
+            QMessageBox.warning(self, _t("Uyarı"), _t("Bir parola yazın."))
+            return
+        if a != b:
+            QMessageBox.warning(self, _t("Uyarı"), _t("İki parola aynı değil."))
+            return
+        self.password = a
+        self.accept()
+
+
+# ---------------------------------------------------------------- kucultme
+class CompressDialog(QDialog):
+    """Kucultme duzeyi sec. Sonuc: self.level ("light" / "medium" / "strong")."""
+
+    LEVELS = (
+        ("light", _t("Hafif"), _t("Resimlere dokunmaz; yalnızca dosyanın yapısını sıkıştırır. Kalite aynı kalır.")),
+        ("medium", _t("Dengeli (önerilen)"), _t("Yüksek çözünürlüklü resimler 150 dpi'ye indirilir. "
+                                                 "Ekranda ve yazıcıda iyi görünür.")),
+        ("strong", _t("Güçlü"), _t("Resimler 96 dpi'ye indirilir. E-postayla göndermek için; "
+                                    "yakınlaştırınca resimler bulanık görünür.")),
+    )
+
+    def __init__(self, parent, size_text=""):
+        super().__init__(parent)
+        self.setWindowTitle(_t("Küçülterek kaydet"))
+        self.level = "medium"
+        v = QVBoxLayout(self)
+        v.setContentsMargins(20, 16, 20, 16)
+        v.setSpacing(6)
+        if size_text:
+            head = QLabel(_t("Şu anki boyut: {size}", size=size_text))
+            head.setObjectName("panelTitle")
+            v.addWidget(head)
+            v.addSpacing(6)
+        self._group = QButtonGroup(self)
+        for key, title, desc in self.LEVELS:
+            rb = QRadioButton(title)
+            rb.setChecked(key == self.level)
+            rb.toggled.connect(lambda on, k=key: on and setattr(self, "level", k))
+            self._group.addButton(rb)
+            v.addWidget(rb)
+            lab = QLabel(desc)
+            lab.setObjectName("fieldLabel")
+            lab.setWordWrap(True)
+            lab.setContentsMargins(24, 0, 0, 6)
+            v.addWidget(lab)
+        note = QLabel(_t("Yazılar ve çizimler etkilenmez. Küçültülmüş belge seçeceğiniz adla kaydedilir; "
+                         "açık kalan belge o olur ve geri alma geçmişi sıfırlanır."))
+        note.setWordWrap(True)
+        v.addSpacing(4)
+        v.addWidget(note)
+        bb = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        bb.button(QDialogButtonBox.Ok).setText(_t("Devam"))
+        bb.button(QDialogButtonBox.Cancel).setText(_t("Vazgeç"))
+        bb.accepted.connect(self.accept)
+        bb.rejected.connect(self.reject)
+        v.addWidget(bb)
+        self.setMinimumWidth(440)
+
+
+# ---------------------------------------------------------------- Excel'e aktar
+class ExportExcelDialog(QDialog):
+    """Excel'e aktarma secenekleri.
+    Sonuc: pages(), whole_page, images, single_sheet, numbers, text_tables."""
+
+    def __init__(self, parent, current_page, page_count):
+        super().__init__(parent)
+        self.setWindowTitle(_t("Excel'e aktar"))
+        v = QVBoxLayout(self)
+        v.setContentsMargins(20, 16, 20, 16)
+        v.setSpacing(6)
+        v.addWidget(QLabel(_t("Sayfalar")))
+        self.scope = PageScope(current_page, page_count)
+        v.addWidget(self.scope)
+        v.addSpacing(8)
+        v.addWidget(QLabel(_t("Ne aktarılsın?")))
+        self.r_page = QRadioButton(_t("Tüm sayfa — yazılar, tablolar ve resimler, sayfadaki yerleşimiyle"))
+        self.r_tables = QRadioButton(_t("Yalnızca tablolar"))
+        self.r_page.setChecked(True)
+        g1 = QButtonGroup(self)
+        for r in (self.r_page, self.r_tables):
+            g1.addButton(r)
+        v.addWidget(self.r_page)
+        self.chk_img = QCheckBox(_t("Resimleri de aktar (logo, fotoğraf, grafik görüntüsü)"))
+        self.chk_img.setChecked(True)
+        self.chk_img.setContentsMargins(24, 0, 0, 0)
+        row = QHBoxLayout()
+        row.setContentsMargins(24, 0, 0, 4)
+        row.addWidget(self.chk_img)
+        v.addLayout(row)
+        v.addWidget(self.r_tables)
+        self.r_tabs = QRadioButton(_t("Her tablo ayrı sekmede"))
+        self.r_one = QRadioButton(_t("Hepsi tek sayfada, alt alta"))
+        self.r_tabs.setChecked(True)
+        g2 = QButtonGroup(self)
+        row2 = QHBoxLayout()
+        row2.setContentsMargins(24, 0, 0, 4)
+        for r in (self.r_tabs, self.r_one):
+            g2.addButton(r)
+            row2.addWidget(r)
+        row2.addStretch()
+        v.addLayout(row2)
+        v.addSpacing(8)
+        self.chk_num = QCheckBox(_t("Sayıları sayı olarak aktar (toplanabilir, sıralanabilir)"))
+        self.chk_num.setChecked(True)
+        v.addWidget(self.chk_num)
+        self.chk_text = QCheckBox(_t("Çizgisiz tabloları da ara (deneysel; yanlış sonuç verebilir)"))
+        v.addWidget(self.chk_text)
+        self.note = QLabel()
+        self.note.setObjectName("fieldLabel")
+        self.note.setWordWrap(True)
+        self.note.setMinimumHeight(self.note.fontMetrics().lineSpacing() * 2)
+        self.note.setAlignment(Qt.AlignLeft | Qt.AlignTop)
+        v.addWidget(self.note)
+        bb = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        bb.button(QDialogButtonBox.Ok).setText(_t("Aktar"))
+        bb.button(QDialogButtonBox.Cancel).setText(_t("Vazgeç"))
+        bb.accepted.connect(self._apply)
+        bb.rejected.connect(self.reject)
+        v.addWidget(bb)
+        self.setMinimumWidth(500)
+        self._pages = []
+        self.r_page.toggled.connect(self._sync)
+        self._sync()
+
+    def _sync(self, *_):
+        whole = self.r_page.isChecked()
+        self.chk_img.setEnabled(whole)
+        self.r_tabs.setEnabled(not whole)
+        self.r_one.setEnabled(not whole)
+        self.note.setText(
+            _t("Her PDF sayfası ayrı bir Excel sekmesi olur. Eğik filigran yazıları ve vektör çizimler aktarılmaz.")
+            if whole else
+            _t("Yalnızca tablolar aktarılır; tablo dışındaki yazılar ve resimler alınmaz."))
+
+    def _apply(self):
+        try:
+            self._pages = self.scope.pages()
+        except ValueError:
+            self._pages = []
+        if not self._pages:
+            QMessageBox.warning(self, _t("Uyarı"), _t("Sayfa aralığı geçersiz. Örnek: 1-3, 5"))
+            return
+        self.accept()
+
+    def pages(self):
+        return list(self._pages)
+
+    @property
+    def whole_page(self):
+        return self.r_page.isChecked()
+
+    @property
+    def images(self):
+        return self.chk_img.isChecked()
+
+    @property
+    def single_sheet(self):
+        return self.r_one.isChecked()
+
+    @property
+    def numbers(self):
+        return self.chk_num.isChecked()
+
+    @property
+    def text_tables(self):
+        return self.chk_text.isChecked()

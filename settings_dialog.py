@@ -1,7 +1,7 @@
 """
 settings_dialog.py
 ------------------
-Ayarlar penceresi: Dil, Klavye kisayollari, Hakkinda, Destek.
+Ayarlar penceresi: Dil, Klavye kisayollari, Hakkinda.
 Soldaki listeden bolum secilir. (Tema secimi yok: program hep koyu tema.)
 """
 from PySide6.QtWidgets import (
@@ -21,30 +21,45 @@ THEMES = (("light", _t("Açık")), ("dark", _t("Koyu")), ("system", _t("Sistemle
 # (baslik, None) = bolum basligi; (tus, aciklama) = satir
 GENERAL_SHORTCUTS = (
     (_t("Genel"), None),
-    ("Ctrl + O", _t("PDF aç")),
+    ("Ctrl + O", _t("PDF aç (yeni sekmede)")),
+    ("Ctrl + W", _t("Sekmeyi kapat")),
+    ("Ctrl + Tab  /  Ctrl + Shift + Tab", _t("Sonraki / önceki sekme")),
     ("Ctrl + S", _t("Kaydet")),
     ("Ctrl + Shift + S", _t("Farklı kaydet")),
     ("Ctrl + Z", _t("Geri al")),
     ("Ctrl + Y  /  Ctrl + Shift + Z", _t("Yinele")),
     ("PgUp / PgDn", _t("Önceki / sonraki sayfa")),
+    ("Ctrl + G", _t("Sayfaya git (numara yaz, Enter)")),
+    ("Ctrl + F", _t("Bul (Enter / F3: sonraki, Shift ile önceki)")),
+    ("Ctrl + H", _t("Bul ve değiştir")),
     (_t("Ctrl + tekerlek"), _t("Yakınlaştır / uzaklaştır")),
+    ("Ctrl + P", _t("Yazdır")),
     ("Ctrl + 0", _t("Sayfa genişliğine sığdır")),
+    ("Ctrl + 9", _t("Tüm sayfayı sığdır")),
     (_t("Ctrl + sürükle / orta tuş"), _t("Sayfayı kaydır")),
     ("Ctrl + ,", _t("Ayarlar")),
-    (_t("Metin"), None),
-    (_t("Tıkla + sürükle"), _t("Yazıyı taşı (Shift: sadece yatay/dikey)")),
-    (_t("Çift tık / F2 / Enter"), _t("Yazıyı sayfanın üstünde düzenle")),
-    ("Esc / Ctrl + Enter", _t("Düzenlemeyi bitir")),
+    (_t("Düzenle"), None),
+    ("V  T  L  K  D", _t("Seç · Yeni metin · Çizgi · Kutu · Daire")),
+    (_t("Tıkla"), _t("Yazıyı, şekli ya da resmi seç")),
+    (_t("Shift + tık"), _t("Seçime ekle / çıkar (yazı, şekil, resim birlikte)")),
+    (_t("Boşta sürükle"), _t("Alan seç: soldan sağa = tamamı içinde olanlar, sağdan sola = değenler")),
+    ("Ctrl + A", _t("Sayfadaki tüm yazı ve şekilleri seç")),
+    (_t("Tıkla + sürükle"), _t("Seçileni taşı (Shift: sadece yatay/dikey)")),
     (_t("Oklar (+Shift)"), _t("İnce kaydırma (5 kat)")),
-    ("Delete", _t("Seçili yazıyı sil")),
-    (_t("Çizgi / Kutu"), None),
-    ("V  L  K  D", _t("Seç · Çizgi · Kutu · Daire")),
-    (_t("Shift + tık"), _t("Seçime ekle / çıkar")),
-    (_t("Boşta sürükle"), _t("Kutu içine alınanları seç")),
-    ("Ctrl + A", _t("Sayfadaki tüm çizgileri seç")),
+    ("Delete", _t("Seçimi sil")),
+    (_t("Düzenle: yazı"), None),
+    (_t("Alt (taşırken)"), _t("Hizaya oturtmayı o an için aç / kapat")),
+    (_t("Çift tık"), _t("Düzenle: imleç tıklanan harfte")),
+    (_t("F2 / Enter"), _t("Düzenle: tüm yazı seçili")),
+    ("Esc / Ctrl + Enter", _t("Düzenlemeyi bitir")),
+    ("Ctrl + C  /  Ctrl + V", _t("Yazıyı kopyala / yapıştır (aynı görünümle)")),
+    ("Ctrl + D", _t("Yazıyı çoğalt")),
+    (_t("Düzenle: resim"), None),
+    (_t("Köşe / kenar tutamacı"), _t("Boyutlandır (oran korunur; Shift: serbest, Alt: merkezden)")),
+    (_t("Sağ tık"), _t("Resmi kaydet · Resmi değiştir · Sil")),
+    (_t("Düzenle: şekil"), None),
     (_t("Shift (çizerken)"), _t("45° adım · kare / tam daire · oranı koru")),
     (_t("Alt (çizgi ucu)"), _t("Açı sabit, sadece uzunluk")),
-    ("Delete", _t("Seçimi sil")),
 )
 
 
@@ -116,7 +131,6 @@ class SettingsDialog(QDialog):
                   shortcuts_page(GENERAL_SHORTCUTS + tuple(
                       [(_t("İşaretle"), None)] + [x for x in markup_shortcuts if x[1] is not None])))
         self._add("about", _t("Hakkında"), "fa5s.info-circle", self._about(app_name, version, logo_path))
-        self._add("support", _t("Destek ol"), "fa5s.heart", self._support())
         self.nav.currentRowChanged.connect(self._show)
         self.nav.setCurrentRow(self._keys.index(page) if page in self._keys else 0)
 
@@ -216,15 +230,5 @@ class SettingsDialog(QDialog):
                       "QtAwesome ve Font Awesome / Material Design ikonları — MIT / OFL"))
         comp.setObjectName("fieldLabel")
         v.addWidget(comp)
-        v.addStretch()
-        return w
-
-    def _support(self):
-        w = QWidget()
-        v = QVBoxLayout(w)
-        v.setContentsMargins(0, 0, 0, 0)
-        t = QLabel(_t("Yakında."))
-        t.setObjectName("fieldLabel")
-        v.addWidget(t)
         v.addStretch()
         return w

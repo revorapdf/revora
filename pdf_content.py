@@ -379,6 +379,35 @@ def remove_texts_at(doc, page, origins, tol=2.0):
     return True
 
 
+def remove_texts_each(doc, page, origins, tol=2.0):
+    """Birden cok metni TEK taramada kaldir -> her biri icin kaldirildi mi ([bool]).
+    Sayfanin kendi akisindakilerin operandlari sondan basa bosaltilir (akis bir kez
+    okunur, bir kez yazilir). Orada bulunamayanlar (form nesnesi icindeki yazi) tek tek
+    remove_text_at ile denenir. Toplu tasima / silme icin: yazi basina ayri tarama, 80
+    yazilik bir tabloda 10+ saniye suruyordu."""
+    page.clean_contents()
+    xrefs = page.get_contents()
+    if not xrefs:
+        return [False] * len(origins)
+    xref = xrefs[0]
+    data = doc.xref_stream(xref)
+    ops, _ = _scan_cached(data, page.transformation_matrix)
+    hits = []
+    for o in origins:
+        best, bd = _nearest(ops, o)
+        hits.append(best if (best is not None and bd <= tol) else None)
+    seen = set()
+    for op in sorted((h for h in hits if h is not None), key=lambda op: op["operand"]["start"], reverse=True):
+        st, en = op["operand"]["start"], op["operand"]["end"]
+        if st in seen:
+            continue
+        seen.add(st)
+        data = data[:st] + (b"[]" if op["op"] == "TJ" else b"()") + data[en:]
+    if seen:
+        doc.update_stream(xref, data)
+    return [True if h is not None else bool(remove_text_at(doc, page, o, tol)) for o, h in zip(origins, hits)]
+
+
 def _nearest(ops, origin):
     ox, oy = origin
     best, bd = None, 1e9
@@ -522,17 +551,29 @@ def extgstate_blend(doc, page, name):
         return None
 
 
-def text_blend_at(doc, page, origin, tol=2.0):
-    """origin'deki metin operatorunun karisim modu (sayfanin kendi akisinda)."""
+def text_blend_at(doc, page, origin, tol=2.0, _cache=None):
+    """origin'deki metin operatorunun karisim modu (sayfanin kendi akisinda).
+    _cache: ad -> karisim modu (ayni sayfada art arda sorgularda paylasilir). Operatorun
+    "gs" listesi o ana kadarki TUM gs adlarini tasir (yuzlerce, cogu ayni ad): her biri
+    icin belgeye sormak tek yazida ~50 ms, 130 yazilik toplu tasimada 7 sn tutuyordu."""
     ops = find_show_ops(page.read_contents(), page.transformation_matrix)
     op, d = _nearest(ops, origin)
     if op is None or d > tol:
         return None
+    cache = {} if _cache is None else _cache
     for name in reversed(op.get("gs") or ()):      # en son BM tanimlayan gecerli
-        bm = extgstate_blend(doc, page, name)
+        if name not in cache:
+            cache[name] = extgstate_blend(doc, page, name)
+        bm = cache[name]
         if bm is not None:
             return None if bm in ("Normal", "Compatible") else bm
     return None
+
+
+def text_blends_at(doc, page, origins, tol=2.0):
+    """Birden cok metnin karisim modu (akis ve kaynak sozlugu bir kez okunur)."""
+    cache = {}
+    return [text_blend_at(doc, page, o, tol, cache) for o in origins]
 
 
 def _copy_form(doc, page, container, tok, fx):

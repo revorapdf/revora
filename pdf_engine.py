@@ -6,13 +6,17 @@ bilgisiyle birlikte cikarir ve secilen bir span'i orijinal font ailesiyle
 degistirir. Ayrica vektor cizim (cizgi/kutu), sayfa, filigran ve form
 islemlerini yapar. Arayuzden bagimsizdir; basliksiz test edilebilir.
 """
+import contextlib
+import copy
 import os
 import math
 import time
 import fitz  # PyMuPDF
 from font_resolver import resolve_font_path, font_file_exists
-from pdf_content import remove_text_at, ensure_wrapped, text_blend_at, add_resource
+from pdf_content import (remove_text_at, remove_texts_each, ensure_wrapped, text_blend_at,
+                         text_blends_at, add_resource)
 import pdf_paths
+import pdf_images
 from i18n import _t
 import pdf_markup
 
@@ -128,6 +132,22 @@ class Block(Span):
         return Block([l.moved(dx, dy) for l in self.lines], self.align)
 
 
+class PasswordError(Exception):
+    """Belge parola korumali: parola verilmedi (needed=True) ya da yanlis."""
+
+    def __init__(self, needed):
+        super().__init__("parola gerekli" if needed else "parola yanlis")
+        self.needed = needed
+
+
+# Kucultme duzeyleri: (resimlerin bu cozunurlukten yuksek olanlari, hedef cozunurluk, JPEG kalitesi)
+COMPRESS_LEVELS = {
+    "light": None,                 # resimlere dokunma: yalniz yapi temizligi + sikistirma
+    "medium": (160, 150, 75),      # ekranda ve yazicida iyi
+    "strong": (110, 96, 60),       # e-posta icin: gozle gorulur ama okunur
+}
+
+
 class PDFEditor:
     MAX_UNDO = 30  # bellek sismesin diye geri-al gecmisi bu kadar snapshot tutar
     GROUP_WINDOW = 2.0  # sn: ayni gruptaki islemler bu kadar arayla gelirse tek geri-al adimi
@@ -139,6 +159,7 @@ class PDFEditor:
         self.undo_stack = []  # list of bytes snapshots
         self.redo_stack = []
         self.dirty = False
+        self.password = None         # belgeyi ACMA parolasi (kaydederken ayni parolayla sifrelenir)
         self._path_cache = {}
         self._span_cache = {}
         self._markup_cache = {}
@@ -152,8 +173,10 @@ class PDFEditor:
     def _invalidate(self):
         """Sayfa icerigi degisti: onbellege alinmis span/cizim listelerini at."""
         self.version = getattr(self, "version", 0) + 1   # arayuz onbellekleri icin
+        self._image_cache = {}
         self._path_cache = {}
         self._span_cache = {}
+        self._vis_cache = {}
         self._markup_cache = {}
         self._word_cache = {}
 
@@ -166,6 +189,10 @@ class PDFEditor:
         yeni kopya alinmaz. Eskiden her ok basisi ayri adimdi: 30 basis tum
         gecmisi silip gercek duzenlemeleri geri alinamaz yapiyordu (ve her
         basista tum PDF kopyalandigi icin yavasti)."""
+        if getattr(self, "_batching", False):      # undo_batch icinde: kopya zaten alindi
+            self.dirty = True
+            self._invalidate()
+            return
         now = time.monotonic()
         if (group is not None and group == self._undo_group and self.undo_stack
                 and now - self._undo_group_t <= self.GROUP_WINDOW):
@@ -180,9 +207,36 @@ class PDFEditor:
         self.dirty = True
         self._invalidate()
 
+    @contextlib.contextmanager
+    def undo_batch(self, group=None):
+        """Birden cok islemi TEK geri-al adiminda topla (toplu secimi tasima / silme):
+            with engine.undo_batch():
+                engine.move_paths(...); engine.move_span(...); engine.move_span(...)
+        Belgenin kopyasi bir kez alinir; icerideki islemlerin kendi kopya almasi atlanir.
+        group: bkz. _push_undo (ok tusuyla ard arda kaydirma tek adim olsun)."""
+        self._push_undo(group)
+        self._batching = True
+        try:
+            yield
+        finally:
+            self._batching = False
+
     # ---------- dosya islemleri ----------
-    def open(self, path):
-        self.doc = fitz.open(path)
+    def open(self, path, password=None):
+        """Parola korumali belgede password verilmezse / yanlissa PasswordError.
+        Parola motorda saklanir: belge bellekte SIFRESIZ islenir (geri-al kopyalari dahil),
+        kaydederken ayni parolayla yeniden sifrelenir -> koruma kendiliginden kalkmaz."""
+        doc = fitz.open(path)
+        locked = bool(doc.needs_pass)          # (dogrulamadan SONRA sorulursa hep False doner)
+        if locked:
+            if not password:
+                doc.close()
+                raise PasswordError(True)
+            if not doc.authenticate(password):
+                doc.close()
+                raise PasswordError(False)
+        self.doc = doc
+        self.password = password if locked else None
         self.path = path
         self.suggested_path = None
         self.undo_stack = []
@@ -203,6 +257,7 @@ class PDFEditor:
         """Bellekte olusturulmus belgeyi ac (ör. resimden PDF): henuz dosyasi yok,
         kaydederken suggested_path onerilir; degismis sayilir."""
         self.doc = doc
+        self.password = None
         self.path = None
         self.suggested_path = suggested_path
         self.undo_stack = []
@@ -214,9 +269,35 @@ class PDFEditor:
     def page_count(self):
         return len(self.doc) if self.doc else 0
 
-    def save(self, path):
+    def set_password(self, password):
+        """Acma parolasini ayarla (None / bos: korumayi kaldir). Bir sonraki KAYITTA gecerli olur."""
+        self.password = password or None
+        self.dirty = True
+
+    def _save_options(self, compress=None):
+        """Kayit secenekleri: parola (AES-256) + kucultme duzeyine gore sikistirma."""
+        opts = {"garbage": 4, "deflate": True}
+        if compress:
+            opts.update(deflate_images=True, deflate_fonts=True, use_objstms=1)
+        if self.password:
+            opts.update(encryption=fitz.PDF_ENCRYPT_AES_256, user_pw=self.password, owner_pw=self.password)
+        return opts
+
+    def _reopen(self, target):
+        doc = fitz.open(target)
+        if doc.needs_pass and self.password:
+            doc.authenticate(self.password)
+        return doc
+
+    def save(self, path, compress=None):
         """Kaydeder. garbage=4 + deflate: tekrarli duzenlemelerden arta kalan
         olu nesneleri temizler ve dosyayi sikistirir -> cikti sismez.
+
+        compress ("light" / "medium" / "strong", bkz. COMPRESS_LEVELS): KUCULTEREK kaydet.
+        Yuksek cozunurluklu resimler dusurulup yeniden sikistirilir (yazi ve cizimlere
+        dokunulmaz). Kayittan sonra calisilan belge kaydedilen dosyadan yeniden acilir (yoksa
+        bellekteki buyuk hali bir sonraki "Kaydet"te dosyayi yine buyuturdu) ve geri-al
+        gecmisi sifirlanir.
 
         Var olan bir dosyanin (acik belgenin kendisi dahil) uzerine yazarken
         once gecici dosyaya yazilir, sonra yerine konur: yarida kalan bir
@@ -249,12 +330,21 @@ class PDFEditor:
         except Exception:
             pass
 
+        level = COMPRESS_LEVELS.get(compress) if compress else None
+        if level:
+            thr, target_dpi, quality = level
+            try:
+                out.rewrite_images(dpi_threshold=thr, dpi_target=target_dpi, quality=quality)
+            except Exception:
+                pass                       # (resim islenemedi: en azindan yapi sikistirilir)
+        opts = self._save_options(compress)
+
         if not os.path.exists(target):
-            out.save(target, garbage=4, deflate=True)
+            out.save(target, **opts)
             out.close()
         else:
             tmp = target + ".tmp"
-            out.save(tmp, garbage=4, deflate=True)
+            out.save(tmp, **opts)
             out.close()
             if backed:
                 self.doc.close()   # Windows'ta acik dosyanin uzerine yazilamaz
@@ -275,8 +365,18 @@ class PDFEditor:
                     pass
                 raise
             if backed:
-                self.doc = fitz.open(target)
+                self.doc = self._reopen(target)
                 self._invalidate()
+        if compress and not (os.path.exists(target) and backed):
+            # kucultulmus hali calisma belgesi olsun (bkz. docstring)
+            try:
+                self.doc.close()
+            except Exception:
+                pass
+            self.doc = self._reopen(target)
+            self._invalidate()
+        if compress:
+            self.undo_stack, self.redo_stack = [], []
         self.path = target
         self.suggested_path = None
         self.dirty = False
@@ -294,6 +394,36 @@ class PDFEditor:
         return self.doc[page_num].rotation_matrix
 
     # ---------- metin span'leri ----------
+    @staticmethod
+    def _extract_dict(page, clip=False):
+        """Sayfanin kendi yazilari (isaretleme nesneleri haric), SAYFA DISINA TASANLAR DAHIL.
+
+        MuPDF yazi cikarirken sayfa kutusunun disindaki harfleri atar (kirpma bayragi
+        kapaliyken bile tamamen disarida kalanlari). Dondurulup ucu disari cikan yazi
+        o zaman kirpik okunuyordu ("BETON DENEY RAPORU" -> "N DENEY RAPORU"): harfler
+        bir sonraki tasimada kayboluyor, baslangic noktasi da kaydigi icin cerrahi silme
+        tutmayip geometrik yedege dusuyor ve KOMSU YAZILARI siliyordu. Bu yuzden yazi
+        sayfasi cok genis bir kutuyla kurulur (PyMuPDF'in hazir cagrisi buna izin vermiyor)."""
+        # clip: kirpma yolunun disinda kalan (gorunmeyen) harfler atilir - bkz. visible_spans
+        flags = fitz.TEXTFLAGS_DICT if clip else fitz.TEXTFLAGS_DICT & ~fitz.TEXT_MEDIABOX_CLIP
+        dl = page.get_displaylist(annots=False)
+        try:
+            mu = fitz.mupdf
+            big = mu.FzRect(-20000, -20000, 20000, 20000)
+            raw = mu.FzStextPage(big)
+            opts = mu.FzStextOptions()
+            opts.flags = flags
+            dev = mu.fz_new_stext_device(raw, opts)
+            mu.fz_run_display_list(dl.this, dev, mu.FzMatrix(), big, mu.FzCookie())
+            mu.fz_close_device(dev)
+            return fitz.TextPage(raw).extractDICT()
+        except Exception:
+            # (baska bir PyMuPDF surumu) eski yol: sayfa disindaki harfler okunmaz
+            tp = dl.get_textpage(flags=flags)
+            if not isinstance(tp, fitz.TextPage):      # bazi surumler ham nesne dondurur
+                tp = fitz.TextPage(tp)
+            return tp.extractDICT()
+
     def get_spans(self, page_num):
         if page_num in self._span_cache:
             return self._span_cache[page_num]
@@ -307,13 +437,16 @@ class PDFEditor:
         if rot:
             page.set_rotation(0)
         try:
-            tp = page.get_displaylist(annots=False).get_textpage(flags=fitz.TEXTFLAGS_DICT)
-            if not isinstance(tp, fitz.TextPage):      # bazi surumler ham nesne dondurur
-                tp = fitz.TextPage(tp)
-            d = tp.extractDICT()
+            d = self._extract_dict(page)
         finally:
             if rot:
                 page.set_rotation(rot)
+        spans = self._spans_from(d, page_num)
+        self._span_cache[page_num] = spans
+        return spans
+
+    @staticmethod
+    def _spans_from(d, page_num):
         spans = []
         for block in d.get("blocks", []):
             for line in block.get("lines", []):
@@ -326,8 +459,62 @@ class PDFEditor:
                                       sp["origin"], direction,
                                       sp.get("alpha", 255), sp.get("flags", 0),
                                       sp.get("ascender", 0.9), sp.get("descender", -0.25)))
-        self._span_cache[page_num] = spans
         return spans
+
+    def visible_spans(self, page_num):
+        """Sayfada GERCEKTEN gorunen yazilar (arama ve disa aktarim icin).
+        get_spans duzenleme icin kirpma yolunun disinda kalan yazilari da okur. Bunlar goz gormez
+        ama aramada "bulunur", Excel'de hucreye karisir: bir raporda kirpilmis "1,0" yazisi "25"
+        ile ayni hucreye dusup "1.025" oluyordu. Burada sayfa kirpmaya UYARAK (TEXT_CLIP) okunur.
+        Ayri bir okuma (tek gecis): get_spans ile karsilastirip elemek iki okuma + n^2 demekti,
+        200 sayfalik belgede arama 14 sn suruyordu."""
+        cache = self.__dict__.setdefault("_vis_cache", {})
+        if page_num not in cache:
+            page = self.doc[page_num]
+            rot = page.rotation
+            if rot:
+                page.set_rotation(0)
+            try:
+                cache[page_num] = self._spans_from(self._extract_dict(page, clip=True), page_num)
+            except Exception:
+                cache[page_num] = self.get_spans(page_num)
+            finally:
+                if rot:
+                    page.set_rotation(rot)
+        return cache[page_num]
+
+    def replace_texts(self, page_num, pairs):
+        """Ayni sayfadaki yazilarin metnini TEK geciste degistir. pairs: [(Span, yeni metin)].
+        Yazi yerinde (ayni taban noktasi, tip, boyut, renk) yeniden yazilir; boyut KUCULTULMEZ
+        (uzun gelen yazi saga uzar). Bos metin: yazi silinir. -> tam bulunamayan yazi tipi sayisi.
+        (apply_edit'i tek tek cagirmak her yazi icin sayfa akisini bastan tarar: move_spans'teki
+        ayni sorun.)"""
+        pairs = [(sp, text) for sp, text in pairs if text != sp.text]
+        if not pairs:
+            return 0
+        self._push_undo()
+        page = self.doc[page_num]
+        spans = [sp for sp, _ in pairs]
+        try:                                                     # akis degismeden: tek tarama
+            blends = text_blends_at(self.doc, page, [sp.origin for sp in spans])
+        except Exception:
+            blends = [None] * len(spans)
+        self._remove_spans(page, spans)
+        items, inexact, checked = [], 0, {}
+        for (sp, text), blend in zip(pairs, blends):
+            if not text.strip():
+                continue
+            new = copy.copy(sp)
+            new.text = text
+            items.append((sp.origin, new, blend))
+            key = (sp.font, sp.is_bold)
+            if key not in checked:
+                checked[key] = self._font_obj_for(page, sp, force_bold=sp.is_bold)[1]
+            inexact += 0 if checked[key] else 1
+        if items:
+            self._write_spans(page, items)
+        self._invalidate()
+        return inexact
 
     # paragraf: satir araligi (taban cizgileri arasi) / yazi boyutu bu araliktaysa
     # ayni paragraf olabilir. Form alanlari alt alta ~1,9 kat (ayri kalir), paragraf ~1,15.
@@ -393,36 +580,94 @@ class PDFEditor:
         if not alone(sp):
             return None
         lo, hi = self.PARA_PITCH
-        lines, mode, pitch = [sp], None, None
-        for down in (True, False):
-            cur = sp
-            while len(lines) < 60:
-                best, bd = None, None
-                for s in same:
-                    if any(s is l for l in lines):
-                        continue
-                    dy = s.origin[1] - cur.origin[1]
-                    if (dy > 0) != down or not (lo * size <= abs(dy) <= hi * size):
-                        continue
-                    if pitch is not None and abs(abs(dy) - pitch) > max(0.6, size * 0.08):
-                        continue
-                    m = aligned(cur, s)
-                    if mode is not None:
-                        m = [x for x in m if x == mode]
-                    if not m:
-                        continue
-                    if bd is None or abs(dy) < bd:
-                        best, bd, bm = s, abs(dy), m[0]
-                if best is None or not alone(best) or separated(cur, best):
-                    break
-                mode = mode or bm
-                pitch = pitch if pitch is not None else bd
-                lines.append(best)
-                cur = best
+
+        def grow(mode):
+            """sp'den yukari ve asagi, HEP ayni hizada (mode) ve esit aralikli satirlari topla."""
+            lines, pitch = [sp], None
+            for down in (True, False):
+                cur = sp
+                while len(lines) < 60:
+                    best, bd = None, None
+                    for s in same:
+                        if any(s is l for l in lines):
+                            continue
+                        dy = s.origin[1] - cur.origin[1]
+                        if (dy > 0) != down or not (lo * size <= abs(dy) <= hi * size):
+                            continue
+                        if pitch is not None and abs(abs(dy) - pitch) > max(0.6, size * 0.08):
+                            continue
+                        if mode not in aligned(cur, s):
+                            continue
+                        if bd is None or abs(dy) < bd:
+                            best, bd = s, abs(dy)
+                    if best is None or not alone(best) or separated(cur, best):
+                        break
+                    pitch = pitch if pitch is not None else bd
+                    lines.append(best)
+                    cur = best
+            return lines
+
+        # Hiza modu ilk komsu ciftinden secilirdi; cift hem sola hem ortaya hizaliysa (kisa
+        # satirlar) "sol" kazaniyor ve paragraf, HANGI SATIRDAN baslandigina gore degisiyordu:
+        # "Beyan / Ed. / Slump / (S/mm)" hucresi ustten 4 satir (ortali), alttan 2 satir (sol)
+        # cikiyor, toplu secimde iki paragraf birden gelip alt iki satir IKI KEZ yaziliyordu.
+        # Simdi her mod denenir, en cok satiri veren secilir (esitlikte sol > orta > sag).
+        lines, mode = [sp], "left"
+        for m in ("left", "center", "right"):
+            got = grow(m)
+            if len(got) > len(lines):
+                lines, mode = got, m
         if len(lines) < 2:
             return None
         lines.sort(key=lambda s: s.origin[1])
-        return Block(lines, mode or "left")
+        return Block(lines, mode)
+
+    @staticmethod
+    def unique_spans(spans):
+        """Toplu secim icin: her SATIR en cok bir kez (ayni satir iki paragrafin icinde
+        gelirse iki kez tasinir / yazilirdi). Buyuk paragraf onceliklidir; baska bir paragrafla
+        kismen cakisanin yalnizca disarida kalan satirlari tek tek eklenir. Sira korunur."""
+        def key(ln):
+            return (ln.page_num, round(ln.origin[0], 2), round(ln.origin[1], 2), ln.text)
+
+        def lines_of(sp):
+            return sp.lines if isinstance(sp, Block) else [sp]
+        order = sorted(range(len(spans)), key=lambda i: -len(lines_of(spans[i])))
+        covered, keep = set(), {}
+        for i in order:
+            lns = lines_of(spans[i])
+            ks = [key(ln) for ln in lns]
+            if not any(k in covered for k in ks):
+                keep[i] = [spans[i]]
+                covered.update(ks)
+            else:
+                rest = [ln for ln, k in zip(lns, ks) if k not in covered]
+                keep[i] = rest
+                covered.update(key(ln) for ln in rest)
+        return [sp for i in range(len(spans)) for sp in keep.get(i, [])]
+
+    def spans_in_rect(self, page_num, rect, inside=False):
+        """Alan cizerek secme. inside=False: rect'e DEGEN yazilar; inside=True: TAMAMI rect'in
+        icinde kalanlar. Paragrafin bir satiri seciliyorsa paragrafin tamami gelir (inside'da
+        paragrafin tamami icerideyse); her yazi bir kez."""
+        rect = fitz.Rect(rect)
+        rect.normalize()
+
+        def box(sp):
+            q = sp.quad()
+            return fitz.Rect(min(p.x for p in q), min(p.y for p in q), max(p.x for p in q), max(p.y for p in q))
+        out, seen = [], set()
+        for s in self.get_spans(page_num):
+            if not box(s).intersects(rect):
+                continue
+            e = self.expand(s)
+            if inside and not rect.contains(box(e)):
+                continue
+            key = (round(e.origin[0], 2), round(e.origin[1], 2), e.text)
+            if key not in seen:
+                seen.add(key)
+                out.append(e)
+        return self.unique_spans(out)
 
     def find_span_at(self, page_num, pdf_x, pdf_y):
         """Verilen noktadaki span'i bulur. Birden fazla span ust uste
@@ -496,7 +741,23 @@ class PDFEditor:
         ensure_wrapped(self.doc, page)
         tw = fitz.TextWriter(page.rect)
         ox, oy = origin
+        self._append_lines(tw, origin, text, font_obj, size, line_spacing, align, ref_width)
+        dx, dy = direction
+        angle = math.degrees(math.atan2(dy, dx))
+        morph = None
+        if abs(angle) >= 0.01:
+            morph = (fitz.Point(ox, oy), fitz.Matrix(-angle))
+        tw.write_text(page, color=color, opacity=max(0.0, min(1.0, opacity)),
+                      morph=morph, overlay=overlay)
+        if blend:
+            self._apply_blend(page, blend, overlay)
+
+    @staticmethod
+    def _append_lines(tw, origin, text, font_obj, size, line_spacing=1.2, align="left", ref_width=None):
+        """Metnin satirlarini yaziciya (TextWriter) ekle; bos degilse True."""
+        ox, oy = origin
         lh = size * line_spacing
+        any_ = False
         for k, line in enumerate(text.split("\n")):
             if line.strip():
                 w = font_obj.text_length(line, fontsize=size)
@@ -507,15 +768,75 @@ class PDFEditor:
                 else:
                     off = 0.0
                 tw.append((ox + off, oy + k * lh), line, font=font_obj, fontsize=size)
-        dx, dy = direction
-        angle = math.degrees(math.atan2(dy, dx))
-        morph = None
-        if abs(angle) >= 0.01:
-            morph = (fitz.Point(ox, oy), fitz.Matrix(-angle))
-        tw.write_text(page, color=color, opacity=max(0.0, min(1.0, opacity)),
-                      morph=morph, overlay=overlay)
-        if blend:
-            self._apply_blend(page, blend, overlay)
+                any_ = True
+        return any_
+
+    @staticmethod
+    def text_preview(text, font_obj, size, color, opacity=1.0, line_spacing=1.2, align="left",
+                     ref_width=None, scale=1.0, origin_dev=None, angle=0.0):
+        """Metni _write_text'in yazacagi GIBI (ayni font dosyasi, ayni hizalama, ayni satir
+        araligi, ayni aci) saydam zeminli bir goruntuye cizer: yazarken canli onizleme.
+        Ekrandaki ile kaydedilecek olan ayni motorla cizildiginden duzenlemeye girince yazi
+        buyuyup kaymaz.
+        Dondurur: (pixmap, ox, oy, box) - (ox, oy): origin'in goruntudeki yeri (px);
+        box = (x0, y0, w, h): yazinin DONMEMIS kutusu, origin'e gore (px) - cerceve cizimi icin.
+        Yazi bossa None.
+        origin_dev: origin'in SAYFA goruntusundeki yeri (aygit pikseli, kesirli). Verilirse
+        onizleme, origin ayni alt-piksel konumuna gelecek sekilde cizilir -> tam piksele
+        yerlestirilince harf kenarlari sayfadaki cizimle ayni olur (gecis fark edilmez).
+        angle: ekranda saat yonunde derece (span_angle ile ayni)."""
+        lines = text.split("\n")
+        if not any(l.strip() for l in lines):
+            return None
+        lh = size * line_spacing
+        widths = [font_obj.text_length(l, fontsize=size) if l.strip() else 0.0 for l in lines]
+        offs = []
+        for w in widths:
+            if align == "center":
+                offs.append(((ref_width - w) / 2) if ref_width is not None else -w / 2)
+            elif align == "right":
+                offs.append((ref_width - w) if ref_width is not None else -w)
+            else:
+                offs.append(0.0)
+        left = min(offs)
+        right = max(o + w for o, w in zip(offs, widths))
+        pad = size * 0.45 + 2.0                       # aksanlar / egik harfler kirpilmasin
+        asc = max(font_obj.ascender, 0.8) * size
+        desc = max(-font_obj.descender, 0.2) * size
+        # donmemis kutu, origin'e gore (pay dahil)
+        x0, y0 = left - pad, -(asc + pad)
+        x1, y1 = right + pad, (len(lines) - 1) * lh + desc + pad
+        rotated = abs(angle) >= 0.01
+        if rotated:
+            a = math.radians(angle)
+            ca, sa = math.cos(a), math.sin(a)
+            pts = [(x * ca - y * sa, x * sa + y * ca) for x, y in ((x0, y0), (x1, y0), (x1, y1), (x0, y1))]
+            bx0, by0 = min(q[0] for q in pts), min(q[1] for q in pts)
+            bx1, by1 = max(q[0] for q in pts), max(q[1] for q in pts)
+        else:
+            bx0, by0, bx1, by1 = x0, y0, x1, y1
+        ox, oy = -bx0, -by0
+        W, H = bx1 - bx0, by1 - by0
+        if origin_dev is not None:
+            ox += ((origin_dev[0] - ox * scale) % 1.0) / scale
+            oy += ((origin_dev[1] - oy * scale) % 1.0) / scale
+            W += 1.0 / scale
+            H += 1.0 / scale
+        tmp = fitz.open()
+        try:
+            pg = tmp.new_page(width=max(W, 4), height=max(H, 4))
+            tw = fitz.TextWriter(pg.rect)
+            for k, (l, off) in enumerate(zip(lines, offs)):
+                if l.strip():
+                    tw.append((ox + off, oy + k * lh), l, font=font_obj, fontsize=size)
+            morph = (fitz.Point(ox, oy), fitz.Matrix(-angle)) if rotated else None
+            tw.write_text(pg, color=color, opacity=max(0.0, min(1.0, opacity)), morph=morph)
+            pix = pg.get_pixmap(matrix=fitz.Matrix(scale, scale), alpha=True)
+        finally:
+            tmp.close()
+        m = max(0.0, pad - 4.0 / scale)                 # cerceve yaziya 4 px payla otursun
+        box = ((x0 + m) * scale, (y0 + m) * scale, (x1 - x0 - 2 * m) * scale, (y1 - y0 - 2 * m) * scale)
+        return pix, ox * scale, oy * scale, box
 
     def _apply_blend(self, page, blend, overlay=True):
         """Az once yazilan metnin akisini karisim moduyla sar (orijinal yazi ör.
@@ -559,8 +880,23 @@ class PDFEditor:
             return
         if remove_text_at(self.doc, page, target.origin):
             return
-        # yedek: geometrik redaction (arka plani koru)
-        page.add_redact_annot(target.bbox, fill=None)
+        self._redact_span(page, target)
+
+    def _redact_span(self, page, target):
+        """Yedek: geometrik redaction (arka plani koru). Donuk yazida eksen-hizali kutu cok
+        buyuktur (kosegeni yazi olan dikdortgen: altindaki her seyi silerdi) -> sadece
+        yazinin kendi seridi boyunca kucuk kareler."""
+        if target.rotated:
+            q = target.quad()
+            a, b = (q[0] + q[3]) * 0.5, (q[1] + q[2]) * 0.5      # seridin orta cizgisi
+            h = abs(q[3] - q[0])
+            n = max(1, int(math.ceil(abs(b - a) / max(h * 0.5, 1.0))))
+            for k in range(n + 1):
+                c = a + (b - a) * (k / n)
+                page.add_redact_annot(fitz.Rect(c.x - h * 0.3, c.y - h * 0.3,
+                                                c.x + h * 0.3, c.y + h * 0.3), fill=None)
+        else:
+            page.add_redact_annot(target.bbox, fill=None)
         page.apply_redactions(images=fitz.PDF_REDACT_IMAGE_NONE,
                               graphics=fitz.PDF_REDACT_LINE_ART_NONE)
 
@@ -627,6 +963,95 @@ class PDFEditor:
         self._remove_span(page, span)
         font_obj, _ = self._font_obj_for(page, span, force_bold=span.is_bold)
         new = span.moved(dx, dy)
+        self._write_text(page, new.origin, span.text, font_obj, span.size,
+                         span.color_rgb(), span.direction, span.opacity,
+                         blend=blend, **self._block_layout(span))
+        return new
+
+    # ---------- toplu islemler (birden cok yazi tek geciste) ----------
+    def _remove_spans(self, page, spans):
+        """Yazilari TEK taramada kaldir (paragraflar satirlarina acilir). Akista bulunamayan
+        olursa onun icin geometrik yedege dusulur."""
+        lines = [ln for sp in spans for ln in (sp.lines if isinstance(sp, Block) else [sp])]
+        if not lines:
+            return
+        done = remove_texts_each(self.doc, page, [ln.origin for ln in lines])
+        for ln, ok in zip(lines, done):
+            if not ok:
+                self._redact_span(page, ln)
+
+    def _write_spans(self, page, items):
+        """items: [(taban noktasi, kaynak span, karisim modu)]. Ayni renk + opakliktaki duz
+        yazilar TEK yaziciyla (tek icerik akisi, font bir kez gomulur) yazilir; donuk ya da
+        karisim modlu olanlar tek tek (_write_text)."""
+        ensure_wrapped(self.doc, page)
+        fonts, writers = {}, {}
+        for origin, sp, blend in items:
+            fk = (sp.font, sp.is_bold)
+            if fk not in fonts:
+                fonts[fk] = self._font_obj_for(page, sp, force_bold=sp.is_bold)[0]
+            fo = fonts[fk]
+            layout = self._block_layout(sp)
+            if blend or abs(self.span_angle(sp)) >= 0.01:
+                self._write_text(page, origin, sp.text, fo, sp.size, sp.color_rgb(), sp.direction,
+                                 sp.opacity, blend=blend, **layout)
+                continue
+            key = (tuple(round(c, 4) for c in sp.color_rgb()), round(max(0.0, min(1.0, sp.opacity)), 3))
+            tw = writers.get(key)
+            if tw is None:
+                tw = writers[key] = [fitz.TextWriter(page.rect), False]
+            if self._append_lines(tw[0], origin, sp.text, fo, sp.size, **layout):
+                tw[1] = True
+        for (color, opacity), (tw, used) in writers.items():
+            if used:
+                tw.write_text(page, color=color, opacity=opacity, overlay=True)
+
+    def move_spans(self, spans, dx, dy, group=None):
+        """Birden cok yaziyi (ayni sayfada) TEK geciste kaydirir -> guncel Span'ler.
+        move_span'i tek tek cagirmak her yazi icin sayfa akisini bastan tarayip yeniden
+        yaziyordu (80 yazilik tabloda 10+ sn)."""
+        spans = list(spans)
+        if not spans:
+            return []
+        self._push_undo(group)
+        page = self.doc[spans[0].page_num]
+        try:                                                     # akis degismeden: tek tarama
+            blends = text_blends_at(self.doc, page, [(sp.lines[0] if isinstance(sp, Block) else sp).origin
+                                                     for sp in spans])
+        except Exception:
+            blends = [None] * len(spans)
+        self._remove_spans(page, spans)
+        moved = [sp.moved(dx, dy) for sp in spans]
+        self._write_spans(page, [(n.origin, sp, bl) for n, sp, bl in zip(moved, spans, blends)])
+        self._invalidate()
+        return moved
+
+    def delete_spans(self, spans):
+        """Birden cok yaziyi (ayni sayfada) TEK geciste siler."""
+        spans = list(spans)
+        if not spans:
+            return
+        self._push_undo()
+        self._remove_spans(self.doc[spans[0].page_num], spans)
+        self._invalidate()
+
+    def duplicate_span(self, span: Span, dx=0.0, dy=0.0, page_num=None):
+        """Yazinin bir KOPYASINI (ayni font/boyut/renk/opaklik/aci) yazar; asli yerinde kalir.
+        page_num verilirse o sayfaya (kopyala -> baska sayfada yapistir). Yeni Span'i dondurur."""
+        self._push_undo()
+        pno = span.page_num if page_num is None else page_num
+        page = self.doc[pno]
+        blend = None
+        if 0 <= span.page_num < len(self.doc):
+            try:
+                blend = self._blend_of(self.doc[span.page_num], span)
+            except Exception:
+                blend = None
+        font_obj, _ = self._font_obj_for(page, span, force_bold=span.is_bold)
+        new = span.moved(dx, dy)
+        new.page_num = pno
+        for ln in getattr(new, "lines", ()):
+            ln.page_num = pno
         self._write_text(page, new.origin, span.text, font_obj, span.size,
                          span.color_rgb(), span.direction, span.opacity,
                          blend=blend, **self._block_layout(span))
@@ -709,8 +1134,92 @@ class PDFEditor:
         return pdf_paths.hit_test(self.get_paths(page_num), (x, y), tol,
                                   page.rect * page.derotation_matrix)
 
-    def paths_in_rect(self, page_num, rect):
-        return pdf_paths.items_in_rect(self.get_paths(page_num), rect)
+    # ---------- resim nesneleri (logo, fotograf, grafik) ----------
+    BIG_IMAGE = 0.8      # sayfanin bu oranindan buyuk resim "zemin"dir (taranmis sayfa): secilmez
+
+    def get_images(self, page_num):
+        cache = self.__dict__.setdefault("_image_cache", {})
+        if page_num not in cache:
+            try:
+                cache[page_num] = pdf_images.page_images(self.doc, self.doc[page_num])
+            except Exception:
+                cache[page_num] = []
+        return cache[page_num]
+
+    def _pickable_images(self, page_num):
+        pr = self.doc[page_num].rect
+        lim = self.BIG_IMAGE * abs(pr.width * pr.height)
+        return [it for it in self.get_images(page_num) if abs(it.bbox.width * it.bbox.height) < lim]
+
+    def image_at(self, page_num, x, y):
+        """Noktadaki resim (ustteki oncelikli); sayfayi kaplayan zemin resmi haric."""
+        base = self.doc[page_num].transformation_matrix
+        pt = fitz.Point(x, y)
+        for it in reversed(self._pickable_images(page_num)):
+            if it.contains(pt, base):
+                return it
+        return None
+
+    def images_by_index(self, page_num, indices):
+        items = self.get_images(page_num)
+        return [items[i] for i in indices if 0 <= i < len(items)]
+
+    def images_in_rect(self, page_num, rect, touch=False):
+        r = fitz.Rect(rect)
+        r.normalize()
+        out = []
+        for it in self._pickable_images(page_num):
+            b = it.bbox
+            if touch:
+                ok = b.x0 <= r.x1 and b.x1 >= r.x0 and b.y0 <= r.y1 and b.y1 >= r.y0
+            else:
+                ok = r.x0 <= b.x0 and b.x1 <= r.x1 and r.y0 <= b.y0 and b.y1 <= r.y1
+            if ok:
+                out.append(it)
+        return out
+
+    def move_images(self, page_num, indices, dx, dy, group=None):
+        self._push_undo(group)
+        pdf_images.move(self.doc, self.doc[page_num], list(indices), dx, dy)
+        self._invalidate()
+
+    def scale_image(self, page_num, index, old, new):
+        self._push_undo()
+        pdf_images.scale(self.doc, self.doc[page_num], index, old, new)
+        self._invalidate()
+
+    def delete_images(self, page_num, indices):
+        self._push_undo()
+        pdf_images.delete(self.doc, self.doc[page_num], list(indices))
+        self._invalidate()
+
+    def replace_image(self, page_num, index, path):
+        """Resmi baska bir resim dosyasiyla degistir: ayni yere (oran korunarak) konur."""
+        items = self.get_images(page_num)
+        if not (0 <= index < len(items)):
+            return False
+        box = fitz.Rect(items[index].bbox)
+        self._push_undo()
+        page = self.doc[page_num]
+        pdf_images.delete(self.doc, page, [index])
+        ensure_wrapped(self.doc, page)
+        page.insert_image(box, filename=path, keep_proportion=True, overlay=True)
+        self._invalidate()
+        return True
+
+    def image_file(self, page_num, index):
+        """Resmin ASIL verisi (kalite kaybi yok) -> (bytes, uzanti) | None."""
+        items = self.get_images(page_num)
+        if not (0 <= index < len(items)):
+            return None
+        try:
+            d = self.doc.extract_image(items[index].xref)
+            return d["image"], d.get("ext", "png")
+        except Exception:
+            return None
+
+    def paths_in_rect(self, page_num, rect, touch=False):
+        return pdf_paths.items_in_rect(self.get_paths(page_num), rect, touch)
 
     def paths_by_index(self, page_num, indices):
         items = self.get_paths(page_num)

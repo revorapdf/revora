@@ -12,7 +12,7 @@ Renkler (0-1 arasi) liste/tuple olarak tasinir; ColorButton ile ayni arayuz:
 # import sirasi kurali: PySide6, fitz'ten once (bu modul fitz kullanmiyor)
 from PySide6.QtWidgets import (QToolButton, QFrame, QGridLayout, QVBoxLayout, QPushButton,
                                QColorDialog, QWidget, QHBoxLayout, QLabel, QLayout)
-from PySide6.QtGui import QColor, QPainter, QPen, QPixmap, QIcon, QBrush, QPolygonF
+from PySide6.QtGui import QColor, QPainter, QPen, QPixmap, QIcon, QBrush, QPolygonF, QPainterPath
 from PySide6.QtCore import Qt, Signal, QSize, QRectF, QPoint, QPointF, QObject, QEvent
 from i18n import _t
 
@@ -31,11 +31,100 @@ PALETTE_NAMES = [_t("Kırmızı"), _t("Turuncu"), _t("Sarı"), _t("Yeşil"), _t(
 ICON_COLOR = {"light": "#3d424a", "dark": "#c4c8d0"}
 
 
+def _magnet_pixmap(px, color):
+    """At nali miknatis, 45 derece yatik: kutuplari sol-uste bakar (secim imleciyle ayni
+    egim). Hazir ikon yazi tiplerindeki miknatis 18 px'te ya "U" harfi gibi duruyor ya da
+    dondurulunce bulaniklasip kutudan tasiyordu; bu yuzden vektor olarak cizilir."""
+    pm = QPixmap(px, px)
+    pm.fill(Qt.transparent)
+    p = QPainter(pm)
+    p.setRenderHint(QPainter.Antialiasing, True)
+    p.scale(px / 24, px / 24)                      # 24 birimlik kutuda ciz
+    p.translate(12, 12)
+    p.rotate(-45)
+    p.scale(0.84, 0.84)                            # diger ikonlar gibi kenarda ~2 birim pay
+    p.translate(-12, -12.05)
+    pen = QPen(QColor(color), 4.6)
+    pen.setCapStyle(Qt.FlatCap)
+    pen.setJoinStyle(Qt.RoundJoin)
+    p.setPen(pen)
+    r, top = 5.6, 8.4                              # yay yaricapi (eksen), govdenin ust ucu
+    path = QPainterPath(QPointF(12 - r, top))
+    path.lineTo(12 - r, 13)
+    path.arcTo(QRectF(12 - r, 13 - r, 2 * r, 2 * r), 180, 180)
+    path.lineTo(12 + r, top)
+    p.drawPath(path)
+    for x in (12 - r, 12 + r):                     # kutup uclari: govdeden ince boslukla ayri
+        p.drawLine(QPointF(x, top - 5.2), QPointF(x, top - 1.8))
+    p.end()
+    return pm
+
+
+def _undo_pixmap(px, color, redo=False):
+    """Geri al / yinele: ince, egri govdeli ok (yinele = aynadaki yansimasi). Hazir ikonlar
+    (fa5s, mdi6) dolu ve iri basli: yandaki ince sayfa oklarinin yaninda kaba duruyordu
+    (kullanici: "gozumu tirmaliyor"). Cizgi kalinligi sayfa oklariyla ayni agirlikta."""
+    pm = QPixmap(px, px)
+    pm.fill(Qt.transparent)
+    p = QPainter(pm)
+    p.setRenderHint(QPainter.Antialiasing, True)
+    p.scale(px / 24, px / 24)
+    if redo:
+        p.translate(24, 0)
+        p.scale(-1, 1)
+    p.translate(12, 12)
+    p.scale(0.94, 0.94)
+    p.translate(-12, -13)
+    pen = QPen(QColor(color), 1.55)
+    pen.setCapStyle(Qt.RoundCap)
+    pen.setJoinStyle(Qt.RoundJoin)
+    p.setPen(pen)
+    p.setBrush(Qt.NoBrush)
+    head = QPainterPath(QPointF(4, 8))             # ok basi: sol altta kucuk bir "L"
+    head.lineTo(4, 13)
+    head.lineTo(9, 13)
+    p.drawPath(head)
+    body = QPainterPath(QPointF(4, 13))            # govde: sola-asagi inen yay
+    body.cubicTo(7.2, 9.4, 9.6, 8, 12.6, 8)
+    body.arcTo(QRectF(12.6 - 7.4, 8, 14.8, 14.8), 90, -90)
+    p.drawPath(body)
+    p.end()
+    return pm
+
+
+# kendi cizdigimiz ikonlar: ad -> cizen islev(px, renk)
+_CUSTOM = {
+    "rv.magnet": _magnet_pixmap,
+    "rv.undo": lambda px, color: _undo_pixmap(px, color, False),
+    "rv.redo": lambda px, color: _undo_pixmap(px, color, True),
+}
+
+
+def custom_icon(name, color, color_on=None, color_disabled=None):
+    """`rv.` ile baslayan ad -> kendi cizimimiz (her ekran olceginde net). Bilinmeyen ad: None.
+    color_on: secili (checked) hal; color_disabled: dugme devre disiyken (soluk)."""
+    draw = _CUSTOM.get(name)
+    if draw is None:
+        return None
+    ic = QIcon()
+    for px in (16, 18, 20, 24, 27, 30, 36, 40, 45, 54, 60, 72, 80):   # %100-%400 ekran olcegi
+        ic.addPixmap(draw(px, color), QIcon.Normal, QIcon.Off)
+        if color_on is not None:
+            on = draw(px, color_on)
+            ic.addPixmap(on, QIcon.Normal, QIcon.On)
+            ic.addPixmap(on, QIcon.Active, QIcon.On)
+        if color_disabled is not None:
+            ic.addPixmap(draw(px, color_disabled), QIcon.Disabled, QIcon.Off)
+    return ic
+
+
 def icon(name, dark=False, on_white=True):
     """Tema rengine uygun ikon; secili (checked) halde beyaz."""
+    col = ICON_COLOR["dark" if dark else "light"]
+    if name.startswith("rv."):                     # kendi cizdigimiz ikon (qtawesome'da yok)
+        return custom_icon(name, col, "#ffffff" if on_white else None) or QIcon()
     if qta is None:
         return QIcon()
-    col = ICON_COLOR["dark" if dark else "light"]
     try:
         if on_white:
             return qta.icon(name, color=col, color_on="#ffffff", color_on_active="#ffffff")
