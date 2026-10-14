@@ -16,7 +16,7 @@ Birlestir listesi hem ana penceredeki sayfa kucuk resimleri ayni bileseni kullan
 """
 from PySide6.QtWidgets import QWidget, QScrollArea, QToolTip, QApplication
 from PySide6.QtGui import QPainter, QColor, QCursor, QPalette
-from PySide6.QtCore import Qt, QTimer, QRectF, QPointF, QPoint, Signal
+from PySide6.QtCore import Qt, QTimer, QRectF, QPointF, QPoint, Signal, QEvent
 
 
 class ReorderView(QWidget):
@@ -43,6 +43,10 @@ class ReorderView(QWidget):
         self._press = None    # (sira, basma_konumu, tutma_payi)
         self._drag = None     # {"src", "y", "gap", "grab"}
         self._timer = QTimer(self)
+        self._tip_timer = QTimer(self)       # kart dugmesi ipucu: gecikmeli (bkz. _show_action_tip)
+        self._tip_timer.setSingleShot(True)
+        self._tip_timer.setInterval(650)
+        self._tip_timer.timeout.connect(self._show_action_tip)
         self._timer.setInterval(16)   # ~60 kare/sn
         self._timer.timeout.connect(self._tick)
         self.setMouseTracking(True)
@@ -269,6 +273,8 @@ class ReorderView(QWidget):
         if e.button() != Qt.LeftButton:
             return
         key = self._action_at(e.position())
+        self._tip_timer.stop()
+        QToolTip.hideText()
         if key is not None:
             self._press = None
             self.actionTriggered.emit(key, self.hover)
@@ -299,11 +305,12 @@ class ReorderView(QWidget):
         if key != self._act_hover:
             self._act_hover = key
             self.update()
-            tip = next((a[2] for a in self.hover_actions if a[0] == key), "")
-            if tip:
-                QToolTip.showText(e.globalPosition().toPoint(), tip, self)
-            else:
-                QToolTip.hideText()
+            # ipucu ANINDA ve imlecin dibinde cikmaz (yandaki dugmeleri ortuyor, tiklamayi
+            # yutuyordu): biraz bekleyince, dugme satirinin ALTINDA gosterilir
+            QToolTip.hideText()
+            self._tip_timer.stop()
+            if key is not None:
+                self._tip_timer.start()
         if key is not None:
             self.setCursor(Qt.PointingHandCursor)
         else:
@@ -349,7 +356,27 @@ class ReorderView(QWidget):
         if i >= 0:
             self.activated.emit(i)
 
+    def event(self, e):
+        # Listenin genel ipucu ("Surukleyerek siralayin ...") kart DUGMELERININ ustunde cikmaz:
+        # orada dugmenin kendi ipucu gosterilir (ikisi ust uste binip dugmeleri ortuyordu).
+        if e.type() == QEvent.ToolTip and self._action_at(QPointF(e.pos())) is not None:
+            self._show_action_tip()
+            return True
+        return super().event(e)
+
+    def _show_action_tip(self):
+        """Kart dugmesinin ipucu: fare dugmenin ustunde bekleyince, dugme satirinin altinda."""
+        key = self._act_hover
+        rr = dict(self._action_rects(self.hover)).get(key) if key is not None else None
+        tip = next((a[2] for a in self.hover_actions if a[0] == key), "")
+        if rr is None or not tip or not self.underMouse():
+            return
+        # (QToolTip verilen konumun biraz sag altina yerlesir: satirin alt kenarindan hesaplanir)
+        pos = self.mapToGlobal(QPoint(int(rr.left()), int(rr.bottom()) - 6))
+        QToolTip.showText(pos, tip, self, rr.toRect().adjusted(-1, -1, 1, 1))
+
     def leaveEvent(self, e):
+        self._tip_timer.stop()
         if self.hover != -1 and not self._drag:
             self.hover = -1
             self._act_hover = None

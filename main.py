@@ -7,6 +7,7 @@ import sys
 import os
 import math
 import json
+import time
 # ============================================================================
 # ONEMLI - IMPORT SIRASI: PySide6, fitz'ten (PyMuPDF) ONCE yuklenmeli!
 # Ters sirada (once fitz) Windows'ta ortak DLL cakismasi yuzunden uygulama
@@ -17,36 +18,40 @@ from PySide6.QtWidgets import (
     QTextEdit, QVBoxLayout, QHBoxLayout, QGridLayout, QSplitter, QScrollArea, QFileDialog,
     QDoubleSpinBox, QSpinBox, QCheckBox, QMessageBox, QGroupBox, QButtonGroup,
     QComboBox, QMenu, QListWidget, QListWidgetItem, QAbstractItemView, QFrame, QToolButton,
-    QSpacerItem, QSizePolicy
+    QSpacerItem, QSizePolicy, QBoxLayout
 )
 from PySide6.QtGui import (QImage, QPixmap, QPainter, QPen, QColor, QCursor, QIcon,
                            QFont, QPalette, QPolygonF, QBrush, QKeySequence, QShortcut,
                            QPainterPath, QTextCharFormat, QTextCursor, QTextBlockFormat)
-from PySide6.QtCore import (Qt, QRect, QRectF, QPointF, QPoint, QSize, QSettings, QTimer, QObject, QEvent,
+from PySide6.QtCore import (Qt, QRect, QRectF, QPointF, QPoint, QSize, QSizeF, QSettings, QTimer, QObject, QEvent,
                             QEventLoop, Signal)
 
 # DIL: arayuz modulleri (modul seviyesindeki sabitleriyle) yuklenmeden ONCE secilmeli
 import i18n
 
 
-def _default_language():
-    """Kayitli dil yoksa (Store kurulumu, ilk acilis): Windows Turkce ise Turkce,
-    degilse Ingilizce. (Inno kurulumu secilen dili kayda yazar, o oncelikli.)"""
+def _system_languages():
+    """Windows'un dil listesi, kullanicinin tercih sirasiyla ('tr-TR', 'en-US' ...)."""
     from PySide6.QtCore import QLocale
-    langs = QLocale.system().uiLanguages()
-    return i18n.SOURCE if langs and langs[0].lower().startswith("tr") else "en-US"
+    try:
+        return list(QLocale.system().uiLanguages())
+    except Exception:
+        return []
 
 
+# Kayitli dil gecerliyse o (Inno kurulumu secilen dili kayda yazar); yoksa - Store kurulumu, ilk
+# acilis ya da kayit bozuksa - Windows'un desteklenen ilk dili, o da yoksa Ingilizce (i18n.resolve).
 # (REVORA_LANG ortam degiskeni: test / deneme icin kayitli ayari ezer)
-i18n.set_language(os.environ.get("REVORA_LANG")
-                  or QSettings("PdfEdit", "PdfEdit").value("language", "", type=str)
-                  or _default_language())
+i18n.set_language(i18n.resolve(os.environ.get("REVORA_LANG")
+                               or QSettings("PdfEdit", "PdfEdit").value("language", "", type=str),
+                               _system_languages()))
 from i18n import _t
 
 import fitz
-from pdf_engine import PDFEditor, PasswordError
+from pdf_engine import PDFEditor, PasswordError, RedactionError
 from merge_split import MergeDialog, SplitDialog
-from font_resolver import FONT_DISPLAY_NAMES
+import font_resolver
+import font_picker
 from dialogs import (WatermarkDialog, FormDialog, OcrDialog, ColorButton,
                      TESSERACT_HELP, ensure_tesseract_env)
 from reorder_view import ReorderView
@@ -54,6 +59,7 @@ from markup_ui import MarkupMixin, _EditorKeys
 import curve_math
 import markup_bar
 import drag_ghost
+import safe_write
 import image_tools
 import home_view
 import title_bar
@@ -102,6 +108,12 @@ def ic(name, color="#aeb3bb"):
     """Ikon dondurur: `rv.` ile baslayanlar kendi cizimimiz (markup_bar.custom_icon),
     digerleri qtawesome (yoksa bos QIcon). Devre disi hali hep soluk (ICON_DISABLED):
     geri al / yinele gibi dugmelerde "su an yapilamaz" bilgisi ikonun kendisinden okunur."""
+    ph = markup_bar.ph_name(name)[0] if HAS_QTA else None
+    if ph is not None:                         # ikon ailesi Phosphor (bkz. markup_bar.PH)
+        try:
+            return qta.icon(ph, color=color, color_disabled=ICON_DISABLED)
+        except Exception:
+            pass
     if name.startswith("rv."):
         return markup_bar.custom_icon(name, color, color_disabled=ICON_DISABLED) or QIcon()
     if HAS_QTA:
@@ -130,47 +142,67 @@ LIGHT = {
     "danger_border_hover": "#e79a9a", "danger_bg": "#fdecec",
     "readonly": "#f0f3fc", "input": "#fbfcfe", "menu_hover": "#eef0fc",
     "scroll": "#c6cee0", "scroll_hover": "#aeb8cf", "disabled": "#b0b4ba",
+    # (acik tema kullanilmiyor; yeni duzenin anahtarlari sablon calissin diye burada da var)
+    "side": "#e9ecf8", "bar": "#f7f8fc", "gold_line": "rgba(37, 99, 235, 120)", "dot": "#e2e6f4",
+    "primary": "#2563eb", "primary_hover": "#1d4ed8", "primary_press": "#1b46c2", "primary_text": "#ffffff",
+    "hi": "#2563eb", "section": "#6b7280",
+    "on_bg": "#dbe4fb", "on_line": "transparent", "on_text": "#2563eb", "on_icon": "#2563eb",
+    "seg_bg": "#dbe4fb", "seg_line": "#2563eb", "focus": "#2563eb", "focus_soft": "rgba(37, 99, 235, 120)",
+    "page_accent": (37, 99, 235), "page_sel": "rgba(37, 99, 235, 90)", "edit_line": "#2563eb",
 }
 DARK = {
-    "bg": "#17181b", "surface": "#26282c", "surface2": "#202225",
-    "border": "#33363c", "border_input": "#3c3f46",
-    "text": "#e6e8eb", "text2": "#c4c8d0", "muted": "#9aa0a6",
-    "accent": "#3b82f6", "accent_hover": "#5a97f7", "accent_press": "#2f6fe0",
-    "accent_text": "#ffffff",
-    "btn_hover": "#2f3238", "btn_press": "#33373d",
-    "tool_hover": "#2f3238", "tool_press": "#33373d",
-    "sel": "#2b3a57", "sel_text": "#e6e8eb",
+    # 2026-10-11 yeni duzen (kullanicinin begendigi ornekten OLCULEN notr griler):
+    #   side  : sol menu + baslik seridi (secili olmayan sekmeler)      212121
+    #   bar   : arac cubugu + secili sekme + sayfalar sutunu            262626
+    #   bg    : sayfa zemini (panellerden KOYU: yuzen seritler ayrissin) 1b1b1b
+    # TEK vurgu rengi acik, soluk altin (accent). Secili oge: ic renk degismez, ince altin
+    # kontur (gold_line, yari saydam) + altin ikon / yazi.
+    "bg": "#1b1b1b", "surface": "#2c2c2c", "surface2": "#262626", "side": "#212121", "bar": "#262626",
+    "border": "#323232", "border_input": "#3a3a3a",
+    "text": "#ededed", "text2": "#b4b4b4", "muted": "#7a7a7a", "section": "#989898",
+    "accent": "#ecd08f", "accent_hover": "#f3dca8", "accent_press": "#d9bd7d",
+    "accent_text": "#1b1b1b", "gold_line": "rgba(236, 208, 143, 100)", "dot": "#2e2e2e",
+    "primary": "#e4e4e4", "primary_hover": "#f2f2f2", "primary_press": "#cfcfcf", "primary_text": "#161616",
+    "btn_hover": "#333333", "btn_press": "#3a3a3a",
+    "tool_hover": "#303030", "tool_press": "#363636",
+    "sel": "#2e2e2e", "sel_text": "#ededed",
     "danger": "#f07171", "danger_border": "#6e3a3a",
     "danger_border_hover": "#8a4747", "danger_bg": "#3a2627",
-    "readonly": "#202225", "input": "#1e2024", "menu_hover": "#2f3238",
-    "scroll": "#4a4d54", "scroll_hover": "#5b5f67", "disabled": "#6b6f77",
+    "readonly": "#222222", "input": "#1b1b1b", "menu_hover": "#363636",
+    "scroll": "#3d3d3d", "scroll_hover": "#505050", "disabled": "#5a5a5a",
 }
 
 _TEMPLATE = """
 QWidget { font-family: "Segoe UI", "Segoe UI Variable", Arial, sans-serif;
           font-size: 10pt; color: %(text)s; }
-QMainWindow, #central, QDialog { background: %(bg)s; }
+QMainWindow, #central { background: %(bg)s; }
+QDialog { background: %(side)s; }
 
 QLabel#hint { color: %(muted)s; padding: 8px 2px; }
 QLabel#panelTitle { color: %(text)s; font-size: 11pt; font-weight: 600; }
 QLabel#fieldLabel { color: %(muted)s; font-size: 9pt; }
 QLabel#settingsSection { color: %(text)s; font-weight: 600; padding-top: 8px; }
-QLabel#keyCap { color: %(text2)s; font-weight: 600; }
-QListWidget#settingsNav { background: %(surface2)s; border: none; border-right: 1px solid %(border)s;
-                          padding: 8px 6px; outline: none; }
-QListWidget#settingsNav::item { color: %(text2)s; padding: 4px 8px; border-radius: 6px; }
-QListWidget#settingsNav::item:selected { background: %(sel)s; color: %(sel_text)s; }
+QLabel#keysGroup { color: %(text)s; font-weight: 600; }
+QScrollArea#keysScroll, QWidget#keysView, QWidget#keysInner { background: transparent; border: none; }
+QListWidget#settingsNav { background: %(side)s; border: none; border-right: 1px solid %(border)s;
+                          padding: 10px 10px; outline: none; }
+QListWidget#settingsNav::item { color: %(text2)s; padding: 4px 8px; border-radius: 9px; }
+QListWidget#settingsNav::item:hover { background: %(tool_hover)s; }
+QLabel#viewRowTitle { color: %(text)s; }
+QFrame#viewRowLine { background: %(border)s; border: none; }
+QListWidget#settingsNav::item { border: 1px solid transparent; }
+QListWidget#settingsNav::item:selected { background: %(on_bg)s; border: 1px solid %(on_line)s; color: %(on_text)s; }
 
-QPushButton { background: %(surface)s; border: 1px solid %(border_input)s; border-radius: 6px;
-              padding: 6px 12px; color: %(text2)s; }
+QPushButton { background: %(surface)s; border: 1px solid %(border_input)s; border-radius: 8px;
+              padding: 7px 16px; color: %(text)s; }
 QPushButton:hover { background: %(btn_hover)s; }
 QPushButton:pressed { background: %(btn_press)s; }
 QPushButton:disabled { color: %(disabled)s; background: %(bg)s; }
 
-QPushButton#primary { background: %(accent)s; border: 1px solid %(accent)s; color: %(accent_text)s;
-                      font-weight: 600; padding: 8px 12px; }
-QPushButton#primary:hover { background: %(accent_hover)s; }
-QPushButton#primary:pressed { background: %(accent_press)s; }
+QPushButton#primary { background: %(primary)s; border: 1px solid %(primary)s; color: %(primary_text)s;
+                      font-weight: 600; }
+QPushButton#primary:hover { background: %(primary_hover)s; border-color: %(primary_hover)s; }
+QPushButton#primary:pressed { background: %(primary_press)s; border-color: %(primary_press)s; }
 QPushButton#primary:disabled { background: %(border_input)s; border-color: %(border_input)s;
                                color: %(disabled)s; }
 
@@ -194,7 +226,7 @@ QLineEdit#pageEdit, QLineEdit#pageTotal { background: transparent; border: 1px s
 QLineEdit#pageTotal { padding-left: 0px; padding-right: 0px; }
 QLineEdit#pageEdit { padding-right: 0px; }
 QLineEdit#pageEdit:hover { border-color: %(border_input)s; }
-QLineEdit#pageEdit:focus { background: %(input)s; border-color: %(accent)s; color: %(text)s; }
+QLineEdit#pageEdit:focus { background: %(input)s; border-color: %(focus)s; color: %(text)s; }
 QLineEdit#pageEdit:disabled, QLineEdit#pageTotal:disabled { color: %(disabled)s; }
 
 QPushButton#segL, QPushButton#segM, QPushButton#segR {
@@ -205,8 +237,13 @@ QPushButton#segM { border-left: none; border-right: none; border-radius: 0; }
 QPushButton#segR { border-top-left-radius: 0; border-bottom-left-radius: 0;
                    border-top-right-radius: 6px; border-bottom-right-radius: 6px; }
 QPushButton#segL:checked, QPushButton#segM:checked, QPushButton#segR:checked {
-    background: %(accent)s; color: %(accent_text)s; border-color: %(accent)s; }
-QPushButton#segM:checked { border-left: 1px solid %(accent)s; border-right: 1px solid %(accent)s; }
+    background: %(seg_bg)s; color: %(on_text)s; border-color: %(seg_line)s; }
+QPushButton#segM:checked { border-left: 1px solid %(seg_line)s; border-right: 1px solid %(seg_line)s; }
+/* tema secimi (Ayarlar > Gorunum): yan yana ayri dugmeler */
+QPushButton#chip { background: %(surface)s; border: 1px solid %(border_input)s; border-radius: 8px;
+                   padding: 6px 12px 6px 10px; color: %(text2)s; }
+QPushButton#chip:hover { background: %(btn_hover)s; }
+QPushButton#chip:checked { background: %(seg_bg)s; border-color: %(seg_line)s; color: %(on_text)s; }
 QPushButton#segL:disabled, QPushButton#segM:disabled, QPushButton#segR:disabled {
     background: transparent; color: %(disabled)s; border-color: %(border)s; }
 QPushButton#segM:disabled { border-left: none; border-right: none; }
@@ -214,7 +251,7 @@ QPushButton#segM:disabled { border-left: none; border-right: none; }
 QLineEdit, QTextEdit, QComboBox, QDoubleSpinBox, QSpinBox {
     background: %(input)s; border: 1px solid %(border_input)s; border-radius: 6px; padding: 5px 8px;
     color: %(text)s; selection-background-color: %(accent)s; selection-color: %(accent_text)s; }
-QLineEdit:focus, QTextEdit:focus, QComboBox:focus, QDoubleSpinBox:focus { border-color: %(accent)s; }
+QLineEdit:focus, QTextEdit:focus, QComboBox:focus, QDoubleSpinBox:focus { border-color: %(focus)s; }
 QLineEdit[readOnly="true"] { background: %(readonly)s; color: %(muted)s; }
 /* acilir liste hep kutunun ALTINDA acilsin (secili oge kutunun ustune hizalanip yukari tasmasin) */
 QComboBox { combobox-popup: 0; }
@@ -242,24 +279,100 @@ QSlider::handle:horizontal { background: %(surface)s; border: 2px solid %(accent
 QComboBox QAbstractItemView { border: 1px solid %(border_input)s; background: %(surface)s;
     color: %(text)s; selection-background-color: %(accent)s; selection-color: %(accent_text)s; outline: none; }
 
+QProgressBar { background: %(border_input)s; border: none; border-radius: 3px; min-height: 6px;
+               max-height: 6px; qproperty-textVisible: false; }
+QProgressBar::chunk { background: %(hi)s; border-radius: 3px; }
+QProgressDialog { background: %(surface)s; min-width: 260px; }
+QProgressDialog QLabel { padding: 8px 2px 2px 2px; }
 QGroupBox { border: 1px solid %(border)s; border-radius: 8px; margin-top: 16px;
             background: %(surface)s; padding: 8px; }
 QGroupBox::title { subcontrol-origin: margin; left: 10px; padding: 0 4px; color: %(muted)s; }
 
-QCheckBox { spacing: 7px; }
+QCheckBox, QRadioButton { spacing: 8px; }
+QCheckBox::indicator { width: 15px; height: 15px; border: 1px solid #5a5a5a; border-radius: 4px;
+                       background: %(input)s; }
+QCheckBox::indicator:hover, QRadioButton::indicator:hover { border-color: %(muted)s; }
+QCheckBox::indicator:checked { border-color: %(accent)s; image: url(%(img_check)s); }
+QRadioButton::indicator { width: 15px; height: 15px; border: 1px solid #5a5a5a; border-radius: 8px;
+                          background: transparent; }
+QRadioButton::indicator:checked { border-color: %(accent)s; image: url(%(img_radio)s); }
+QCheckBox::indicator:disabled, QRadioButton::indicator:disabled { border-color: %(border_input)s; }
+/* Pasif secenek GORUNUR bicimde pasif: yazisi soluk, isareti de soluk. Eskiden yalniz kutunun
+   kenari degisiyordu; isaretli ama o an gecersiz bir secenek etkin gibi duruyordu. */
+QCheckBox:disabled, QRadioButton:disabled { color: %(disabled)s; }
+QCheckBox::indicator:checked:disabled { border-color: %(border_input)s; image: url(%(img_check_off)s); }
+QRadioButton::indicator:checked:disabled { border-color: %(border_input)s; image: url(%(img_radio_off)s); }
+/* secim karti (pencerelerde "hangisi?" sorusu: Excel'e aktar): bkz. dialogs.ChoiceCard */
+QFrame#choiceCard { background: %(surface2)s; border: 1px solid %(border_input)s; border-radius: 10px; }
+QFrame#choiceCard:hover { border-color: %(muted)s; }
+QFrame#choiceCard[sel="true"] { background: %(sel)s; border: 1px solid %(accent)s; }
+QLabel#cardTitle { color: %(text)s; font-size: 10.5pt; font-weight: 600; background: transparent; }
+/* aciklama KARAR icin okunur: soluk "muted" degil ikinci metin rengi (Codex incelemesi 2026-10-13) */
+QLabel#cardDesc { color: %(text2)s; font-size: 9.5pt; background: transparent; }
+QLabel#dlgSection { color: %(section)s; font-size: 8.5pt; font-weight: 600; }
+QLabel#dlgNote { color: %(text2)s; font-size: 9.5pt; }
+/* klavye odagini dialogs.FocusRing gosterir: yerel noktali cerceve ayrica cizilmesin */
+QDialog#ringDialog QCheckBox, QDialog#ringDialog QRadioButton, QDialog#ringDialog QPushButton { outline: none; }
+QLineEdit#scopeRange:disabled { color: %(disabled)s; background: transparent; border-color: %(border)s; }
+QLineEdit#scopeRange[bad="true"] { border-color: %(danger)s; }
+/* Yazdir penceresi (print_dialog): solda ayarlar, sagda onizleme (zemini kendisi cizer) */
+QFrame#printDivider { background: %(border)s; border: none; }
+QScrollArea#printPreview, QWidget#printPreviewBody { background: transparent; border: none; }  /* (zemin: noktali desen, Preview cizer) */
+QLabel#printPageNo { color: %(muted)s; font-size: 8.5pt; background: transparent; }
+QPushButton#linkButton { background: transparent; border: none; padding: 2px 0px; color: %(accent)s;
+                         text-align: left; }
+QPushButton#linkButton:hover { text-decoration: underline; background: transparent; }
 
-#topbar { background: %(surface)s; border-bottom: 1px solid %(border)s; }
+/* ---- sol menu (ust serit yerine): kaydet / geri al, sayfa, bul, modlar, belge isleri, ayarlar */
+QFrame#sidePanel { background: %(side)s; border: none; border-right: 1px solid %(border)s; }
+QScrollArea#sideScroll, QWidget#sideView, QWidget#sideMid { background: transparent; border: none; }
+QScrollArea#sideScroll QScrollBar:vertical { width: 8px; margin: 2px 0px; }
+QScrollArea#sideScroll QScrollBar::handle:vertical { margin: 0px 2px; border-radius: 2px; }
+/* bolum basligi solda (logo / ust ikonlarla ayni hizada), altindaki satirlar biraz ICERIDE */
+QLabel#sideSection { color: %(section)s; font-size: 7.5pt; font-weight: 600; padding: 14px 10px 5px 12px; }
+QPushButton#sideItem { background: transparent; border: 1px solid transparent; border-radius: 9px;
+                       padding: 7px 10px 7px 24px; color: %(text2)s; text-align: left; }
+QPushButton#sideItem:hover { background: %(tool_hover)s; }
+QPushButton#sideItem:pressed { background: %(tool_press)s; }
+QPushButton#sideItem:checked { background: %(on_bg)s; border: 1px solid %(on_line)s; color: %(on_text)s;
+                               font-weight: 600; }
+QPushButton#sideItem:disabled { color: %(disabled)s; }
+QPushButton#sideItem::menu-indicator { image: none; }
+QPushButton#sideItem[mini="true"] { padding: 7px 0px; text-align: center; }
+QLabel#sideSection[mini="true"] { padding: 0px; margin: 9px 7px 6px 7px; border-top: 1px solid %(border)s;
+                                  min-height: 0px; max-height: 0px; }
+QFrame#sideField, QLineEdit#sideFind { background: %(input)s; border: 1px solid %(border)s; border-radius: 9px; }
+QLineEdit#sideFind { padding: 6px 6px; color: %(text)s; }
+QLineEdit#sideFind:focus { border-color: %(focus_soft)s; }
+QLineEdit#sideFind:disabled { color: %(disabled)s; }
+QToolButton#sideHint { color: %(muted)s; font-size: 8pt; background: transparent; border: none; padding: 2px 4px; }
+QToolButton#sideHint:hover { color: %(text)s; }
+QToolButton#sideHint[none="true"] { color: %(danger)s; }
+
+/* ---- sabit arac cubugu: ikon + altinda yazi; secili arac ince altin konturlu */
+QFrame#toolBar { background: %(bar)s; border: none; border-bottom: 1px solid %(border)s; }
+QFrame#toolRow { background: transparent; border: none; }
+QToolButton#barTool { background: transparent; border: 1px solid transparent; border-radius: 10px;
+                      padding: 6px 6px 4px 6px; color: %(text2)s; font-size: 8.5pt; }
+QToolButton#barTool:hover { background: %(tool_hover)s; }
+QToolButton#barTool:pressed { background: %(tool_press)s; }
+QToolButton#barTool:checked { background: %(on_bg)s; border: 1px solid %(on_line)s; color: %(on_text)s; }
+QToolButton#barTool:disabled { color: %(disabled)s; }
+
 #inspector { background: %(surface)s; border-left: 1px solid %(border)s; }
 
 QSplitter::handle { background: %(border)s; }
 QScrollArea { border: none; background: %(bg)s; }
 QScrollArea#inspectorScroll { background: %(surface)s; }
 
-QScrollArea#thumbs { background: %(surface2)s; border: none; border-right: 1px solid %(border)s; }
-#thumbsHead { background: %(surface2)s; border-right: 1px solid %(border)s; }
+QScrollArea#thumbs { background: %(surface2)s; border: none; }
+#thumbsHead { background: %(surface2)s; }
+#thumbsPane { background: %(border)s; }   /* tuvalle arasindaki 1 px cizgi: bkz. set_thumbs_side */
 QScrollArea#thumbs > QWidget { background: %(surface2)s; }
 
-QStatusBar { background: %(surface)s; border-top: 1px solid %(border)s; color: %(muted)s; }
+QLabel#hintPill { background: %(surface)s; border: 1px solid %(border_input)s; border-radius: 10px;
+                  padding: 7px 14px; color: %(text)s; font-size: 9.5pt; }
+QStatusBar { background: %(side)s; border-top: 1px solid %(border)s; color: %(muted)s; }
 QStatusBar QLabel { color: %(muted)s; }
 
 QMenu { background: %(surface)s; border: 1px solid %(border_input)s; border-radius: 8px; padding: 4px;
@@ -270,12 +383,13 @@ QMenu::item:selected { background: %(menu_hover)s; }
 /* Isaretle: ShareX tarzi ust cubuk */
 #canvasColumn { background: %(bg)s; }
 #mkBarHost { background: transparent; }
-QFrame#mkPill { background: %(surface)s; border: 1px solid %(border)s; border-radius: 10px; }
+QFrame#mkPill { background: %(surface)s; border: 1px solid %(border_input)s; border-radius: 12px; }
 QToolButton#mkTool, QToolButton#mkToolDanger { background: transparent; border: none;
     border-radius: 7px; padding: 4px; color: %(text2)s; }
 QToolButton#mkTool:hover, QToolButton#mkToolDanger:hover { background: %(tool_hover)s; }
 QToolButton#mkTool:pressed { background: %(tool_press)s; }
-QToolButton#mkTool:checked { background: %(accent)s; color: %(accent_text)s; }
+QToolButton#mkTool { border: 1px solid transparent; }
+QToolButton#mkTool:checked { background: %(on_bg)s; border: 1px solid %(on_line)s; color: %(on_text)s; }
 QToolButton#mkTool:disabled { background: transparent; }
 QToolButton#mkZoomPct { background: transparent; border: none; border-radius: 6px;
                         color: %(text2)s; font-size: 8.5pt; padding: 3px 2px; min-width: 34px; }
@@ -289,40 +403,68 @@ QFrame#mkSepStrong { background: %(muted)s; border-radius: 1px; }
 QLabel#mkLabel { color: %(muted)s; padding: 0 6px; }
 QFrame#mkPopover { background: %(surface)s; border: 1px solid %(border_input)s; border-radius: 10px; }
 QFrame#mkPill QComboBox, QFrame#mkPill QDoubleSpinBox, QFrame#mkPill QSpinBox { padding: 3px 6px; }
-/* Bul / Degistir cubugu */
-QFrame#mkPill QLineEdit { padding: 3px 8px; border-radius: 7px; }
-QLabel#findCount { color: %(muted)s; font-size: 9pt; background: transparent; border: none; }
-QLabel#findCount[none="true"] { color: %(danger)s; }
-QToolButton#findBtn { background: %(tool_hover)s; border: none; border-radius: 7px; padding: 3px 12px;
-                      color: %(text)s; }
-QToolButton#findBtn:hover { background: %(border_input)s; }
-QToolButton#findBtn:disabled { color: %(disabled)s; }
-QToolButton#findSeg { background: transparent; border: none; border-radius: 7px; padding: 2px 10px;
-                      color: %(muted)s; font-size: 9pt; }
-QToolButton#findSeg:hover { background: %(tool_hover)s; }
-QToolButton#findSeg:checked { background: %(tool_press)s; color: %(text)s; }
+/* Bul / Degistir paneli (find_bar.FindBar; zemini, sekmeleri ve kivrimlari paintEvent cizer) */
+QFrame#findPanel { background: transparent; border: none; }
+QFrame#findPanel QLineEdit { padding: 3px 8px; border-radius: 8px; }
+QFrame#findPanel QLineEdit:focus { border-color: %(focus_soft)s; }
+QLabel#findLabel { color: %(text2)s; font-size: 9pt; background: transparent; }
+QLabel#findStatus { color: %(muted)s; font-size: 9pt; background: transparent; }
+QLabel#findStatus[none="true"] { color: %(danger)s; }
+QToolButton#findTab { background: transparent; border: none; color: %(muted)s; font-size: 9.5pt; }
+QToolButton#findTab:hover { color: %(text2)s; }
+QToolButton#findTab:checked { color: %(text)s; font-weight: 600; }
+QToolButton#findTab:focus { color: %(text)s; }
+QToolButton#findIcon { background: transparent; border: 1px solid transparent; border-radius: 7px; padding: 2px; }
+QToolButton#findIcon:hover { background: %(btn_press)s; }
+QToolButton#findIcon:pressed { background: %(btn_hover)s; }
+/* kapsam ve "Tumunu": acilir pencerelerin ikinci dugmesiyle (QPushButton, ör. Vazgec) ayni dil -
+   paneldeki yuzeyden bir ton acik zemin + ince sinir; ustune gelince yalniz zemin degisir.
+   Secili kapsam vurgu rengi; Degistir ana dugme (QPushButton#primary ile ayni) */
+QPushButton#findScope, QPushButton#findSecondary { background: %(btn_hover)s; border: 1px solid %(border_input)s;
+    border-radius: 8px; color: %(text)s; font-size: 9pt; padding: 0px 8px; }
+QPushButton#findScope:hover, QPushButton#findSecondary:hover { background: %(btn_press)s; }
+QPushButton#findScope:pressed, QPushButton#findSecondary:pressed { background: %(btn_press)s; }
+QPushButton#findScope:checked { background: %(on_bg)s; border: 1px solid %(on_line)s; color: %(on_text)s; }
+QPushButton#findScope:focus, QPushButton#findSecondary:focus { border: 1px solid %(focus)s; }
+QPushButton#findSecondary:disabled { color: %(disabled)s; border-color: %(border)s; }
+/* (ic bosluk sifir: dugmenin boyu sabit 30 px; genel QPushButton'in 7 px'lik ust / alt boslugu
+   kalinca yaziya 14 px kaliyor, "Değiştir"in g'sinin kuyrugu kesiliyordu) */
+QPushButton#findPrimary { background: %(primary)s; border: 1px solid %(primary)s; border-radius: 8px;
+                          color: %(primary_text)s; font-size: 9pt; font-weight: 600; padding: 0px 8px; }
+QPushButton#findPrimary:hover { background: %(primary_hover)s; border-color: %(primary_hover)s; }
+QPushButton#findPrimary:pressed { background: %(primary_press)s; border-color: %(primary_press)s; }
+QPushButton#findPrimary:focus { border: 1px solid %(focus)s; }
+QPushButton#findPrimary:disabled { background: %(primary_off)s; border-color: %(primary_off)s; color: %(primary_off_text)s; }
+QToolButton#findCase { background: transparent; border: 1px solid %(border_input)s; border-radius: 7px;
+                       color: %(text2)s; font-size: 9pt; }
+QToolButton#findCase:hover { background: %(btn_hover)s; color: %(text)s; }
+QToolButton#findCase:checked { background: %(on_bg)s; border: 1px solid %(on_line)s; color: %(on_text)s; }
+QToolButton#findCase:focus { border: 1px solid %(focus)s; }
 QTextEdit#mkInlineText, QTextEdit#mkInlineEdit { background: rgba(255, 255, 255, 245);
-    border: 2px solid %(accent)s; border-radius: 4px; padding: 2px; }
+    border: 2px solid %(edit_line)s; border-radius: 4px; padding: 2px; }
 QTextEdit#mkInlineEdit { background: #ffffff; }   /* opak: alttaki orijinal yazi golge yapmasin */
 /* canli duzenleme: kutu GORUNMEZ (yazi PDF motoruyla sayfaya cizilir); sadece imlec + secim */
 QTextEdit#mkInlineLive { background: transparent; border: none; padding: 0px; color: #111111;
-    selection-background-color: rgba(59, 130, 246, 110); selection-color: transparent; }
+    selection-background-color: %(page_sel)s; selection-color: transparent; }
 QTextEdit#mkInlineText { color: #111111; }
 
 /* Kaydirma cubugu: GORUNEN tutamac 8 px (eskiden 6), TUTULAN alan 12 px. Tutamacin cevresinde
    2 px gorunmez kenarlik var (background-clip: padding): ince gorunur ama fareyle yakalamasi
    kolay. (Karsilastirma: macOS ~7 px, ustune gelince 11; Windows 11 ~6-8; klasik Windows 17.) */
-QScrollBar:vertical { background: transparent; width: 12px; margin: 0px; }
-QScrollBar::handle:vertical { background: %(scroll)s; border: 2px solid transparent; border-radius: 6px;
-                              background-clip: padding; min-height: 36px; }
+QScrollBar:vertical { background: transparent; width: 12px; margin: 4px 0px; }
+/* tutamac: uclari TAM yuvarlak ince bir hap (8 px), cubugun iki ucundan 4 px iceride. (Eskiden
+   saydam kenarlik + background-clip ile inceltiliyordu: Qt o durumda koseleri yuvarlatmiyor,
+   tutamac kose gibi gorunuyordu.) */
+QScrollBar::handle:vertical { background: %(scroll)s; border: none; border-radius: 4px; margin: 0px 2px;
+                              min-height: 36px; }
 QScrollBar::handle:vertical:hover { background: %(scroll_hover)s; }
-QScrollBar:horizontal { background: transparent; height: 12px; margin: 0px; }
-QScrollBar::handle:horizontal { background: %(scroll)s; border: 2px solid transparent; border-radius: 6px;
-                                background-clip: padding; min-width: 36px; }
+QScrollBar:horizontal { background: transparent; height: 12px; margin: 0px 4px; }
+QScrollBar::handle:horizontal { background: %(scroll)s; border: none; border-radius: 4px; margin: 2px 0px;
+                                min-width: 36px; }
 QScrollBar::handle:horizontal:hover { background: %(scroll_hover)s; }
 QScrollBar::add-page, QScrollBar::sub-page { background: transparent; }
-/* sol sayfa paneli dar: orada gorunen tutamac 6 px (8 kalin duruyordu), tutulan alan yine 12 px */
-QScrollArea#thumbs QScrollBar::handle:vertical { border: 3px solid transparent; }
+/* sayfalar paneli dar: orada tutamac 6 px */
+QScrollArea#thumbs QScrollBar::handle:vertical { margin: 0px 3px; border-radius: 3px; }
 QScrollBar::add-line, QScrollBar::sub-line { height: 0; width: 0; }
 """
 
@@ -330,25 +472,57 @@ QScrollBar::add-line, QScrollBar::sub-line { height: 0; width: 0; }
 def _arrow_images(dark):
     """Tema renginde kucuk ok resimleri (QSS url() ile kullanilir); gecici klasore yazilir."""
     import tempfile
-    col = "#c4c8d0" if dark else "#4b5058"
-    d = os.path.join(tempfile.gettempdir(), "revora_ui")
+    col = DARK["text2"] if dark else "#4b5058"
+    d = os.path.join(tempfile.gettempdir(), "revora_ui2")
     os.makedirs(d, exist_ok=True)
     out = {}
     for key, name in (("arrow_up", "mdi6.chevron-up"), ("arrow_down", "mdi6.chevron-down"),
                       ("arrow_combo", "mdi6.chevron-down")):
-        path = os.path.join(d, f"{key}_{'d' if dark else 'l'}.png")
+        path = os.path.join(d, f"{key}_{col.strip('#')}.png")
         if not os.path.exists(path):
             try:
                 import qtawesome as qta
-                qta.icon(name, color=col).pixmap(32, 32).save(path)
+                qta.icon(markup_bar.ph_name(name)[0] or name, color=col).pixmap(32, 32).save(path)
             except Exception:
                 pass
+        out[key] = path.replace("\\", "/")
+    pal = DARK if dark else LIGHT
+    # (_off: pasif ama isaretli kutu / dugme icin soluk isaret)
+    for key, kind, acc in (("img_check", "check", pal["accent"]), ("img_radio", "radio", pal["accent"]),
+                           ("img_check_off", "check", pal["disabled"]), ("img_radio_off", "radio", pal["disabled"])):
+        path = os.path.join(d, f"{key}_{acc.strip('#')}.png")
+        if not os.path.exists(path):
+            im = QImage(60, 60, QImage.Format_ARGB32)
+            im.fill(Qt.transparent)
+            p = QPainter(im)
+            p.setRenderHint(QPainter.Antialiasing)
+            if kind == "radio":
+                p.setPen(Qt.NoPen)
+                p.setBrush(QColor(acc))
+                p.drawEllipse(QPointF(30, 30), 13, 13)
+            else:
+                pen = QPen(QColor(acc), 7, Qt.SolidLine, Qt.RoundCap, Qt.RoundJoin)
+                p.setPen(pen)
+                p.drawPolyline([QPointF(14, 31), QPointF(25, 42), QPointF(46, 19)])
+            p.end()
+            im.save(path)
         out[key] = path.replace("\\", "/")
     return out
 
 
+def _blend(a, b, t):
+    """Iki rengin karisimi (#rrggbb; t: b'nin payi)."""
+    a, b = QColor(a), QColor(b)
+    return QColor(round(a.red() + (b.red() - a.red()) * t), round(a.green() + (b.green() - a.green()) * t),
+                  round(a.blue() + (b.blue() - a.blue()) * t)).name()
+
+
 def build_style(dark):
-    return _TEMPLATE % {**(DARK if dark else LIGHT), **_arrow_images(dark)}
+    c = DARK if dark else LIGHT
+    # pasif ana dugme: yuzeyi KAYBOLMAZ, vurgu rengi zemine dogru solar (Bul / Degistir paneli)
+    extra = {"primary_off": _blend(c["primary"], c["surface"], 0.62),
+             "primary_off_text": _blend(c["primary_text"], c["surface"], 0.45)}
+    return _TEMPLATE % {**c, **extra, **_arrow_images(dark)}
 
 
 def build_palette(dark):
@@ -372,6 +546,7 @@ def build_palette(dark):
     pal.setColor(QPalette.Highlight, QColor(p["accent"]))
     pal.setColor(QPalette.HighlightedText, QColor(p["accent_text"]))
     pal.setColor(QPalette.Link, QColor(p["accent"]))
+    pal.setColor(QPalette.BrightText, QColor(p["primary_text"]))    # onay dugmesinin ustundeki ikon / yazi
     # kenarlik tonlari: Birlestir/Ayir pencereleri renklerini buradan okur
     # (ayarlanmazsa Qt'nin acik gri varsayilanlari koyu temada da kalir)
     pal.setColor(QPalette.Light, surf)
@@ -386,14 +561,111 @@ def pix_to_qimage(pix):
     return img.copy()
 
 
-ACCENT = QColor(37, 99, 235)
+ACCENT = QColor(37, 99, 235)       # sayfanin USTUNDEKI secim / kilavuz rengi (temaya gore: set_theme)
+
+# ---------------------------------------------------------------------------
+# Gorunum (Ayarlar > Gorunum): UC BAGIMSIZ secim; hepsi koyu arayuz.
+#   ZEMIN (BACKDROPS): night    = en koyu (VARSAYILAN; kullanicinin ornek gorselinden OLCULEN tonlar)
+#                      graphite = bir ton acik, notr gri (2026-10-11'deki ilk yeni duzen)
+#                      steel    = maviye calan gri (eski arayuzun havasi, biraz daha mavi)
+#   RENK  (ACCENTS):   blue (VARSAYILAN) · gold · plain (renksiz: beyaz / gri)
+#   BICIM (STYLES):    line = secili ogenin cevresinde ince kontur, ici bos
+#                      fill = secili ogenin ici renkle dolu (VARSAYILAN; kullanici 2026-10-12)
+# set_theme ucunu birlestirir, DARK sozlugunu YERINDE gunceller (her yer ayni sozlugu okur).
+# Uretilen anahtarlar: on_* secili dugme / satir · seg_* bolmeli dugmenin secili parcasi ·
+# focus* yazi kutusu odagi · hi vurgu renginin kendisi · page_accent sayfanin USTUNDEKI secim
+# cercevesi / kilavuz (beyaz kagitta okunmali: HER secim renginde ayni mavi).
+# ---------------------------------------------------------------------------
+_NIGHT = {
+    "bg": "#0e0e0e", "side": "#141414", "bar": "#1b1b1b", "surface": "#222222", "surface2": "#1b1b1b",
+    "border": "#262626", "border_input": "#303030", "input": "#0f0f0f", "dot": "#202020",
+    "btn_hover": "#2a2a2a", "btn_press": "#303030", "tool_hover": "#242424", "tool_press": "#2b2b2b",
+    "sel": "#262626", "readonly": "#161616", "menu_hover": "#2e2e2e",
+    "scroll": "#343434", "scroll_hover": "#474747", "danger_bg": "#2e1e1f",
+}
+_STEEL = {
+    "bg": "#14161a", "side": "#1a1d23", "bar": "#20242b", "surface": "#272c35", "surface2": "#20242b",
+    "border": "#2d323c", "border_input": "#39404c", "input": "#14161a", "dot": "#262b33",
+    "btn_hover": "#2f3540", "btn_press": "#373e4a", "tool_hover": "#2a2f39", "tool_press": "#323845",
+    "sel": "#2a2f39", "readonly": "#1a1d23", "menu_hover": "#333a47",
+    "scroll": "#3c434f", "scroll_hover": "#4f5766", "danger_bg": "#3a2627",
+    "text": "#e8eaee", "text2": "#b7bcc6", "muted": "#7f8693", "disabled": "#5a606c", "section": "#9aa1ae",
+}
+# Grafit: zemin acik oldugu icin yazi / ikon grileri bir tik ACIK (ayni grilerle zeminle arasindaki
+# fark azaliyor, arayuz soluk gorunuyordu - kullanici, 2026-10-11)
+_GRAPHITE = {"text": "#f4f4f4", "text2": "#cbcbcb", "muted": "#929292", "disabled": "#666666",
+             "section": "#acacac"}
+BACKDROPS = {"night": _NIGHT, "graphite": _GRAPHITE, "steel": _STEEL}
+ACCENTS = {
+    # (primary*: pencerelerdeki ONAY dugmesi - secim bicimi ne olursa olsun hep DOLGULU)
+    "blue": {"hi": "#5b9cf8", "line": "rgba(91, 156, 248, 125)", "fill": "#3b82f6", "fill_text": "#ffffff",
+             "primary": "#3b82f6", "primary_hover": "#5a97f7", "primary_press": "#2f6fe0", "primary_text": "#ffffff",
+             "accent": "#5b9cf8", "accent_hover": "#7db1fa", "accent_press": "#4686e6", "accent_text": "#0e1726",
+             "focus": "#5b9cf8", "focus_soft": "rgba(91, 156, 248, 125)",
+             "page_accent": (37, 99, 235), "page_sel": "rgba(37, 99, 235, 90)", "edit_line": "#2563eb"},
+    "gold": {"hi": "#ecd08f", "line": "rgba(236, 208, 143, 100)", "fill": "#ecd08f", "fill_text": "#1b1b1b",
+             "primary": "#ecd08f", "primary_hover": "#f3dca8", "primary_press": "#d9bd7d", "primary_text": "#1b1b1b",
+             "accent": "#ecd08f", "accent_hover": "#f3dca8", "accent_press": "#d9bd7d", "accent_text": "#1b1b1b",
+             "focus": "#ecd08f", "focus_soft": "rgba(236, 208, 143, 100)",
+             # (sayfanin USTUNDEKI secim / yazi kutusu rengi her secim renginde AYNI mavi: beyaz kagitta
+             #  altin okunmuyordu - kullanici, 2026-10-11)
+             "page_accent": (37, 99, 235), "page_sel": "rgba(37, 99, 235, 90)", "edit_line": "#2563eb"},
+    "plain": {"hi": "#ffffff", "line": "rgba(255, 255, 255, 95)", "fill": "rgba(255, 255, 255, 22)",
+              "fill_text": "#ffffff",
+              "accent": "#d8d8d8", "accent_hover": "#ececec", "accent_press": "#c4c4c4", "accent_text": "#161616",
+              "focus": "#787878", "focus_soft": "#565656",
+              "page_accent": (37, 99, 235), "page_sel": "rgba(37, 99, 235, 90)", "edit_line": "#2563eb"},
+}
+STYLES = ("line", "fill")
+THEME_DEFAULT = ("night", "blue", "fill")
+BACKDROP_DOTS = {"night": "#0e0e0e", "graphite": "#3a3a3a", "steel": "#2c3644"}      # Ayarlar'daki benekler
+ACCENT_DOTS = {"blue": "#5b9cf8", "gold": "#ecd08f", "plain": "#d8d8d8"}
+_DARK_BASE = dict(DARK)
+
+
+def set_theme(backdrop=None, accent=None, style=None):
+    """Gorunumu sec; taninmayan / bos deger varsayilana duser. (zemin, renk, bicim) dondurur.
+    Arayuzu yenilemek MainWindow.set_ui_theme'in isi."""
+    bg = backdrop if backdrop in BACKDROPS else THEME_DEFAULT[0]
+    ac = accent if accent in ACCENTS else THEME_DEFAULT[1]
+    st = style if style in STYLES else THEME_DEFAULT[2]
+    a = ACCENTS[ac]
+    DARK.clear()
+    DARK.update(_DARK_BASE)
+    DARK.update(BACKDROPS[bg])
+    DARK.update(a)
+    if st == "fill":
+        seg = "rgba(255, 255, 255, 44)" if ac == "plain" else a["fill"]     # (dugme zemini zaten acik: daha belirgin)
+        DARK.update({"on_bg": a["fill"], "on_line": "transparent", "on_text": a["fill_text"],
+                     "on_icon": a["fill_text"], "seg_bg": seg,
+                     "seg_line": "rgba(255, 255, 255, 70)" if ac == "plain" else seg})
+    else:
+        DARK.update({"on_bg": "transparent", "on_line": a["line"], "on_text": a["hi"], "on_icon": a["hi"],
+                     "seg_bg": "transparent", "seg_line": a["line"]})
+    ACCENT.setRgb(*DARK["page_accent"])
+    markup_bar.ICON_ON = DARK["on_icon"]
+    markup_bar.ICON_COLOR["dark"] = DARK["text2"]      # ikonlar yaziyla ayni gri (zemine gore degisir)
+    return bg, ac, st
+
+
+set_theme()
 TEXT_SEL = QColor(230, 50, 50)
 INSERT_COL = QColor(40, 170, 90)
 GUIDE_COL = QColor(236, 72, 153)     # akilli kilavuz cizgisi (secim kirmizisi ve vurgu mavisinden ayri)
 HANDLE_PX = 4.5       # tutamac yari-genisligi (ekran pikseli)
+GROUP_ROT_PX = 24     # toplu secimin dondurme tutamaci, dis cercevenin ne kadar ustunde (ekran pikseli)
 DRAG_START_PX = 4     # bu kadar oynamadan surukleme baslamaz (yanlislikla tasimayi onler)
 SNAP_PX = 7           # yapisma mesafesi (ekran pikseli)
-MAX_RENDER_PIXELS = 40_000_000
+MAX_RENDER_PIXELS = 40_000_000       # (eski tam sayfa siniri; artik bolge cizimi var - asagida)
+# YUKSEK YAKINLIKTA BOLGE CIZIMI (2026-10-13). Sayfanin tamami FULL_RENDER_PIXELS'i asiyorsa
+# yalniz gorunen alan + cevresi (her yanda REGION_MARGIN x gorunen alan, en cok REGION_PIXELS)
+# keskin cizilir; gerisi dusuk cozunurluklu bir tam sayfa goruntusuyle (LOW_PIXELS) doldurulur.
+# Eskiden %800'de A4 icin 32 milyon piksel ciziliyordu (yuzlerce ms, ~100 MB); A0'dan buyuk
+# sayfada sinir delinip GB'larca bellek istenebiliyordu. Simdi cizilen alan ekranla sinirli.
+FULL_RENDER_PIXELS = 6_000_000
+REGION_PIXELS = 8_000_000
+REGION_MARGIN = 0.4
+LOW_PIXELS = 1_500_000
 MIN_ZOOM, MAX_ZOOM = 0.25, 8.0   # %25 - %800
 
 HANDLE_CURSORS = {
@@ -466,6 +738,10 @@ class PDFCanvas(QWidget):
         self._pix = None
         self.disp = fitz.Identity       # sayfa -> ekran (sayfa donusu)
         self.derot = fitz.Identity      # ekran -> sayfa
+        self.pix_org = QPoint(0, 0)     # goruntunun sayfadaki sol-ust kosesi (bolge cizimi; cihaz pikseli)
+        self.pix_full = QSize(0, 0)     # sayfanin tamaminin boyutu (cihaz pikseli)
+        self.region = False             # goruntu sayfanin yalniz bir bolgesi mi (yuksek yakinlik)
+        self._low = None                # bolgenin disi icin dusuk cozunurluklu tam sayfa
         self.bg = None                  # surukleme: nesnesiz sayfa goruntusu (yoksa asil sayfa)
         self.ghost = None               # surukleme: (nesnenin goruntusu, sol-ust sayfa noktasi, kirpma cokgeni|None)
         self._panning = False
@@ -479,13 +755,53 @@ class PDFCanvas(QWidget):
     def has_page(self):
         return self._pix is not None
 
-    def set_page(self, qimg, dpr, disp, derot):
+    def set_page(self, qimg, dpr, disp, derot, full=None, org=None, low=None):
+        """qimg: sayfa goruntusu. Yuksek yakinlikta sayfanin yalniz bir BOLGESI cizilir; o zaman
+        full = sayfanin tamaminin boyutu (QSize, cihaz pikseli), org = goruntunun sayfadaki sol-ust
+        kosesi (QPoint, cihaz pikseli), low = bolgenin disini dolduran dusuk cozunurluklu tam sayfa."""
         self._pix = QPixmap.fromImage(qimg)
         self._pix.setDevicePixelRatio(dpr)
+        self._pix_zoom = self.zoom             # goruntunun cizildigi yakinlik
+        self.pix_org = QPoint(org) if org is not None else QPoint(0, 0)
+        self.pix_full = QSize(full) if full is not None else qimg.size()
+        self.region = full is not None
+        self._low = QPixmap.fromImage(low) if low is not None else None
         self.bg = self.ghost = None
         self.dpr, self.disp, self.derot = dpr, disp, derot
-        self.setFixedSize(QSize(round(qimg.width() / dpr),
-                                round(qimg.height() / dpr) + self.pad_top + self.pad_bottom))
+        self.fit_size()
+        self.update()
+
+    def page_size(self):
+        """Sayfanin tamami, cizildigi yakinlikta (mantiksal piksel)."""
+        return QSizeF(self.pix_full.width() / self.dpr, self.pix_full.height() / self.dpr)
+
+    def fit_size(self, full=None, dpr=None):
+        """Tuvalin boyutu = sayfanin tamami (+ ust / alt pay). full / dpr: goruntu konmadan ONCE
+        boyutu ayarlamak icin (bolge ciziminde gorunen alan yeni boyuta gore olculur)."""
+        if full is not None:
+            w, h = full.width() / dpr, full.height() / dpr
+        else:
+            k, sz = self.stretch(), self.page_size()
+            w, h = sz.width() * k, sz.height() * k
+        self.setFixedSize(QSize(round(w), round(h) + self.pad_top + self.pad_bottom))
+
+    def pix_rect(self):
+        """Eldeki goruntunun sayfada kapladigi bolge (cihaz pikseli)."""
+        return QRect(self.pix_org, self._pix.size())
+
+    def stretch(self):
+        """Gosterilen goruntu, cizildigi yakinliga gore kac kat gerilmis (1.0: keskin).
+        Yakinlastirirken sayfa hemen yeniden cizilmez: eldeki goruntu gerilerek gosterilir
+        (preview_zoom), kullanici durunca keskini cizilir (MainWindow._zoom_settle)."""
+        z0 = getattr(self, "_pix_zoom", None)
+        return self.zoom / z0 if (self._pix is not None and z0) else 1.0
+
+    def preview_zoom(self, zoom):
+        """Yakinligi HEMEN degistir: eldeki goruntuyu gererek goster (yeniden cizmeden)."""
+        self.zoom = zoom
+        if self._pix is None:
+            return
+        self.fit_size()
         self.update()
 
     def set_pad_top(self, px):
@@ -493,12 +809,12 @@ class PDFCanvas(QWidget):
         if px != self.pad_top:
             self.pad_top = px
             if self._pix is not None:
-                sz = self._pix.deviceIndependentSize()
-                self.setFixedSize(QSize(round(sz.width()), round(sz.height()) + px + self.pad_bottom))
+                self.fit_size()
             self.update()
 
     def clear_page(self):
-        self._pix = None
+        self._pix = self._low = None
+        self.region = False
         self.setMinimumSize(500, 500)
         self.setMaximumSize(16777215, 16777215)
         self.update()
@@ -521,10 +837,26 @@ class PDFCanvas(QWidget):
         a, b = self.to_px(r.tl), self.to_px(r.br)
         return QRectF(a, b).normalized()
 
+    def patch(self, qimg, org):
+        """Eldeki sayfa goruntusunun bir BOLGESINI yenisiyle degistir. qimg: bolgenin goruntusu
+        (cihaz pikseli), org: sayfadaki sol-ust kosesi (cihaz pikseli). Sayfanin tamami yeniden
+        cizilmeden kucuk bir degisiklik gosterilir (surguyle ayar)."""
+        pos = QPoint(org) - self.pix_org
+        d = self._pix.devicePixelRatio()
+        self._pix.setDevicePixelRatio(1.0)             # (cihaz pikseliyle birebir kopya)
+        p = QPainter(self._pix)
+        p.setCompositionMode(QPainter.CompositionMode_Source)
+        p.drawImage(pos, qimg)
+        p.end()
+        self._pix.setDevicePixelRatio(d)
+        self.update(QRectF(org.x() / self.dpr - 1, org.y() / self.dpr + self.pad_top - 1,
+                           qimg.width() / self.dpr + 2, qimg.height() / self.dpr + 2).toAlignedRect())
+
     def crop(self, rectf):
         d = self.dpr
         pm = self._pix.copy(QRect(int(rectf.x() * d), int((rectf.y() - self.pad_top) * d),
-                                  int(rectf.width() * d) + 1, int(rectf.height() * d) + 1))
+                                  int(rectf.width() * d) + 1, int(rectf.height() * d) + 1)
+                            .translated(-self.pix_org))        # (bolge ciziminde goruntu sayfanin bir parcasi)
         pm.setDevicePixelRatio(d)
         return pm
 
@@ -545,10 +877,36 @@ class PDFCanvas(QWidget):
             return
         # nesnesiz arka plan yalnizca surukleme surerken (iptal edilen suruklemede kalmasin)
         bg = self.bg if self.bg is not None and (getattr(self.win, "drag", None)
-                                                 or self.win.editing_live()) else self._pix
-        p.drawPixmap(0, self.pad_top, bg)
+                                                 or self.win.live_bg()) else self._pix
+        k = self.stretch()
+        org = QPointF(self.pix_org.x() / self.dpr, self.pix_org.y() / self.dpr)
+        if self.region:
+            # bolge cizimi: keskin goruntunun kapsamadigi yer dusuk cozunurluklu tam sayfayla dolar
+            # (kaydirirken bos / beyaz alan gorunmez; durunca keskini cizilir - _region_settle)
+            sz = self.page_size()
+            page = QRectF(0, self.pad_top, sz.width() * k, sz.height() * k)
+            sharp = QRectF(org.x() * k, org.y() * k + self.pad_top,
+                           bg.width() / self.dpr * k, bg.height() / self.dpr * k)
+            if self._low is not None and not sharp.contains(QRectF(ev.rect()) & page):
+                p.save()
+                p.setRenderHint(QPainter.SmoothPixmapTransform, True)
+                p.drawPixmap(page, self._low, QRectF(self._low.rect()))
+                p.restore()
+        if abs(k - 1.0) > 1e-6:                # yakinlastirma suruyor: eldeki goruntu gerilir
+            p.save()
+            p.setRenderHint(QPainter.SmoothPixmapTransform, True)      # (tirtiksiz; yalniz gorunen alan olceklenir)
+            p.translate(0, self.pad_top)
+            p.scale(k, k)
+            p.drawPixmap(org, bg)
+            p.restore()
+        elif self.region:
+            p.drawPixmap(QPointF(org.x(), org.y() + self.pad_top), bg)
+        else:
+            p.drawPixmap(0, self.pad_top, bg)
         p.setRenderHint(QPainter.Antialiasing)
+        self.paint_rect = ev.rect()            # (ust katman yalniz bu alana duseni cizebilir)
         self.win.paint_overlay(p, self)
+        self.paint_rect = None
         p.end()
 
     # ---- fare ----
@@ -604,7 +962,116 @@ class PDFCanvas(QWidget):
             super().wheelEvent(ev)
 
 
+SIDE_W = 216          # sol menunun genisligi
+SIDE_MINI_W = 58      # daraltilmis hali: yalniz ikonlar
+SIDE_TOP = 31         # sol menunun ust boslugu: sayfa kutusunun UST kenari, arac cubugunun alt kenariyla
+                      # (duzenleme alaninin ustu) ayni hizada olsun diye (kullanici, 2026-10-12; eskiden 22).
+                      # Ekran olcegi / yazi tipi farkinda _side_align_top ince ayari yapar.
+TOOLBAR_H = 74        # sabit arac cubugunun yuksekligi (ikon + altinda yazi)
+
+
+class _HintPill(QLabel):
+    """Sayfanin alt ortasinda beliren kucuk bildirim kutusu. Alttaki durum cubugunun yerini aldi
+    (kullanici iki hafta fark etmedi: goz oraya gitmiyor; 2026-10-12). Iki is gorur:
+      say(yazi)  : islem bildirimi ("Sayfa silindi", "19 yer degistirildi ...") - birkac saniye
+                   gorunur, kendiliginden kaybolur
+      live(yazi) : surukleme sirasindaki olcu (Δx Δy, en x boy, aci) - yazi bos olana dek gorunur
+    Fareyi engellemez. Yeri: place() - gorunen tuvalin (ya da acilis ekraninin) alt ortasi."""
+
+    def __init__(self, parent, host_fn):
+        super().__init__(parent)
+        self.setObjectName("hintPill")
+        self._host = host_fn                       # -> uzerinde duracagi bilesen (tuval / acilis ekrani)
+        self.setAttribute(Qt.WA_TransparentForMouseEvents, True)
+        self.setAlignment(Qt.AlignCenter)
+        self._live = False
+        self._timer = QTimer(self)
+        self._timer.setSingleShot(True)
+        self._timer.timeout.connect(self._timeout)
+        self.hide()
+
+    def _timeout(self):
+        if not self._live:
+            self.hide()
+
+    def _show(self, text):
+        self.setText(text)
+        self.adjustSize()
+        self.place()
+        self.show()
+        self.raise_()
+
+    def say(self, text):
+        if not text:
+            return
+        self._live = False
+        self._show(text)
+        self._timer.start(min(7000, 2400 + 45 * len(text)))       # uzun yazi daha uzun kalir
+
+    def live(self, text):
+        if text:
+            self._live = True
+            self._timer.stop()
+            self._show(text)
+        elif self._live:                           # olcu bitti (zamanli bildirim varsa ona dokunma)
+            self._live = False
+            self.hide()
+
+    def place(self):
+        host = self._host()
+        if host is None or self.parentWidget() is None:
+            return
+        g = host.geometry()
+        self.move(g.x() + max(0, (g.width() - self.width()) // 2), g.bottom() - self.height() - 22)
+
+
+class _HintProxy:
+    """Eski "lbl_coords" etiketinin yerine: setText(yazi) -> bildirim kutusunda canli olcu."""
+
+    def __init__(self, pill):
+        self._pill = pill
+
+    def setText(self, text):
+        self._pill.live(text)
+
+
+class _DotBackground(QObject):
+    """Sayfanin arkasindaki zemin: duz koyu renk + soluk nokta dokusu (20 px aralik)."""
+
+    def __init__(self, viewport, colors):
+        super().__init__(viewport)
+        self._vp, self._colors, self._tile, self._key = viewport, colors, None, None
+        viewport.installEventFilter(self)
+
+    def eventFilter(self, obj, ev):
+        if obj is self._vp and ev.type() == QEvent.Paint:
+            c = self._colors()
+            if not getattr(self, "enabled", True):
+                p = QPainter(obj)
+                p.fillRect(obj.rect(), QColor(c["bg"]))
+                p.end()
+                return False
+            key = (c["bg"], c["dot"], obj.devicePixelRatioF())
+            if key != self._key:
+                d = key[2]
+                tile = QPixmap(int(20 * d), int(20 * d))
+                tile.setDevicePixelRatio(d)
+                tile.fill(QColor(c["bg"]))
+                tp = QPainter(tile)
+                tp.setRenderHint(QPainter.Antialiasing)
+                tp.setPen(Qt.NoPen)
+                tp.setBrush(QColor(c["dot"]))
+                tp.drawEllipse(QPointF(10, 10), 1.1, 1.1)
+                tp.end()
+                self._tile, self._key = tile, key
+            p = QPainter(obj)
+            p.drawTiledPixmap(obj.rect(), self._tile)
+            p.end()
+        return False
+
+
 THUMB_H = 104         # sol listedeki sayfa kucuk resminin yuksekligi (px)
+THUMB_EAGER = 24      # bu kadar sayfaya kadar kucuk resimlerin hepsi hemen cizilir (bkz. _populate_thumbnails)
 THUMBS_W = 140        # sol listenin genisligi (uzerine gelince 4 dugme sigsin)
 
 
@@ -649,7 +1116,7 @@ def paint_thumb(p, r, pix, info, badge=0):
         p.setPen(Qt.NoPen)
         p.setBrush(acc)
         p.drawRoundedRect(pill, 8, 8)
-        p.setPen(QColor("#ffffff"))
+        p.setPen(pal.color(QPalette.HighlightedText))
         p.drawText(pill, Qt.AlignCenter, text)
 
 
@@ -681,6 +1148,43 @@ class _PageEdit(QLineEdit):
                 or e.key() in (Qt.Key_Backspace, Qt.Key_Delete, Qt.Key_Left, Qt.Key_Right, Qt.Key_Home, Qt.Key_End,
                                Qt.Key_Return, Qt.Key_Enter, Qt.Key_Tab) or e.modifiers() & Qt.ControlModifier:
             super().keyPressEvent(e)            # (harf yazilamaz: yalnizca rakam)
+
+
+class _SideFind(QLineEdit):
+    """Sol menudeki arama kutusu: sag ucunda ipucu / sayac dugmesi (tiklaninca genis cubuk)."""
+    enter = Signal(bool)                 # shift basili mi
+    escape = Signal()
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.hint = None
+
+    def set_hint(self, text, none=False):
+        if self.hint is None:
+            return
+        self.hint.setText(text)
+        self.hint.setProperty("none", bool(none))
+        self.hint.style().unpolish(self.hint)
+        self.hint.style().polish(self.hint)
+        self._place()
+
+    def _place(self):
+        if self.hint is not None:
+            self.hint.adjustSize()
+            self.hint.move(self.width() - self.hint.width() - 5, (self.height() - self.hint.height()) // 2)
+            self.setTextMargins(0, 0, self.hint.width() + 2, 0)
+
+    def resizeEvent(self, ev):
+        super().resizeEvent(ev)
+        self._place()
+
+    def keyPressEvent(self, ev):
+        if ev.key() in (Qt.Key_Return, Qt.Key_Enter):
+            self.enter.emit(bool(ev.modifiers() & Qt.ShiftModifier))
+        elif ev.key() == Qt.Key_Escape:
+            self.escape.emit()
+        else:
+            super().keyPressEvent(ev)
 
 
 class _PageTotal(QLineEdit):
@@ -737,6 +1241,34 @@ class MainWindow(QMainWindow, MarkupMixin, FindMixin):
         self._overwrite_ok = set()
         self._neutral_icons = []      # tema degisince yeniden renklenecek ikonlar
         self._nudge_token = 0         # ok tusu kaydirma grubu (tiklama/secim degisince artar)
+        # akici yakinlastirma: tekerlek donerken goruntu gerilir, durunca keskini bir kez cizilir
+        self._zoom_timer = QTimer(self)
+        self._zoom_timer.setSingleShot(True)
+        self._zoom_timer.setInterval(140)
+        self._zoom_timer.timeout.connect(self._zoom_settle)
+        self._thumb_late = set()               # (motor, sayfa): kullanici durunca yenilenecek kucuk resimler
+        self._thumb_late_timer = QTimer(self)
+        self._thumb_late_timer.setSingleShot(True)
+        self._thumb_late_timer.setInterval(220)
+        self._thumb_late_timer.timeout.connect(self.thumb_flush)
+        self._patched = False                  # eldeki sayfa goruntusune bolge cizimi yerlestirildi (bkz. thumb_flush)
+        self._adjust_seq = 0                   # surguyle ayarlama oturumu sayaci (geri-al gruplari)
+        self._shape_live = False               # kalinlik canli uygulandi, ertelenen isleri bekliyor
+        self._shape_pending = False            # renk / kesikli degisti, 350 ms sonra uygulanacak
+        self._shape_w_last = None              # canli ayarda son uygulanan kalinlik (bolge payi icin)
+        self._adjust_engine = None
+        # bolge cizimi: kaydirma durunca gorunen alanin keskini cizilir (bkz. _region_settle)
+        self._region_timer = QTimer(self)
+        self._region_timer.setSingleShot(True)
+        self._region_timer.setInterval(80)
+        self._region_timer.timeout.connect(self._region_settle)
+        self._low_cache = (None, None)
+        # uzun belgede kucuk resimler bostayken parca parca cizilir (bkz. _thumb_fill)
+        self._thumb_blank = set()
+        self._thumb_timer = QTimer(self)
+        self._thumb_timer.setSingleShot(True)
+        self._thumb_timer.setInterval(0)
+        self._thumb_timer.timeout.connect(self._thumb_fill)
 
         self._settings = QSettings("PdfEdit", "PdfEdit")
         # 2026-10-02: sadece koyu tema (kullanici: acik arayuz goz aliyor). Acik tema kodu
@@ -744,6 +1276,10 @@ class MainWindow(QMainWindow, MarkupMixin, FindMixin):
         # Ayarlar'da tema secimi yok, kayitli eski "theme" degeri yok sayilir.
         self.theme_mode = "dark"
         self.dark = True
+        # 2026-10-11: gorunum = zemin x secim rengi x secim bicimi (bkz. set_theme)
+        self.ui_theme = set_theme(self._settings.value("ui_bg", "", type=str),
+                                  self._settings.value("ui_accent", "", type=str),
+                                  self._settings.value("ui_style", "", type=str))
         # yeni cizimler icin son kullanilan cizgi stili (kapatip acinca da hatirlanir)
         self.shape_style = self.load_style_setting(
             "shape_style", {"width": 0.75, "color": [0.0, 0.0, 0.0], "dashed": False, "dash": "dash_m"})
@@ -751,7 +1287,18 @@ class MainWindow(QMainWindow, MarkupMixin, FindMixin):
 
         self._build_ui()
         self._build_shortcuts()
+        # dosya yazan pencereler (Birlestir, Bol, resimlerden PDF...) sekmede acik dosyaya yazmasin
+        safe_write.open_files = lambda: [t.engine.path for t in self.tabs if t.engine.path]
+        for bar in (self.scroll.horizontalScrollBar(), self.scroll.verticalScrollBar()):
+            bar.valueChanged.connect(self._region_scrolled)
+            bar.rangeChanged.connect(self._region_scrolled)
+        QTimer.singleShot(0, self._side_align_top)
+        # kurulu fontlarin taramasi (~0,5 sn) acilis bittikten sonra, arka planda: ilk menu beklemesin
+        QTimer.singleShot(2000, font_resolver.warm_up)
         self.apply_theme(self.dark)
+        self._fit_combos()
+        if self._settings.value("side_mini", False, type=bool):
+            self.set_side_mini(True, save=False)
         try:    # "Sistemle ayni": Windows'ta acik/koyu degisince takip et (Qt 6.5+)
             QApplication.styleHints().colorSchemeChanged.connect(self._on_system_scheme)
         except Exception:
@@ -800,7 +1347,15 @@ class MainWindow(QMainWindow, MarkupMixin, FindMixin):
         if ev.type() == QEvent.WindowStateChange and getattr(self, "titlebar", None) is not None:
             self.titlebar.set_maximized(self.isMaximized())
             self._update_frame_border()
+            if getattr(self, "find_bar", None) is not None and not self.find_bar.isHidden():
+                QTimer.singleShot(0, self._place_find_bar)
         super().changeEvent(ev)
+
+    def moveEvent(self, ev):
+        super().moveEvent(ev)
+        # Bul / Degistir paneli ayri bir pencere: ana pencereyle birlikte kaysin
+        if getattr(self, "find_bar", None) is not None and not self.find_bar.isHidden():
+            self._place_find_bar()
 
     def _update_frame_border(self):
         """Windows 10: pencere normal boyuttayken 1 piksel kenarlik (ekrani kaplayinca yok)."""
@@ -890,20 +1445,45 @@ class MainWindow(QMainWindow, MarkupMixin, FindMixin):
         root.setContentsMargins(0, 0, 0, 0)
         root.setSpacing(0)
         # en ustte: sekmeler + pencere dugmeleri (Windows'un baslik seridi yerine)
-        self.titlebar = title_bar.TitleBar(resource_path("assets", "revora.png"), self,
+        self.titlebar = title_bar.TitleBar(resource_path("assets", "revora_mark.png"), self,
                                            own_buttons=win_frame.ACTIVE)
+        self.titlebar.strip.set_home_width(SIDE_W)
         strip = self.titlebar.strip
         strip.currentChanged.connect(self.switch_tab)
         strip.closeRequested.connect(self.close_tab)
         strip.moved.connect(self._tab_moved)
         strip.newRequested.connect(lambda: self.open_pdf())
         strip.contextRequested.connect(self._tab_context)
+        strip.backRequested.connect(self.back_to_document)
+        self._corner = title_bar.CornerPiece(central, self.titlebar)
+        self._logo_piece = title_bar.LogoPiece(central, strip)
+        strip.logo_external = True
+        strip.cornerChanged.connect(self._place_corner)
         root.addWidget(self.titlebar)
+        # YENI DUZEN (2026-10-11): solda menu (eski ust serit: self.topbar adi tarihsel), ortada
+        # ustte sabit arac cubugu + altinda tuval, SAGDA sayfalar. Acilis ekraninda sol menu ve
+        # arac cubugu gizlenir (_show_home).
+        body = QHBoxLayout()
+        body.setContentsMargins(0, 0, 0, 0)
+        body.setSpacing(0)
+        root.addLayout(body, 1)
         self.topbar = self._build_topbar()
-        root.addWidget(self.topbar)
+        body.addWidget(self.topbar)
+        col = QVBoxLayout()
+        col.setContentsMargins(0, 0, 0, 0)
+        col.setSpacing(0)
+        body.addLayout(col, 1)
+        self.tool_bar = QFrame()
+        self.tool_bar.setObjectName("toolBar")
+        self.tool_bar.setFixedHeight(TOOLBAR_H)
+        tbl = QHBoxLayout(self.tool_bar)
+        tbl.setContentsMargins(12, 0, 12, 0)
+        tbl.setSpacing(0)
+        col.addWidget(self.tool_bar)
 
-        splitter = QSplitter(Qt.Horizontal)
-        root.addWidget(splitter, 1)
+        splitter = self._splitter = QSplitter(Qt.Horizontal)
+        splitter.setHandleWidth(0)
+        col.addWidget(splitter, 1)
 
         # --- sol: sayfa kucuk resimleri ---
         # iOS tarzi siralama: tutulan sayfa kalkar, birakilacak yerde bosluk acilir.
@@ -945,8 +1525,9 @@ class MainWindow(QMainWindow, MarkupMixin, FindMixin):
         hh.addStretch()
         pane = self.thumbs_pane = QWidget()
         pane.setObjectName("thumbsPane")
+        pane.setAttribute(Qt.WA_StyledBackground, True)     # (duz QWidget: yoksa zemini boyanmaz)
         pane.setFixedWidth(THUMBS_W)
-        pv = QVBoxLayout(pane)
+        pv = self._thumbs_lay = QVBoxLayout(pane)
         pv.setContentsMargins(0, 0, 0, 0)
         pv.setSpacing(0)
         pv.addWidget(head)
@@ -969,14 +1550,14 @@ class MainWindow(QMainWindow, MarkupMixin, FindMixin):
         cl.addWidget(self.scroll, 1)
         # acilis ekrani: PDF acik degilken tuvalin yerinde (hizli islemler + son dosyalar)
         self.home = home_view.HomeView(
-            ic, resource_path("assets", "revora.png"),
-            [("mdi6.folder-open-outline", "#7fb0ff", _t("PDF aç"),
+            ic, resource_path("assets", "revora_mark.png"),
+            [("mdi6.folder-open-outline", DARK["hi"], _t("PDF aç"),
               _t("Düzenle, işaretle, imzala"), lambda: self.open_pdf(), True, "Ctrl+O"),
-             ("mdi6.image-multiple-outline", "#c9cdd6", _t("Resimlerden PDF"),
+             ("mdi6.image-multiple-outline", "#b4b4b4", _t("Resimlerden PDF"),
               _t("Fotoğraf ve taramaları tek PDF yap"), lambda: self.open_images_to_pdf(), False, None),
-             ("mdi6.call-merge", "#c9cdd6", _t("PDF birleştir"),
+             ("mdi6.call-merge", "#b4b4b4", _t("PDF birleştir"),
               _t("Birden çok dosyayı tek PDF yap"), self.open_merge_dialog, False, None),
-             ("mdi6.call-split", "#c9cdd6", _t("PDF ayır"),
+             ("mdi6.call-split", "#b4b4b4", _t("PDF böl"),
               _t("Sayfaları ayrı dosyalara böl"), self.open_split_dialog, False, None)],
             self._recent_files, self.open_pdf, self._forget_recent, self._reveal_in_folder,
             self.open_settings)
@@ -1000,17 +1581,26 @@ class MainWindow(QMainWindow, MarkupMixin, FindMixin):
         splitter.addWidget(self.inspector)
         self.inspector.hide()
         self._build_mode_bars()
-        splitter.setStretchFactor(0, 0)
-        splitter.setStretchFactor(1, 1)
+        self._dock_tools()
+        splitter.insertWidget(0, center)           # sayfalar SAGDA: tuval | sayfalar | (gizli panel)
+        splitter.setStretchFactor(0, 1)
+        splitter.setStretchFactor(1, 0)
         splitter.setStretchFactor(2, 0)
-        splitter.setSizes([THUMBS_W, 800, 350])
+        splitter.setSizes([800, THUMBS_W, 350])
+        self._dots = _DotBackground(self.scroll.viewport(), lambda: DARK if self.dark else LIGHT)
+        self._dots.enabled = self._settings.value("view_dots", True, type=bool)
+        self.thumbs_side = "right"
+        self.set_thumbs_side(self._settings.value("thumbs_side", "right", type=str), save=False)
 
-        # --- durum cubugu ---
-        self.lbl_coords = QLabel("")
+        # --- bildirimler: alttaki durum cubugu GIZLI (kimse bakmiyordu); islem bildirimleri ve
+        # surukleme olculeri sayfanin alt ortasindaki kucuk kutuda (_HintPill) gosterilir.
+        # Cubugun kendisi duruyor (son bildirim oradan da okunabilir: testler).
+        self.hint_pill = _HintPill(center, lambda: self.home if self.scroll.isHidden() else self.scroll)
+        self.lbl_coords = _HintProxy(self.hint_pill)
         self.lbl_fileinfo = QLabel("")
-        self.statusBar().addPermanentWidget(self.lbl_coords)
         self.statusBar().addPermanentWidget(self.lbl_fileinfo)
-        self.status(_t("Hazır — başlamak için bir PDF açın."))
+        self.statusBar().hide()
+        self.status(_t("Hazır — başlamak için bir PDF açın."), quiet=True)
 
     def _build_zoom_pill(self, parent):
         """Tuvalin sag altinda yuzen yakinlastirma denetimi (dikey): + / %deger / - / tum
@@ -1028,8 +1618,8 @@ class MainWindow(QMainWindow, MarkupMixin, FindMixin):
         self.btn_zoom_out = self._bar_btn("mdi6.magnify-minus-outline", _t("Uzaklaştır (Ctrl+tekerlek)"), False)
         self.btn_fit_page = self._bar_btn("mdi6.fit-to-page-outline", _t("Tüm sayfayı sığdır (Ctrl+9)"), False)
         self.btn_fit = self._bar_btn("mdi6.arrow-expand-horizontal", _t("Sayfa genişliğine sığdır (Ctrl+0)"), False)
-        self.btn_zoom_in.clicked.connect(lambda: self.set_zoom(self.canvas.zoom * 1.2))
-        self.btn_zoom_out.clicked.connect(lambda: self.set_zoom(self.canvas.zoom / 1.2))
+        self.btn_zoom_in.clicked.connect(lambda: self.zoom_by(1.2))
+        self.btn_zoom_out.clicked.connect(lambda: self.zoom_by(1 / 1.2))
         self.lbl_zoom.clicked.connect(lambda: self.set_zoom(1.0))
         self.btn_fit_page.clicked.connect(self.fit_to_page)
         self.btn_fit.clicked.connect(self.fit_to_width)
@@ -1059,26 +1649,73 @@ class MainWindow(QMainWindow, MarkupMixin, FindMixin):
         pill.move(max(0, x), max(0, y))
         pill.raise_()
 
-    def _build_topbar(self):
-        """Ust serit, uc bolge (kullaniciyla konusuldu, 2026-10-05):
-          SOL  : belge islemleri  - kaydet (+ acilir menu), geri al / yinele, sayfa gezinme
-          ORTA : modlar           - Metin | Cizgi/Kutu | Isaretle (tuvalin ortasina hizali:
-                                    hemen altindaki yuzen arac seritleriyle ayni eksende)
-          SAG  : araclar          - Sayfa, PDF Islemleri, Ayarlar
-        "Ac" dugmesi yok: sekme seridindeki "+" ve Ctrl+O ayni isi yapiyor."""
-        bar = QWidget()
-        bar.setObjectName("topbar")
-        h = QHBoxLayout(bar)
-        h.setContentsMargins(10, 8, 10, 8)
-        h.setSpacing(2)
+    def _side_align_top(self):
+        """Sol menude sayfa kutusunun ust kenari = arac cubugunun alt kenari (sagdaki duzenleme
+        alaninin ustu): ikisi ayni cizgide baslasin. Ust bosluk gerektigi kadar duzeltilir."""
+        box = getattr(self, "_side_page_box", None)
+        if box is None or box.isHidden() or self.topbar.isHidden() or self.tool_bar.isHidden():
+            return
+        lay = self.topbar.layout()
+        lay.activate()
+        # (arac cubugunun alt CIZGISI son piksel satirinda: kutunun ust kenarligi o satira gelir)
+        diff = self.tool_bar.height() - 1 - box.mapTo(self.topbar, QPoint(0, 0)).y()
+        if diff:
+            m = lay.contentsMargins()
+            lay.setContentsMargins(m.left(), max(0, m.top() + diff), m.right(), m.bottom())
 
-        # ---------------- SOL: kaydet + geri al / yinele + sayfa
+    def _side_item(self, fa, text, tip, slot=None, checkable=False):
+        """Sol menu satiri: ikon + yazi. checkable: secili halde altin kontur + dolu ikon."""
+        b = QPushButton("  " + text)
+        b._full, b._tip = text, tip             # (dar halde yazi gizlenir, ad ipucuna tasinir)
+        self.__dict__.setdefault("_side_rows", []).append(b)
+        b.setObjectName("sideItem")
+        b.setCheckable(checkable)
+        b.setCursor(QCursor(Qt.PointingHandCursor))
+        b.setToolTip(tip)
+        b.setFocusPolicy(Qt.NoFocus)
+        b.setIconSize(QSize(18, 18))
+        if checkable:
+            b.setIcon(markup_bar.icon(fa, self.dark))
+            b._icon_name = fa
+            self._mk_bar_buttons.append(b)
+        else:
+            b.setIcon(ic(fa, "#b4b4b4"))
+            self._neutral_icons.append((b, fa))
+        if slot is not None:
+            b.clicked.connect(slot)
+        return b
+
+    def _side_section(self, text):
+        l = QLabel(text)
+        l.setObjectName("sideSection")
+        f = l.font()                               # (buyuk harfli kucuk baslik: harfler biraz aralikli)
+        f.setLetterSpacing(QFont.AbsoluteSpacing, 0.8)
+        l.setFont(f)
+        l._full = text
+        self.__dict__.setdefault("_side_sections", []).append(l)
+        return l
+
+    def _build_topbar(self):
+        """SOL MENU (adi tarihsel: eski ust seridin yerini aldi; kullaniciyla taslak uzerinde
+        konusuldu, 2026-10-11). Yukaridan asagi: kaydet (+ acilir menu) / geri al / yinele ·
+        sayfa gezinme · Bul · MOD (Duzenle, Isaretle) · BELGE · ARACLAR · en altta Ayarlar.
+        "Ac" yok: sekme seridindeki "+" ve Ctrl+O ayni isi yapiyor."""
+        if not hasattr(self, "_mk_bar_buttons"):
+            self._mk_bar_buttons = []
+        bar = QFrame()
+        bar.setObjectName("sidePanel")
+        bar.setFixedWidth(SIDE_W)
+        v = QVBoxLayout(bar)
+        v.setContentsMargins(11, SIDE_TOP, 12, 10)
+        v.setSpacing(2)
+
+        # ---------------- kaydet + geri al / yinele
         self.btn_save = self._tool_btn("mdi6.content-save-outline", _t("Kaydet"), _t("Kaydet (Ctrl+S)"), size=20)
         self.btn_save.clicked.connect(self.save_pdf)
         save_menu = QMenu(self)
         save_menu.addAction(ic("mdi6.content-save-outline"), _t("Kaydet\tCtrl+S"), self.save_pdf)
         save_menu.addAction(ic("mdi6.content-save-edit-outline"), _t("Farklı kaydet...\tCtrl+Shift+S"), self.save_pdf_as)
-        save_menu.addAction(ic("mdi6.arrow-collapse-vertical"), _t("Küçülterek kaydet..."), self.save_compressed)
+        save_menu.addAction(ic("mdi6.arrow-collapse-vertical"), _t("PDF sıkıştır..."), self.save_compressed)
         save_menu.addSeparator()
         save_menu.addAction(ic("mdi6.table-arrow-right"), _t("Excel'e aktar..."), self.export_excel)
         save_menu.addAction(ic("mdi6.image-outline"), _t("Sayfayı resim olarak kaydet..."), self.export_pages_dialog)
@@ -1087,25 +1724,35 @@ class MainWindow(QMainWindow, MarkupMixin, FindMixin):
         save_menu.addAction(ic("mdi6.clipboard-outline"), _t("Sayfayı panoya resim olarak kopyala"), self.copy_page_image)
         save_menu.addSeparator()
         save_menu.addAction(ic("mdi6.printer-outline"), _t("Yazdır...\tCtrl+P"), self.print_pdf)
-        self.btn_save_more = self._tool_btn("mdi6.chevron-down", "▾", _t("Kaydetme ve dışa aktarma seçenekleri"), size=14)
+        self.btn_save_more = self._tool_btn("mdi6.chevron-down", "▾", _t("Kaydetme ve dışa aktarma seçenekleri"), size=12)
         self.btn_save_more.setObjectName("toolbtnSlim")
         self.btn_save_more.setMenu(save_menu)
-        h.addWidget(self.btn_save)
-        h.addWidget(self.btn_save_more)
-        h.addSpacing(6)
-        # (kendi cizimimiz: hazir ikonlar yandaki ince sayfa oklarinin yaninda kaba duruyordu)
-        self.btn_undo = self._tool_btn("rv.undo", "↶", _t("Geri al (Ctrl+Z)"), size=20)
-        self.btn_redo = self._tool_btn("rv.redo", "↷", _t("Yinele (Ctrl+Y)"), size=20)
+        self.btn_undo = self._tool_btn("rv.undo", "↶", _t("Geri al (Ctrl+Z)"), size=19)
+        self.btn_redo = self._tool_btn("rv.redo", "↷", _t("Yinele (Ctrl+Y)"), size=19)
         self.btn_undo.clicked.connect(self.undo_change)
         self.btn_redo.clicked.connect(self.redo_change)
-        h.addWidget(self.btn_undo)
-        h.addWidget(self.btn_redo)
-        h.addSpacing(6)
-        h.addWidget(self._sep())
-        h.addSpacing(6)
+        # menuyu daralt / genislet: hep SOL USTTE (dar halde de ayni yerde kalir)
+        self.side_mini = False
+        self.btn_side = self._tool_btn("rv.sidebar", "≡", _t("Menüyü daralt"), size=19)
+        self.btn_side.setFocusPolicy(Qt.NoFocus)
+        self.btn_side.clicked.connect(lambda: self.set_side_mini(not self.side_mini))
+        top = self._side_top = QBoxLayout(QBoxLayout.LeftToRight)
+        top.setContentsMargins(0, 0, 0, 0)
+        top.setSpacing(0)
+        top.addWidget(self.btn_side)
+        top.addSpacing(6)
+        top.addWidget(self.btn_save)
+        top.addWidget(self.btn_save_more)
+        top.addSpacing(8)
+        top.addWidget(self.btn_undo)
+        top.addWidget(self.btn_redo)
+        self._side_top_gap = QSpacerItem(0, 0, QSizePolicy.Expanding, QSizePolicy.Minimum)
+        top.addItem(self._side_top_gap)
+        v.addLayout(top)
+        v.addSpacing(8)
 
-        # sayfa: < [3] / 30 >  - sayi kutusuna yazip Enter: o sayfaya git (Ctrl+G kutuya gecer)
-        self.btn_prev = self._tool_btn("mdi6.chevron-left", "◀", _t("Önceki sayfa (PgUp)"), size=20)
+        # ---------------- sayfa: < [3] / 30 >  (sayi kutusuna yazip Enter: o sayfaya git; Ctrl+G)
+        self.btn_prev = self._tool_btn("mdi6.chevron-left", "◀", _t("Önceki sayfa (PgUp)"), size=14)
         self.ed_page = _PageEdit(self)
         self.ed_page.setObjectName("pageEdit")
         self.ed_page.setAlignment(Qt.AlignRight | Qt.AlignVCenter)    # rakam hep "/" isaretine yasli
@@ -1113,8 +1760,7 @@ class MainWindow(QMainWindow, MarkupMixin, FindMixin):
         self.ed_page.submitted.connect(self._goto_typed_page)
         self.ed_page.cancelled.connect(self._page_box_cancelled)
         self.ed_page.focused.connect(self._show_page_number)
-        # "/ 40": etiket degil, salt okunur AYNI tur kutu. Etiketle yazi 1 px asagida ve sikisik
-        # duruyordu (kullanici: "gozumu tirmaliyor"); ayni kutu = ayni yazi satiri.
+        # "/ 40": etiket degil, salt okunur AYNI tur kutu (ayni kutu = ayni yazi satiri)
         self.lbl_page = _PageTotal()
         self.lbl_page.setObjectName("pageTotal")
         self.lbl_page.setReadOnly(True)
@@ -1123,81 +1769,125 @@ class MainWindow(QMainWindow, MarkupMixin, FindMixin):
         self.lbl_page.setToolTip(self.ed_page.toolTip())
         self.lbl_page.clicked.connect(self.focus_page_box)
         self.lbl_page.setAlignment(Qt.AlignLeft | Qt.AlignVCenter)
-        self.btn_next = self._tool_btn("mdi6.chevron-right", "▶", _t("Sonraki sayfa (PgDn)"), size=20)
+        self.btn_next = self._tool_btn("mdi6.chevron-right", "▶", _t("Sonraki sayfa (PgDn)"), size=14)
         self.btn_prev.clicked.connect(lambda: self.change_page(-1))
         self.btn_next.clicked.connect(lambda: self.change_page(1))
-        # ODAK: ilk sayfaya gelince "onceki" oku devre disi kalir; Qt odagi siradaki denetime
-        # (sayfa kutusuna) atiyor, kutu da kendini secili gosteriyordu (kullanici: "geri giderken
-        # 1 gelince secili oluyor"). Oklar odak almaz (tuvalde kalir); kutu yalnizca tiklayinca /
-        # Ctrl+G ile odak alir, Tab sirasinda ya da odak aktariminda degil.
+        # ODAK: oklar odak almaz (tuvalde kalir); kutu yalnizca tiklayinca / Ctrl+G ile odak alir
         for b in (self.btn_prev, self.btn_next, self.btn_undo, self.btn_redo):
             b.setFocusPolicy(Qt.NoFocus)
         self.ed_page.setFocusPolicy(Qt.ClickFocus)
-        pg = QHBoxLayout()                     # (kendi icinde bosluksuz: araliklar hesapli)
-        pg.setContentsMargins(0, 0, 0, 0)
+        box = self._side_page_box = QFrame()
+        box.setObjectName("sideField")
+        pg = QHBoxLayout(box)
+        pg.setContentsMargins(2, 2, 2, 2)
         pg.setSpacing(0)
+        pg.addWidget(self.btn_prev)
+        pg.addStretch()
         pg.addWidget(self.ed_page)
         pg.addWidget(self.lbl_page)
-        h.addWidget(self.btn_prev)
-        h.addLayout(pg)
-        h.addWidget(self.btn_next)
+        pg.addStretch()
+        pg.addWidget(self.btn_next)
+        v.addWidget(box)
+        v.addSpacing(6)
 
-        # ---------------- ORTA: modlar (yerlesimde degil: _place_mode_seg tuvalin ortasina koyar)
-        # "Yeni metin" ayri mod dugmesi degil: Metin'in arac satirinda (Sec | Yeni metin).
-        # Ic durum yine self.mode == "text" / "insert".
-        # DUZENLE = eski "Metin" + "Sekil" (2026-10-05): sayfada ZATEN olan yazi ve cizimler tek
-        # modda; Sec araci tiklanan neyse onu secer, birlikte tasinir. Ic durum hala
-        # self.mode == "text" / "insert" / "shape" (secime gore kendiliginden degisir).
-        self.btn_mode_text = self._make_seg("segL", "mdi6.square-edit-outline", _t("Düzenle"),
-                                            _t("Sayfadaki yazıları, şekilleri ve resimleri seç, taşı, düzenle, sil; "
-                                               "yeni yazı, çizgi, kutu ekle"))
-        self.btn_mode_markup = self._make_seg("segR", "mdi6.marker", _t("İşaretle"),
-                                              _t("Ok, daire, kutu ve not kutusu ekle (sonradan da "
-                                              "düzenlenebilir)"))
+        # ---------------- bul: kutuya yazinca DOGRUDAN arar (eslesmeler sayfada boyanir, Enter sonraki).
+        # Genis cubuk (degistir, kapsam, harf ayrimi) yalniz Ctrl+F ile ya da sagdaki ipucuna
+        # tiklayinca acilir (kullanici: "sol menude de arama yapsin, ustteki menu acilmasin").
+        self.btn_find = _SideFind(self)
+        self.btn_find.setObjectName("sideFind")
+        self.btn_find.setPlaceholderText(_t("Bul"))
+        self.btn_find.setToolTip(_t("Belgede ara: yazın, Enter sonraki eşleşme (Shift+Enter önceki)"))
+        self.btn_find.addAction(ic("mdi6.magnify", "#7a7a7a"), QLineEdit.LeadingPosition)
+        self.btn_find_more = QToolButton(self.btn_find)
+        self.btn_find_more.setObjectName("sideHint")
+        self.btn_find_more.setText("Ctrl+F")
+        self.btn_find_more.setCursor(QCursor(Qt.PointingHandCursor))
+        self.btn_find_more.setFocusPolicy(Qt.NoFocus)
+        self.btn_find_more.setToolTip(_t("Bul ve değiştir (Ctrl+F)"))
+        self.btn_find_more.clicked.connect(lambda: self.find_open())
+        self.btn_find.hint = self.btn_find_more
+        self.btn_find.textEdited.connect(self._side_find_typed)
+        self.btn_find.enter.connect(lambda shift: self.find_step(-1 if shift else 1))
+        self.btn_find.escape.connect(self.find_close)
+        v.addWidget(self.btn_find)
+        # dar menude kutu yerine buyutec: genis arama cubugunu acar
+        self.btn_find_mini = self._side_item("mdi6.magnify", _t("Bul"), _t("Bul ve değiştir (Ctrl+F)"),
+                                             lambda: self.find_open())
+        self.btn_find_mini.hide()
+        v.addWidget(self.btn_find_mini)
+
+        # MOD / BELGE / ARACLAR satirlari bir KAYDIRMA alaninda: pencere kisaysa (1366x768 ekran)
+        # menu pencereyi uzatmaz, bu kisim kayar; ustteki kutular ve alttaki Ayarlar sabit kalir.
+        # (Eskiden pencere en az 815 px istiyordu: kucuk ekranda alt kisim gorunmuyordu - audit.)
+        mid_w = QWidget()
+        mid_w.setObjectName("sideMid")
+        mv = QVBoxLayout(mid_w)
+        mv.setContentsMargins(0, 0, 0, 0)
+        mv.setSpacing(2)
+        # ---------------- MOD
+        # DUZENLE = sayfada ZATEN olan yazi, cizim ve resimler tek modda; Sec araci tiklanan neyse
+        # onu secer. Ic durum hala self.mode == "text" / "insert" / "shape" (secime gore degisir).
+        mv.addWidget(self._side_section(_t("MOD")))
+        self.btn_mode_text = self._side_item(
+            "mdi6.square-edit-outline", _t("Düzenle"),
+            _t("Sayfadaki yazıları, şekilleri ve resimleri seç, taşı, düzenle, sil; yeni yazı, çizgi, kutu ekle"),
+            checkable=True)
+        self.btn_mode_markup = self._side_item(
+            "ph.marker-circle", _t("İşaretle"),
+            _t("Ok, daire, kutu ve not kutusu ekle (sonradan da düzenlenebilir)"), checkable=True)
         self.btn_mode_text.setChecked(True)
         grp = QButtonGroup(self)
         grp.setExclusive(True)
+        self.mode_seg = QWidget()                  # (iki mod birlikte acilip kapansin diye tek kap)
+        ml = QVBoxLayout(self.mode_seg)
+        ml.setContentsMargins(0, 0, 0, 0)
+        ml.setSpacing(2)
         for b in (self.btn_mode_text, self.btn_mode_markup):
             grp.addButton(b)
+            ml.addWidget(b)
         self.btn_mode_text.clicked.connect(lambda: self.set_mode("text"))
         self.btn_mode_markup.clicked.connect(lambda: self.set_mode("markup"))
-        seg = QHBoxLayout()
-        seg.setContentsMargins(0, 0, 0, 0)
-        seg.setSpacing(0)
-        seg.addWidget(self.btn_mode_text)
-        seg.addWidget(self.btn_mode_markup)
-        seg_w = self.mode_seg = QWidget(bar)
-        seg_w.setLayout(seg)
-        seg_w.adjustSize()
-        # sol ve sag bolge arasinda modlara yer ayiran bosluk (serit bundan daha dar olamaz)
-        self._seg_gap = QSpacerItem(seg_w.sizeHint().width() + 32, 0, QSizePolicy.MinimumExpanding,
-                                    QSizePolicy.Minimum)
-        h.addItem(self._seg_gap)
+        mv.addWidget(self.mode_seg)
 
-        # ---------------- SAG: sayfa menusu, PDF islemleri, ayarlar
-        self.btn_find = self._tool_btn("mdi6.magnify", _t("Bul"), _t("Bul ve değiştir (Ctrl+F)"), size=20)
-        self.btn_find.clicked.connect(lambda: self.find_close() if self.find_active() else self.find_open())
-        h.addWidget(self.btn_find)
-        self.btn_page = self._tool_btn("mdi6.file-outline", _t("Sayfa"), _t("Sayfa işlemleri"), text=_t("Sayfa"), size=18)
+        # ---------------- BELGE
+        mv.addWidget(self._side_section(_t("BELGE")))
+        self.btn_page = self._side_item("mdi6.file-outline", _t("Sayfa işlemleri"),
+                                        _t("Döndür, sil, çoğalt, boş sayfa ya da başka PDF'ten sayfa ekle"))
+        # menu sol menunun USTUNE binmesin: sol menunun sag kenarinin hemen disinda acilir
         self.btn_page.clicked.connect(
-            lambda: self._page_menu(self.current_page).exec(
-                self.btn_page.mapToGlobal(self.btn_page.rect().bottomLeft())))
-        h.addWidget(self.btn_page)
+            lambda: title_bar.run_modal(
+                self._page_menu(self.current_page, side=True),
+                QPoint(self.topbar.mapToGlobal(QPoint(self.topbar.width(), 0)).x() + 4,
+                       self.btn_page.mapToGlobal(QPoint(0, 0)).y())))
+        items = [self.btn_page,
+                 self._side_item("mdi6.table-arrow-right", _t("Excel'e aktar"),
+                                 _t("Tabloları, yazıları ve resimleri Excel dosyasına aktar"), self.export_excel),
+                 self._side_item("mdi6.image-outline", _t("Resim olarak kaydet"),
+                                 _t("Sayfaları PNG / JPG olarak kaydet"), lambda: self.export_pages_dialog()),
+                 self._side_item("mdi6.printer-outline", _t("Yazdır"), _t("Yazdır (Ctrl+P)"), self.print_pdf)]
+        for b in items:
+            mv.addWidget(b)
+        self._side_doc_items = items[1:] + [self.btn_find, self.btn_find_mini]      # (belge yokken soluk)
 
-        # ("PDF Islemleri" cok genel bir addi: programin tamami zaten PDF islemi -> "Araclar")
-        self.btn_more = self._tool_btn("mdi6.toolbox-outline", _t("Araçlar"),
-                                       _t("Birleştir, ayır, filigran, form, OCR"), text=_t("Araçlar"), size=18)
+        # ---------------- ARACLAR
+        mv.addWidget(self._side_section(_t("ARAÇLAR")))
+        tools = [self._side_item("mdi6.call-merge", _t("PDF birleştir"), _t("Birden çok dosyayı tek PDF yap"),
+                                 self.open_merge_dialog),
+                 self._side_item("mdi6.call-split", _t("PDF böl"), _t("Sayfaları ayrı dosyalara böl"),
+                                 self.open_split_dialog),
+                 self._side_item("mdi6.image-multiple-outline", _t("Resimlerden PDF"),
+                                 _t("Fotoğraf ve taramaları tek PDF yap"), lambda: self.open_images_to_pdf()),
+                 self._side_item("mdi6.watermark", _t("Filigran ekle"), _t("Sayfalara filigran yazısı ekle"),
+                                 self.open_watermark_dialog),
+                 self._side_item("mdi6.form-textbox", _t("Form doldur"), _t("PDF form alanlarını doldur"),
+                                 self.open_form_dialog),
+                 self._side_item("mdi6.text-recognition", _t("OCR"), _t("Taranmış sayfayı metne çevir"),
+                                 self.open_ocr_dialog)]
+        for b in tools:
+            mv.addWidget(b)
+        # parola: koy / degistir / kaldir (acilir menu)
+        self.btn_more = self._side_item("mdi6.lock-outline", _t("Parola"), _t("Belgeye parola koy, değiştir ya da kaldır"))
         menu = QMenu(self)
-        menu.addAction(ic("mdi6.call-merge"), _t("PDF Birleştir"), self.open_merge_dialog)
-        menu.addAction(ic("mdi6.call-split"), _t("PDF Ayır"), self.open_split_dialog)
-        menu.addAction(ic("mdi6.image-multiple-outline"), _t("Resimlerden PDF oluştur..."), self.open_images_to_pdf)
-        menu.addSeparator()
-        menu.addAction(ic("mdi6.watermark"), _t("Filigran ekle..."), self.open_watermark_dialog)
-        menu.addAction(ic("mdi6.form-textbox"), _t("Form doldur..."), self.open_form_dialog)
-        menu.addAction(ic("mdi6.text-recognition"), _t("OCR — taranmış sayfayı metne çevir..."), self.open_ocr_dialog)
-        menu.addSeparator()
-        menu.addAction(ic("mdi6.stamper"), _t("İşaretlemeleri sayfaya işle..."), self.flatten_markups_dialog)
-        menu.addSeparator()
         self._act_pw_set = menu.addAction(ic("mdi6.lock-outline"), _t("Parola koy..."), self.set_password_dialog)
         self._act_pw_del = menu.addAction(ic("mdi6.lock-open-variant-outline"), _t("Parolayı kaldır"), self.remove_password)
 
@@ -1206,28 +1896,224 @@ class MainWindow(QMainWindow, MarkupMixin, FindMixin):
             self._act_pw_set.setText(_t("Parolayı değiştir...") if has else _t("Parola koy..."))
             self._act_pw_del.setVisible(has)
         menu.aboutToShow.connect(_pw_menu)
-        self.btn_more.setMenu(menu)
-        h.addWidget(self.btn_more)
+        def _pw_click():           # parola yoksa secilecek bir sey de yok: dogrudan pencere
+            if self.engine.doc is not None and self.engine.password:
+                # (kalici menu: bir kez kurulur, silinmez)
+                menu.exec(self.btn_more.mapToGlobal(self.btn_more.rect().topRight() + QPoint(6, 0)))
+            else:
+                self.set_password_dialog()
+        self.btn_more.clicked.connect(_pw_click)
+        self._pw_menu = menu
+        mv.addWidget(self.btn_more)
+        self._side_doc_items += tools[3:] + [self.btn_more]
 
-        self.btn_settings = self._tool_btn("mdi6.cog-outline", _t("Ayarlar"), _t("Ayarlar (Ctrl+,)"), size=20)
-        self.btn_settings.clicked.connect(self.open_settings)
-        h.addWidget(self.btn_settings)
+        mv.addStretch(1)
+        self._side_scroll = QScrollArea()
+        self._side_scroll.setObjectName("sideScroll")
+        self._side_scroll.setFrameShape(QFrame.NoFrame)
+        self._side_scroll.setWidgetResizable(True)
+        self._side_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        self._side_scroll.setFocusPolicy(Qt.NoFocus)
+        self._side_scroll.viewport().setObjectName("sideView")
+        self._side_scroll.setWidget(mid_w)
+        v.addWidget(self._side_scroll, 1)
+        line = QFrame()
+        line.setFixedHeight(1)
+        line.setObjectName("viewRowLine")
+        v.addWidget(line)
+        v.addSpacing(4)
+        self.btn_settings = self._side_item("mdi6.cog-outline", _t("Ayarlar"), _t("Ayarlar (Ctrl+,)"), self.open_settings)
+        v.addWidget(self.btn_settings)
         return bar
 
-    def _place_mode_seg(self):
-        """Mod dugmelerini TUVALIN ortasina hizala (altindaki yuzen arac seritleriyle ayni
-        eksen); sol / sag bolgeye binmeyecek sekilde ayrilan bosluga sigdir."""
-        seg = getattr(self, "mode_seg", None)
-        if seg is None or self.topbar.isHidden():
+    def _place_corner(self, on=None):
+        """Arac cubugunun sol ust kosesindeki kavis parcasi (title_bar.CornerPiece): ilk sekme secili
+        degilken gorunur; sol menu daralip genisleyince yeri degisir."""
+        c = getattr(self, "_corner", None)
+        if c is None or not hasattr(self, "tool_bar"):
             return
-        gap = self._seg_gap.geometry()
-        w, hh = seg.sizeHint().width(), seg.sizeHint().height()
-        vp = self.scroll.viewport()                        # yuzen seritler de buna gore ortalanir
-        cx = vp.mapTo(self.centralWidget(), QPoint(vp.width() // 2, 0)).x() if vp.isVisible() \
-            else self.topbar.width() // 2
-        x = max(gap.left() + 16, min(cx - w // 2, gap.right() - 16 - w))
-        seg.setGeometry(x, (self.topbar.height() - hh) // 2, w, hh)
-        seg.raise_()
+        if on is not None:
+            self._corner_on = bool(on)
+        show = getattr(self, "_corner_on", False) and not self.tool_bar.isHidden()
+        if show:
+            pos = self.tool_bar.mapTo(c.parentWidget(), QPoint(0, 0))
+            c.move(pos.x() - 1, pos.y() - 1)
+            c.raise_()
+        c.setVisible(show)
+        c.update()
+
+    def _place_logo(self):
+        """Sol ustteki logo: SOL kenari altindaki ikon sutununun sol kenariyla ayni hizada, USTTEN
+        boslugu da soldan boslugu kadar (kullanici, 2026-10-12). Acilis ekraninda gizli."""
+        lp = getattr(self, "_logo_piece", None)
+        if lp is None or not hasattr(self, "btn_side"):
+            return
+        show = not self.topbar.isHidden()
+        if show:
+            c = self.btn_side.mapTo(lp.parentWidget(), self.btn_side.rect().center())
+            left = c.x() - 7                       # "menuyu daralt" ikonunun cizgisinin sol kenari
+            lp.set_name("" if self.side_mini else "Revora")     # dar menude yalniz logo
+            lp.place(left, left)
+            self.titlebar.strip.logo_x = int(left)
+            self.titlebar.strip.logo_w = lp.width()
+            lp.raise_()
+        lp.setVisible(show)
+
+    def set_side_mini(self, on, save=True):
+        """Sol menuyu ikon seridine daralt / geri genislet (menunun sol ustundeki dugme). Dar halde
+        satirlar yalniz ikon (ad ipucunda), sayfa ve arama kutusu gizli (buyutec genis cubugu acar)."""
+        on = bool(on)
+        self.side_mini = on
+        w = SIDE_MINI_W if on else SIDE_W
+        self.topbar.setFixedWidth(w)
+        self.titlebar.strip.set_home_width(w)
+        self.topbar.layout().setContentsMargins(*((8, SIDE_TOP, 8, 10) if on else (11, SIDE_TOP, 12, 10)))
+        top = self._side_top
+        top.setDirection(QBoxLayout.TopToBottom if on else QBoxLayout.LeftToRight)
+        self._side_top_gap.changeSize(0, 0, QSizePolicy.Minimum if on else QSizePolicy.Expanding, QSizePolicy.Minimum)
+        for b in (self.btn_side, self.btn_save, self.btn_undo, self.btn_redo):
+            top.setAlignment(b, Qt.AlignHCenter if on else Qt.Alignment())
+        top.invalidate()
+        self.btn_save_more.setVisible(not on)
+        self._side_page_box.setVisible(not on)
+        self.btn_find.setVisible(not on)
+        self.btn_find_mini.setVisible(on)
+        self.btn_side.setToolTip(_t("Menüyü genişlet") if on else _t("Menüyü daralt"))
+        QTimer.singleShot(0, self._side_align_top)
+        for l in self._side_sections:
+            l.setText("" if on else l._full)
+            l.setProperty("mini", on)
+        for b in self._side_rows:
+            b.setText("" if on else "  " + b._full)
+            b.setToolTip((b._full + "\n" + b._tip if b._tip else b._full) if on else b._tip)
+            b.setProperty("mini", on)
+        for x in self._side_sections + self._side_rows:
+            x.style().unpolish(x)
+            x.style().polish(x)
+        if save:
+            self._settings.setValue("side_mini", on)
+        QTimer.singleShot(0, self._place_bar_overlay)
+        QTimer.singleShot(0, self._place_corner)
+        QTimer.singleShot(0, self._place_logo)
+
+    # ---- Ayarlar > Gorunum
+    def set_thumbs_side(self, side, save=True):
+        """Sayfalar sutunu varsayilan SAGDA; kullanici isterse solda (sol menu ile tuval arasinda)."""
+        side = "left" if side == "left" else "right"
+        self.thumbs_side = side
+        self._splitter.insertWidget(0 if side == "left" else 1, self.thumbs_pane)
+        self._splitter.setStretchFactor(self._splitter.indexOf(self.thumbs_pane), 0)
+        self._splitter.setStretchFactor(self._splitter.indexOf(self.scroll.parentWidget()), 1)
+        # Tuvalle sayfalar sutunu arasinda yukaridan asagi 1 px ayirici cizgi (sol menu ve ust cubuk
+        # cizgileriyle ayni renk). Stil sayfasindaki "border" duz QWidget'ta hic cizilmiyordu, cizilse
+        # de icindeki baslik ve liste ustunu orterdi: sutunun zemini cizgi renginde, icerigi TUVALE
+        # bakan kenardan 1 px iceride -> o 1 px'lik zemin cizgi olarak gorunur. (Tema degisince
+        # zemin %(border)s ile kendiliginden yenilenir.)
+        edge = "right" if side == "left" else "left"
+        self._thumbs_lay.setContentsMargins(1 if edge == "left" else 0, 0, 1 if edge == "right" else 0, 0)
+        self.thumbs_pane.setStyleSheet("")
+        if save:
+            self._settings.setValue("thumbs_side", side)
+        QTimer.singleShot(0, self._place_bar_overlay)
+
+    def set_view_option(self, key, value):
+        if key == "thumbs_side":
+            if value != self.thumbs_side:              # (zaten secili dugmeye basildi: is yok)
+                self.set_thumbs_side(value)
+        elif key in ("backdrop", "accent", "style"):
+            self.set_ui_theme(**{key: value})
+        elif key == "dots":
+            self._dots.enabled = bool(value)
+            self._settings.setValue("view_dots", bool(value))
+            self.scroll.viewport().update()
+
+    def _side_find_typed(self, text):
+        """Sol menudeki kutuya yazildi: genis cubugu ACMADAN ara (cubugun kutusuyla ayni metin)."""
+        self._fx_inline = bool(text.strip())
+        ed = self.find_bar.ed_find
+        if ed.text() != text:
+            ed.setText(text)                       # (cubugun "degisti" sinyali aramayi baslatir)
+        if not self._fx_inline and self.find_bar.isHidden():
+            self.find_close(keep_focus=True)
+
+    def _place_mode_seg(self):
+        """(Eski ust seritte modlari tuvalin ortasina hizaliyordu; modlar artik sol menude.)"""
+        return
+
+    TOOL_LABELS = {"select": _t("Seç"), "arrow": _t("Ok"), "line": _t("Çizgi"), "rect": _t("Kutu"),
+                   "ellipse": _t("Daire"), "note": _t("Not"), "pen": _t("Kalem"), "highlight": _t("Fosforlu"),
+                   "number": _t("Numara"), "eraser": _t("Silgi"), "magnifier": _t("Büyüteç"),
+                   "blur": _t("Karart")}
+
+    def _dock_tools(self):
+        """ARAC seritlerini (eski 1. yuzen satir) sabit ust cubuga yerlestir; dugmeler ikon +
+        altinda yazi olur. Yuzen alanda yalniz AYAR seridi (eski 2. satir) kalir. Seritlerin
+        kendisi (gorunurluk mantigi) aynen durur: hangi mod aciksa onun araclari gorunur."""
+        rc, lay = self._bar_row_widgets[0], self._bar_rows[0]
+        it = lay.takeAt(0)                          # ortalayan sol bosluk: araclar sola dayali
+        del it
+        self.tool_bar.layout().addWidget(rc, 1)     # (yeniden ebeveynlenir)
+        rc.setMinimumHeight(0)
+        rc.setMaximumHeight(16777215)
+        self._tool_pills = self._bar_row_pills[0]
+        self._bar_row_pills = [self._bar_row_pills[1]]
+        self._bar_row_widgets = [self._bar_row_widgets[1]]
+        self._bar_row_base_h = [self._bar_row_base_h[1]]
+        self._bar_rows = [self._bar_rows[1]]
+        for pill in self._tool_pills:
+            pill.removeEventFilter(self._bar_geom_watch)
+            pill.setObjectName("toolRow")
+            pill.layout().setContentsMargins(0, 0, 0, 0)
+            pill._lines[0].setSpacing(4)
+        labels = {self.btn_tx_select: _t("Seç"), self.btn_tx_new: _t("Yeni metin"), self.btn_tool_line: _t("Çizgi"),
+                  self.btn_tool_rect: _t("Kutu"), self.btn_tool_ellipse: _t("Daire"), self.btn_tx_snap: _t("Hizala"),
+                  self.btn_tool_select: _t("Seç"), self.btn_mk_sign: _t("İmza"), self.btn_mk_image: _t("Görüntü"),
+                  self.btn_mk_flatten: _t("Sayfaya işle")}
+        for key, b in self.mk_tool_btns.items():
+            labels[b] = self.TOOL_LABELS.get(key, key)
+        self._bar_tools = list(labels)
+        for b, text in labels.items():
+            b.setObjectName("barTool")
+            b.setText(text)
+            b.setIconSize(QSize(22, 22))
+            b.setMinimumSize(58, TOOLBAR_H - 16)
+            b.setMaximumSize(16777215, TOOLBAR_H - 16)
+        self._tool_labels_on = None
+        self._tool_fit = _Resized(self._fit_tool_labels)
+        self.tool_bar.installEventFilter(self._tool_fit)
+        m = self.mk_bar_host.layout().contentsMargins()
+        self._bar_full_h = m.top() + m.bottom() + sum(w.height() for w in self._bar_row_widgets)
+        self._fit_tool_labels()
+
+    def _fit_tool_labels(self):
+        """Dar pencerede araclar sigmiyorsa yazilar gizlenir (yalniz ikon); sigiyorsa geri gelir."""
+        tools = getattr(self, "_bar_tools", None)
+        if not tools:
+            return
+        shown = [p for p in self._tool_pills if not p.isHidden()]
+        avail = self.tool_bar.width() - 24
+
+        def need(with_text):
+            total = 0
+            for p in shown:
+                for w in p._items:
+                    if w.isHidden():
+                        continue
+                    if w in tools:
+                        fm = w.fontMetrics()
+                        total += (max(58, fm.horizontalAdvance(w.text()) + 16) if with_text else 44) + 4
+                    else:
+                        total += w.sizeHint().width() + 4
+            return total
+        on = need(True) <= avail or avail <= 0
+        if on == self._tool_labels_on:
+            return
+        self._tool_labels_on = on
+        for b in tools:
+            b.setToolButtonStyle(Qt.ToolButtonTextUnderIcon if on else Qt.ToolButtonIconOnly)
+            b.setMinimumWidth(58 if on else 44)
+        for p in self._tool_pills:
+            p.layout().activate()
 
     def _goto_typed_page(self, text):
         """Sayfa kutusuna yazilan numaraya git; gecersizse kutu eski degerine doner."""
@@ -1327,12 +2213,11 @@ class MainWindow(QMainWindow, MarkupMixin, FindMixin):
         self.spin_size = QDoubleSpinBox()
         self.spin_size.setRange(1, 400)
         self.spin_size.setValue(11)
-        self.combo_font = QComboBox()
+        # elle yazilmis aileler + bilgisayarda kurulu, PDF'e yazilabilen fontlar; yazarak aranir
+        self.combo_font = font_picker.FontCombo(_t("Otomatik (orijinal)"))
         self.combo_font.setSizeAdjustPolicy(QComboBox.AdjustToMinimumContentsLengthWithIcon)
         self.combo_font.setMinimumContentsLength(8)
-        self.combo_font.addItem(_t("Otomatik (orijinal)"), None)
-        for display_name, key in FONT_DISPLAY_NAMES:
-            self.combo_font.addItem(display_name, key)
+        self.combo_font.rejected.connect(self._font_rejected)
         self.spin_opacity = QSpinBox()
         self.spin_opacity.setRange(1, 100)
         self.spin_opacity.setValue(100)
@@ -1403,7 +2288,7 @@ class MainWindow(QMainWindow, MarkupMixin, FindMixin):
         self.btn_apply = QPushButton(_t("Değişikliği uygula"))
         self.btn_apply.setObjectName("primary")
         self.btn_apply.setToolTip("Ctrl+Enter")
-        ap_icon = ic("fa5s.check", "#ffffff")
+        ap_icon = ic("fa5s.check", "#161616")
         if not ap_icon.isNull():
             self.btn_apply.setIcon(ap_icon)
         self.btn_apply.clicked.connect(self.apply_change)
@@ -1482,7 +2367,7 @@ class MainWindow(QMainWindow, MarkupMixin, FindMixin):
         self.cmb_dash = markup_bar.dash_combo(self.dark)
         stl.addWidget(self.chk_dashed, 2, 0, 1, 2)
         self._show_shape_style()
-        self.spin_width.valueChanged.connect(self._on_shape_style_edit)
+        self.spin_width.valueChanged.connect(self._on_shape_width_edit)
         self.btn_line_color.changed.connect(self._on_shape_style_edit)
         self.chk_dashed.toggled.connect(self._on_shape_style_edit)
         self.cmb_dash.currentIndexChanged.connect(self._on_shape_style_edit)
@@ -1658,6 +2543,16 @@ class MainWindow(QMainWindow, MarkupMixin, FindMixin):
         self.txt_new.hide()
         self._tx_live = False                  # yazarken yaziyi PDF motoru mu ciziyor (bkz. _tx_begin_live)
         self._tx_box = False
+        self._tx_rot = False                   # donuk yazi KENDI ACISINDA, yerinde duzenleniyor
+        self._tx_caret_on = True
+        self._tx_sel_drag = False
+        self._tx_caret_timer = QTimer(self)
+        self._tx_caret_timer.setInterval(max(200, QApplication.cursorFlashTime() // 2 or 530))
+        self._tx_caret_timer.timeout.connect(self._tx_caret_blink)
+        self.txt_new.cursorPositionChanged.connect(self._tx_caret_moved)
+        self.txt_new.selectionChanged.connect(self._tx_caret_moved)
+        self.mk_text.cursorPositionChanged.connect(self._tx_caret_moved)     # not: yerinde duzenleme
+        self.mk_text.selectionChanged.connect(self._tx_caret_moved)
         self._tx_live_cache = None
         self._tx_font_cache = {}
         self._tx_editor_keys = _EditorKeys(self, self._inline_text_done)
@@ -1723,8 +2618,32 @@ class MainWindow(QMainWindow, MarkupMixin, FindMixin):
             self.apply_change()
 
     def _apply_shape_style_now(self):
+        """Bekleyen sekil stili: renk / kesikli degisikligi simdi uygulanir; kalinlik zaten canli
+        uygulanmistir, onun yalniz ertelenen isleri (tam cizim, kucuk resim, alanlar) yapilir."""
+        self._shape_style_timer.stop()
+        if self._shape_pending:                    # renk / kesikli: henuz uygulanmadi
+            self._shape_pending = False
+            self._shape_live = False               # (apply_path_style ertelenen isleri de yapar)
+            self._shape_w_last = None
+            if self.mode == "shape" and self.sel_paths:
+                self.apply_path_style()
+            return
+        if not self._shape_live:
+            return
+        if self._adjust_engine is not None:        # surgu hala oynuyor: hepsi birakinca (adjust_end)
+            return
+        self._shape_live = False
+        self._shape_w_last = None
+        if self.engine.doc is not None:
+            self.after_edit()                      # buyutecler, tam sayfa cizimi, kucuk resim
         if self.mode == "shape" and self.sel_paths:
-            self.apply_path_style()
+            self._on_path_selection()
+            self.status(_t("Stil uygulandı") + ".")
+
+    def _shape_style_flush(self):
+        """Secim / belge degismeden, kaydetmeden ONCE: bekleyen sekil stili isi kalmasin."""
+        if self._shape_pending or self._shape_live:
+            self._apply_shape_style_now()
 
     # ---------------- sayfa ustunde metin yazma ----------------
     def _text_edit_begin(self, select_all=True, at=None):
@@ -1745,6 +2664,7 @@ class MainWindow(QMainWindow, MarkupMixin, FindMixin):
                 self._text_loading = False
         elif self.mode != "insert" or self.pending_insert is None:
             return
+        self._zoom_flush()
         self.txt_new.show()
         self._tx_begin_live()
         self._tx_editor_color()
@@ -1759,6 +2679,8 @@ class MainWindow(QMainWindow, MarkupMixin, FindMixin):
             local = QPoint(int(pos.x()) - ed.x() - vp.x(), int(pos.y()) - ed.y() - vp.y())
             local.setY(max(1, min(local.y(), vp.height() - 2)))
             ed.setTextCursor(ed.cursorForPosition(local))
+        elif at is not None and getattr(self, "_tx_rot", False) and self._tx_rot_click(at, Qt.NoModifier):
+            pass                                # donuk yazi: imlec tiklanan harfin yaninda
         elif at is not None:
             cur = ed.textCursor()
             cur.movePosition(QTextCursor.End)
@@ -1771,15 +2693,20 @@ class MainWindow(QMainWindow, MarkupMixin, FindMixin):
     def editing_live(self):
         return getattr(self, "_tx_live", False) and self.txt_new.isVisible()
 
+    def live_bg(self):
+        """Nesnesiz arka plan gosterilmeli mi: yazi ya da NOT yerinde, canli duzenleniyor."""
+        return self.editing_live() or getattr(self, "_mk_live", False)
+
     def _tx_begin_live(self):
         """Yazarken gorunen yaziyi Qt degil PDF MOTORU cizsin (text_preview): ekrandaki,
         kaydedilecek olanin aynisi olur - duzenlemeye girince yazi buyuyup kaymaz, beyaz
         kutu yok, alttaki filigran / cizgiler gorunur. QTextEdit gorunmez kalir (yazisi
         saydam); sadece klavye, imlec ve secim icin. Orijinal yazi duzenleme boyunca
         sayfadan kaldirilir (suruklemedeki nesnesiz arka plan: canvas.bg).
-        DONUK YAZI: sayfadaki yazi yine canli ve KENDI ACISIYLA cizilir; ama yazma kutusu
-        yatay ve gorunur kalir (_tx_box), yazinin ustune degil yanina konur - egik / ters
-        yaziyi yerinde yazmak zor, imlec ve secim de egik calismaz.
+        DONUK YAZI (_tx_rot): yazi KENDI ACISINDA, yerinde duzenlenir (kullanici, 2026-10-12:
+        yandaki yatay kutu baska yazilarin ustune geliyor, okumayi zorlastiriyordu). QTextEdit
+        ekran disina alinir (yalniz klavye icin); imlec, secim ve fareyle imlec koyma yazinin
+        acisinda BIZIM tarafimizdan cizilir / hesaplanir (_paint_tx_caret, _tx_rot_pos_at).
         Donuk sayfa / arka plan uretilemezse eski yonteme (sadece opak kutu) dusulur."""
         ed = self.txt_new
         live = False
@@ -1790,12 +2717,13 @@ class MainWindow(QMainWindow, MarkupMixin, FindMixin):
         except Exception:
             flat = False
         self._tx_live = False
-        self._tx_box = False                  # canli + ayri yatay yazma kutusu (donuk yazi)
+        self._tx_box = False                  # (eski: donuk yazida ayri yatay kutu - artik kullanilmiyor)
+        self._tx_rot = False
         if flat and self.mode == "text" and self.current_span is not None:
             self._ghost_end()
             self._ghost_text(self.current_span)
             live = self.canvas.bg is not None
-            self._tx_box = live and self.current_span.rotated
+            self._tx_rot = live and self.current_span.rotated
         elif flat and self.mode == "insert" and self.pending_insert is not None:
             live = True
         self._tx_live = live
@@ -1805,12 +2733,131 @@ class MainWindow(QMainWindow, MarkupMixin, FindMixin):
             ed.style().unpolish(ed)
             ed.style().polish(ed)             # (yazi tipini sifirlar; _position_text_editor yeniden kurar)
         ed.setLineWrapMode(QTextEdit.NoWrap)  # yazi asla kendiliginden alt satira gecmez
+        if self._tx_rot:
+            self._tx_caret_on = True
+            self._tx_caret_timer.start()
 
     def _tx_end_live(self):
+        self._tx_caret_timer.stop()
+        self._tx_rot = False
+        self._tx_sel_drag = False
         if getattr(self, "_tx_live", False):
             self._tx_live = False
             self._tx_live_cache = None
             self._ghost_end()
+
+    # ---- donuk yazida yerinde duzenleme: imlec / secim / fare
+    def _tx_caret_blink(self):
+        if not ((self._tx_rot and self.txt_new.isVisible()) or getattr(self, "_mk_live", False)):
+            self._tx_caret_timer.stop()
+            return
+        self._tx_caret_on = not self._tx_caret_on
+        self.canvas.update()
+
+    def _tx_caret_moved(self):
+        if getattr(self, "_tx_rot", False) or getattr(self, "_mk_live", False):
+            self._tx_caret_on = True              # hareket edince imlec hemen gorunur
+            self._tx_caret_timer.start()
+            self.canvas.update()
+
+    def _tx_rot_geom(self):
+        """Satirlarin YEREL yerlesimi (donmemis, origin'e gore, ekran px) - text_preview ile
+        ayni kurallar (hizalama, harf sikligi, satir araligi)."""
+        P = self._tx_params()
+        if P is None:
+            return None
+        z = self.canvas.zoom
+        fo, size, k = P["font"], P["size"], P["track"] * P["stretch"]
+        lines = self.txt_new.toPlainText().split(chr(10))
+
+        def adv(text):
+            return fo.text_length(text, fontsize=size) * k * z if text else 0.0
+        ref = P["ref"] * z if P["ref"] is not None else None
+        offs = []
+        for ln in lines:
+            w = adv(ln) if ln.strip() else 0.0
+            if P["align"] == "center":
+                offs.append(((ref - w) / 2) if ref is not None else -w / 2)
+            elif P["align"] == "right":
+                offs.append((ref - w) if ref is not None else -w)
+            else:
+                offs.append(0.0)
+        return {"P": P, "lines": lines, "offs": offs, "adv": adv,
+                "lh": size * self._tx_spacing() / (P.get("k") or 1.0) * z,
+                "asc": max(fo.ascender, 0.8) * size * z, "desc": max(-fo.descender, 0.2) * size * z}
+
+    def _tx_line_col(self, pos, n_lines):
+        b = self.txt_new.document().findBlock(pos)
+        ln = max(0, min(b.blockNumber(), n_lines - 1))
+        return ln, max(0, pos - b.position())
+
+    def _paint_tx_caret(self, p, cv):
+        g = self._tx_rot_geom()
+        if g is None:
+            return
+        P, lines, offs, adv, lh, asc, desc = (g[k] for k in ("P", "lines", "offs", "adv", "lh", "asc", "desc"))
+        cur = self.txt_new.textCursor()
+        p.save()
+        p.translate(cv.to_px(P["origin"]))
+        p.rotate(P["angle"])
+        if cur.hasSelection():
+            (l0, c0), (l1, c1) = (self._tx_line_col(q, len(lines)) for q in (cur.selectionStart(), cur.selectionEnd()))
+            p.setPen(Qt.NoPen)
+            p.setBrush(QColor(37, 99, 235, 90))
+            for ln in range(l0, l1 + 1):
+                a = offs[ln] + (adv(lines[ln][:c0]) if ln == l0 else 0.0)
+                b = offs[ln] + (adv(lines[ln][:c1]) if ln == l1 else adv(lines[ln]) + asc * 0.3)
+                p.drawRect(QRectF(a, ln * lh - asc, b - a, asc + desc))
+        if self._tx_caret_on:
+            ln, col = self._tx_line_col(cur.position(), len(lines))
+            x = offs[ln] + adv(lines[ln][:col])
+            pen = QPen(QColor(17, 17, 17))
+            pen.setWidthF(max(1.2, min(2.0, asc / 14.0)))
+            pen.setCapStyle(Qt.FlatCap)
+            p.setPen(pen)
+            p.drawLine(QPointF(x, ln * lh - asc), QPointF(x, ln * lh + desc))
+        p.restore()
+
+    def _tx_rot_pos_at(self, pt):
+        """Sayfa noktasi -> yazidaki imlec konumu (belge konumu); yazinin disindaysa None."""
+        g = self._tx_rot_geom()
+        if g is None:
+            return None
+        P, lines, offs, adv, lh, asc, desc = (g[k] for k in ("P", "lines", "offs", "adv", "lh", "asc", "desc"))
+        z = self.canvas.zoom
+        vx, vy = (pt.x - P["origin"].x) * z, (pt.y - P["origin"].y) * z
+        a = math.radians(-P["angle"])
+        lx, ly = vx * math.cos(a) - vy * math.sin(a), vx * math.sin(a) + vy * math.cos(a)
+        pad = 10.0
+        n = len(lines)
+        x0 = min(offs)
+        x1 = max(max(o + adv(l) for o, l in zip(offs, lines)), x0 + 40.0)
+        if not (-asc - pad <= ly <= (n - 1) * lh + desc + pad and x0 - pad - 6 <= lx <= x1 + pad + 6):
+            return None
+        ln = max(0, min(int((ly + asc) // max(lh, 1e-6)), n - 1))
+        line = lines[ln]
+        best, bd = 0, None
+        for i in range(len(line) + 1):
+            dist = abs(offs[ln] + adv(line[:i]) - lx)
+            if bd is None or dist < bd:
+                best, bd = i, dist
+        return self.txt_new.document().findBlockByNumber(ln).position() + best
+
+    def _tx_rot_click(self, pt, mods, keep=False):
+        """Donuk yazi yerinde duzenlenirken yaziya tiklandi: imleci oraya koy (Shift / surukleme:
+        secim). Yazinin disina tiklandiysa False (cagiran duzenlemeyi bitirir)."""
+        if not (getattr(self, "_tx_rot", False) and self.editing_live()):
+            return False
+        pos = self._tx_rot_pos_at(pt)
+        if pos is None:
+            return False
+        cur = self.txt_new.textCursor()
+        anchor = keep or bool(mods & Qt.ShiftModifier)
+        cur.setPosition(pos, QTextCursor.KeepAnchor if anchor else QTextCursor.MoveAnchor)
+        self.txt_new.setTextCursor(cur)
+        self.txt_new.setFocus()                  # (tuvale tiklamak odagi aldi)
+        self._tx_caret_moved()
+        return True
 
     def _tx_spacing(self):
         """Satir araligi: kutudaki deger; ama kullanici degistirmediyse paragrafin GERCEK
@@ -1835,16 +2882,22 @@ class MainWindow(QMainWindow, MarkupMixin, FindMixin):
             if key not in cache:
                 cache[key] = eng._font_obj_for(eng.doc[sp.page_num], sp, bold, choice)[0]
             fo = cache[key]
-            size = self.spin_size.value() or sp.size
+            # ozgun yazinin gercek boyu / harf sikligi (engine.apply_edit de ayni degerleri kullanir)
+            lk = ("look",) + key[1:]
+            if lk not in cache:
+                cache[lk] = eng.edit_look(sp, choice, bold)
+            k, track, stretch = cache[lk]
+            size = (self.spin_size.value() or sp.size) * k
             if self.chk_autofit.isChecked() and text.strip():
-                size = eng._fit_size(fo, text, sp.bbox, size, sp)
+                size = eng._fit_size(fo, text, sp.bbox, size, sp, track * stretch)
             q = sp.quad()
             align = self.text_align
             if hasattr(sp, "lines") and align == "left":
                 align = sp.align
             return {"font": fo, "key": key, "size": size, "color": self.selected_color or sp.color_rgb(),
                     "align": align, "ref": abs(q[1] - q[0]) if align != "left" else None,
-                    "origin": fitz.Point(sp.origin), "angle": eng.span_angle(sp) if sp.rotated else 0.0}
+                    "origin": fitz.Point(sp.origin), "angle": eng.span_angle(sp) if sp.rotated else 0.0,
+                    "track": track, "stretch": stretch, "k": k}
         if self.mode == "insert" and self.pending_insert is not None:
             key = ("i", choice, bold)
             if key not in cache:
@@ -1852,7 +2905,7 @@ class MainWindow(QMainWindow, MarkupMixin, FindMixin):
             _, x, y = self.pending_insert
             return {"font": cache[key], "key": key, "size": self.spin_size.value(),
                     "color": self.selected_color or (0, 0, 0), "align": self.text_align, "ref": None,
-                    "origin": fitz.Point(x, y), "angle": 0.0}
+                    "origin": fitz.Point(x, y), "angle": 0.0, "track": 1.0, "stretch": 1.0}
         return None
 
     def _tx_live_pix(self):
@@ -1865,16 +2918,18 @@ class MainWindow(QMainWindow, MarkupMixin, FindMixin):
         cv = self.canvas
         text = self.txt_new.toPlainText()
         scale = cv.zoom * cv.dpr
-        opacity, spacing = self.spin_opacity.value() / 100, self._tx_spacing()
+        # (satir araligi adlandirilan boyuta gore; P["size"] ise k ile carpilmis: bkz. apply_edit)
+        opacity, spacing = self.spin_opacity.value() / 100, self._tx_spacing() / (P.get("k") or 1.0)
         dev = (P["origin"].x * scale, P["origin"].y * scale)     # origin, sayfa goruntusunde (px)
         key = (text, round(P["size"], 3), tuple(P["color"]), opacity, spacing, P["align"], P["ref"],
                P["key"], round(scale, 4), round(dev[0] % 1.0, 3), round(dev[1] % 1.0, 3),
-               round(P["angle"], 3))
+               round(P["angle"], 3), round(P["track"], 4), round(P["stretch"], 4))
         c = getattr(self, "_tx_live_cache", None)
         if c is not None and c[0] == key:
             return c[1]
         res = self.engine.text_preview(text, P["font"], P["size"], P["color"], opacity, spacing,
-                                       P["align"], P["ref"], scale, origin_dev=dev, angle=P["angle"])
+                                       P["align"], P["ref"], scale, origin_dev=dev, angle=P["angle"],
+                                       track=P["track"], stretch=P["stretch"])
         out = None
         if res is not None:
             pix, ox, oy, box = res
@@ -1906,6 +2961,8 @@ class MainWindow(QMainWindow, MarkupMixin, FindMixin):
         p.setBrush(Qt.NoBrush)
         p.drawRoundedRect(QRectF(*box), 3, 3)
         p.restore()
+        if getattr(self, "_tx_rot", False):    # donuk yazi: imlec ve secim yazinin acisinda
+            self._paint_tx_caret(p, cv)
 
     def _tx_editor_color(self):
         """Yazma kutusundaki yazi, PDF'teki yazinin KENDI renginde gorunsun.
@@ -1959,7 +3016,7 @@ class MainWindow(QMainWindow, MarkupMixin, FindMixin):
         if getattr(self, "_tx_live", False):       # canli: gercek boyut (otomatik sigdirma dahil)
             P = self._tx_params()
             if P is not None:
-                return max(1.0, P["size"] * self.canvas.zoom) * max(0.5, self._tx_spacing())
+                return max(1.0, P["size"] * self.canvas.zoom) * max(0.5, self._tx_spacing() / (P.get("k") or 1.0))
         return max(6.0, size * self.canvas.zoom) * max(0.5, self._tx_spacing())
 
     def _position_text_editor(self):
@@ -1993,6 +3050,10 @@ class MainWindow(QMainWindow, MarkupMixin, FindMixin):
             length = 0.0
         else:
             return
+        if rotated and getattr(self, "_tx_rot", False):
+            ed.resize(60, 30)
+            ed.move(-4000, -4000)              # gorunmez: imlec / secim sayfada, yazinin acisinda cizilir
+            return
         box = getattr(self, "_tx_box", False)
         live = getattr(self, "_tx_live", False) and not box
         P = self._tx_params() if live else None
@@ -2019,7 +3080,8 @@ class MainWindow(QMainWindow, MarkupMixin, FindMixin):
             # kutunun harf araligi oranlanir (gorunmeyen yazi, gorunenle ayni genislikte).
             longest = max(lines, key=len)
             qt_w = fm.horizontalAdvance(longest)
-            pdf_w = P["font"].text_length(longest, fontsize=size) * cv.zoom if longest.strip() else 0
+            pdf_w = (P["font"].text_length(longest, fontsize=size) * P["track"] * P["stretch"] * cv.zoom
+                     if longest.strip() else 0)
             if qt_w > 2 and pdf_w > 2:
                 f.setLetterSpacing(QFont.PercentageSpacing, 100.0 * pdf_w / qt_w)
                 ed.setFont(f)
@@ -2092,6 +3154,11 @@ class MainWindow(QMainWindow, MarkupMixin, FindMixin):
             s = QShortcut(QKeySequence(keys), widget or self)
             if widget is not None:
                 s.setContext(Qt.WidgetShortcut)
+            else:
+                # (Bul / Degistir paneli ayri bir pencere: yazarken de F3, Ctrl+S ... calissin.
+                #  Kipli iletisim kutulari acikken Qt yine engeller; panelin yazi kutusu kendi
+                #  tuslarini - Ctrl+Z, Ctrl+A ... - once alir.)
+                s.setContext(Qt.ApplicationShortcut)
             s.activated.connect(fn)
 
         sc("Ctrl+O", self.open_pdf)
@@ -2123,8 +3190,22 @@ class MainWindow(QMainWindow, MarkupMixin, FindMixin):
         self.dark = dark
         app = QApplication.instance()
         app.setPalette(build_palette(dark))
-        app.setStyleSheet(build_style(dark))
-        icol = "#c4c8d0" if dark else "#3d424a"
+        # Stil sayfasi degisince Qt butun parcalari (~450) yeniden cilalar ve bu sirada binlerce
+        # olay uretir. Iletisim kutularina baslik takan GENEL olay suzgeci (Python) her biri
+        # icin cagriliyordu: gorunum degisimi 640 ms suruyordu, suzgecsiz 350 ms. Bu sirada
+        # yeni pencere acilmaz, var olanlarin basligi zaten takili: suzgec gecici olarak cikarilir.
+        chrome = getattr(title_bar.DialogChrome, "_instance", None)
+        if chrome is not None:
+            app.removeEventFilter(chrome)
+        try:
+            app.setStyleSheet(build_style(dark))
+        finally:
+            if chrome is not None:
+                app.installEventFilter(chrome)
+        icol = DARK["text2"] if dark else "#3d424a"
+        ap_icon = ic("fa5s.check", (DARK if dark else LIGHT)["primary_text"])
+        if not ap_icon.isNull():
+            self.btn_apply.setIcon(ap_icon)
         for b, fa in self._neutral_icons:
             icon = ic(fa, icol)
             if not icon.isNull():
@@ -2133,14 +3214,37 @@ class MainWindow(QMainWindow, MarkupMixin, FindMixin):
         for b in (self.btn_color, self.btn_line_color) + self._mk_color_buttons():
             b.set_rgb(b.rgb)
         self._mk_recolor_icons()
+        if getattr(self, "find_bar", None) is not None:
+            self.find_bar.recolor(dark, DARK if dark else LIGHT)
         self.titlebar.set_colors(DARK if dark else LIGHT)
         # iletisim kutulari da kendi basligimizla acilir (Ayarlar, soru kutulari ...)
         title_bar.DialogChrome.ensure(app, DARK if dark else LIGHT)
         self.thumbs.update()          # kartlar renklerini paletten ciziminde okur
+        self._place_corner()
+        self._place_logo()
+        if dark:                      # temaya bagli, sablonun disinda kalan yerler
+            self.home.set_colors(DARK, DARK["hi"])
+            self.set_thumbs_side(self.thumbs_side, save=False)
+            self.scroll.viewport().update()
+            self.canvas.update()
         try:
             self._settings.setValue("dark", dark)
         except Exception:
             pass
+
+    def set_ui_theme(self, backdrop=None, accent=None, style=None):
+        """Ayarlar > Gorunum: zemin / secim rengi / secim bicimi (verilmeyen ayni kalir). Aninda
+        uygulanir, kapatip acinca da hatirlanir."""
+        cur = self.ui_theme
+        if (backdrop or cur[0], accent or cur[1], style or cur[2]) == tuple(cur):
+            return                                 # (zaten secili: butun arayuzu yeniden bicimlendirme)
+        self.ui_theme = set_theme(backdrop or cur[0], accent or cur[1], style or cur[2])
+        try:
+            for k, v in zip(("ui_bg", "ui_accent", "ui_style"), self.ui_theme):
+                self._settings.setValue(k, v)
+        except Exception:
+            pass
+        self.apply_theme(self.dark)
 
     @staticmethod
     def _resolve_dark(mode):
@@ -2167,17 +3271,24 @@ class MainWindow(QMainWindow, MarkupMixin, FindMixin):
             if dark != self.dark:
                 self.apply_theme(dark)
 
-    def open_settings(self, page="appearance"):
+    def open_settings(self, page="view"):
         from settings_dialog import SettingsDialog
-        from markup_ui import SHORTCUTS
         self._settings_dlg = SettingsDialog(
             self, self.theme_mode, self.set_theme_mode, APP_NAME, APP_VERSION,
-            resource_path("assets", "revora.png"), SHORTCUTS,
-            page=page if isinstance(page, str) else "appearance", icon_fn=ic,
+            resource_path("assets", "revora.png"),
+            page=page if isinstance(page, str) else "view", icon_fn=ic,
+            view={"thumbs_side": self.thumbs_side, "dots": self._dots.enabled, "theme": self.ui_theme,
+                  "backdrops": [("night", _t("Gece"), BACKDROP_DOTS["night"]),
+                                ("graphite", _t("Grafit"), BACKDROP_DOTS["graphite"]),
+                                ("steel", _t("Çelik"), BACKDROP_DOTS["steel"])],
+                  "accents": [("blue", _t("Mavi"), ACCENT_DOTS["blue"]), ("gold", _t("Altın"), ACCENT_DOTS["gold"]),
+                              ("plain", _t("Sade"), ACCENT_DOTS["plain"])],
+                  "styles": [("line", _t("Kontür")), ("fill", _t("Dolgu"))]},
+            on_view=self.set_view_option,
             language=self._settings.value("language", i18n.language(), type=str),
             on_language=lambda code: self._settings.setValue("language", code),
             on_restart=self.restart_app)
-        self._settings_dlg.exec()
+        title_bar.run_modal(self._settings_dlg)
         self._settings_dlg = None
 
     def restart_app(self):
@@ -2215,8 +3326,12 @@ class MainWindow(QMainWindow, MarkupMixin, FindMixin):
         QApplication.quit()
 
     # ======================================================== durum / panel
-    def status(self, msg):
+    def status(self, msg, quiet=False):
+        """Islem bildirimi: sayfanin alt ortasinda birkac saniye gorunur. quiet: yalniz kayda
+        gecer, gosterilmez (kullanicinin zaten gordugu seyler: "Acildi: ...")."""
         self.statusBar().showMessage(msg)
+        if not quiet and getattr(self, "hint_pill", None) is not None:
+            self.hint_pill.say(msg)
 
     def _doc_name(self):
         p = self.engine.path or getattr(self.engine, "suggested_path", None)
@@ -2232,7 +3347,8 @@ class MainWindow(QMainWindow, MarkupMixin, FindMixin):
         self.btn_redo.setEnabled(has and bool(self.engine.redo_stack))
         for b in (self.btn_pg_dup, self.btn_pg_blank, self.btn_pg_import,
                   self.btn_save, self.btn_save_more, self.btn_page, self.ed_page,
-                  self.btn_zoom_in, self.btn_zoom_out, self.btn_fit, self.btn_fit_page, self.mode_seg):
+                  self.btn_zoom_in, self.btn_zoom_out, self.btn_fit, self.btn_fit_page, self.mode_seg,
+                  *getattr(self, "_side_doc_items", ())):
             b.setEnabled(has)
         self._show_page_number()               # (onceki / sonraki sayfa oklari da orada)
 
@@ -2254,7 +3370,9 @@ class MainWindow(QMainWindow, MarkupMixin, FindMixin):
         # acilista ust serit de yok (hepsi belge isteyen dugmeler); Ayarlar acilis ekraninin
         # sag ustunde. Kisayollar (Ctrl+O, Ctrl+,) calismaya devam eder.
         self.topbar.setVisible(not on)
+        self.tool_bar.setVisible(not on)
         self.home.setVisible(on)
+        QTimer.singleShot(0, self._place_logo)
 
     def _settle_bars(self):
         """Seritlerde parca gizlenip gosterilince boyut + ortalama HEMEN yeniden hesaplansin
@@ -2274,6 +3392,15 @@ class MainWindow(QMainWindow, MarkupMixin, FindMixin):
         if not getattr(self, "_bar_settle_pending", False):
             self._bar_settle_pending = True
             QTimer.singleShot(0, self._settle_bars_later)
+
+    def _fit_combos(self):
+        """Acilir listeler: uzun ceviriler de sigsin (kutu en cok 40 px genisler, liste satirina gore)."""
+        fit = markup_bar.fit_combo
+        fit(self.combo_font, 40, only=(0,))                # yalniz "Otomatik (orijinal)" satiri icin
+        for cb in (self.mk_head, self.mk_hsize, self.mk_hlstyle, self.mk_mag_mode, self.blur_mode):
+            fit(cb, 40)
+        for cb in (self.mk_font, self.mk_lfont, self.mk_preset):
+            fit(cb)
 
     def _settle_bars_later(self):
         self._bar_settle_pending = False
@@ -2300,6 +3427,8 @@ class MainWindow(QMainWindow, MarkupMixin, FindMixin):
         self.canvas.set_pad_top(getattr(self, "_bar_full_h", 0) + 6 if has else 0)
         self._place_zoom_pill()
         self._place_find_bar()
+        if getattr(self, "hint_pill", None) is not None and not self.hint_pill.isHidden():
+            self.hint_pill.place()
         self._place_mode_seg()                 # ust seritteki modlar ayni eksende kalsin
 
     def _update_bar_mask(self):
@@ -2339,9 +3468,10 @@ class MainWindow(QMainWindow, MarkupMixin, FindMixin):
         # sayfanin ustundeki pay TEK satirlik seritlere gore: uzun menu ikinci satira
         # kayinca sayfa zıplamasin (ikinci satir sayfanin ustunde suzulur)
         hm = self.mk_bar_host.layout()
-        one = self.w_mk_tools.sizeHint().height()       # tek satirlik serit yuksekligi
-        single = [max(base, one) for base in self._bar_row_base_h]
-        self._bar_full_h = m.top() + m.bottom() + hm.spacing() + sum(single)
+        single = list(self._bar_row_base_h)             # (araclar sabit ust cubukta; burada yalniz ayar seridi)
+        self._bar_full_h = m.top() + m.bottom() + sum(single)
+        if hasattr(self, "_fit_tool_labels"):
+            self._fit_tool_labels()
 
     def _refresh_bars(self):
         for group in getattr(self, "_bar_row_pills", ()):
@@ -2397,10 +3527,17 @@ class MainWindow(QMainWindow, MarkupMixin, FindMixin):
         strip.set_current(self.tab_idx)
 
     def _finish_edits(self):
-        """Yarim kalan duzenlemeleri uygula (sayfada yazilan metin, bekleyen aci onizlemesi)."""
+        """Yarim kalan duzenlemeleri uygula (sayfada yazilan metin, yerinde duzenlenen not, bekleyen
+        aci onizlemesi). Kaydetmeden, sekme / belge degistirmeden ONCE cagrilir: ekranda gorunen
+        ile belgeye yazilan ayni olsun."""
         if self.engine.doc is not None:
+            self._shape_style_flush()
             self._inline_text_done()
             self._text_angle_commit()
+            try:
+                self._mk_close_editor()            # (not yerinde duzenleniyorsa yazisini uygular)
+            except Exception:
+                pass
 
     def _leave_tab(self):
         """Gecerli sekmeden ayrilmadan once: duzenlemeleri bitir, gorunumunu sakla."""
@@ -2419,6 +3556,8 @@ class MainWindow(QMainWindow, MarkupMixin, FindMixin):
     def _activate(self, i):
         """i. sekmeyi goster (-1: baslangic ekrani). Onceki sekmeden _leave_tab ile cikilmis olmali."""
         self.tab_idx = i
+        if i >= 0:
+            self._last_tab = i
         self.engine = self.tabs[i].engine if i >= 0 else self._home_engine
         # belgeye bagli onbellekler: anahtarlari sayfa + belge surumu, baska belgeyle cakisabilir
         self._mk_loaded = None
@@ -2446,10 +3585,11 @@ class MainWindow(QMainWindow, MarkupMixin, FindMixin):
         if t.thumbs is not None and t.thumbs_ver == self.engine.version and len(t.thumbs) == n:
             self.thumbs.set_items(t.thumbs, self.current_page)
             self.thumbs.ensure_visible(self.current_page)
+            self._thumb_fill()                 # (sekmeden cikilirken yarim kalmis olabilir)
         else:
             self._populate_thumbnails()
         if t.zoom is None:
-            self.fit_to_width()
+            self.fit_to_page()
         else:
             self.canvas.zoom = t.zoom
             self.render_current_page()
@@ -2469,6 +3609,12 @@ class MainWindow(QMainWindow, MarkupMixin, FindMixin):
             return
         self._leave_tab()
         self._activate(i)
+
+    def back_to_document(self):
+        """Acilis ekranindan en son bakilan belgeye don."""
+        if self.tabs:
+            i = getattr(self, "_last_tab", 0)
+            self.switch_tab(i if 0 <= i < len(self.tabs) else len(self.tabs) - 1)
 
     def step_tab(self, delta):
         """Sonraki / onceki belge sekmesi (Ctrl+Tab / Ctrl+Shift+Tab)."""
@@ -2512,6 +3658,8 @@ class MainWindow(QMainWindow, MarkupMixin, FindMixin):
             pass
         t.engine.doc = None
         t.engine.undo_stack, t.engine.redo_stack = [], []
+        for pm in t.thumbs or ():              # kapanan sekmenin bos kagit kayitlari birikmesin
+            self._thumb_blank.discard(pm.cacheKey())
         t.thumbs = None
         return True
 
@@ -2537,7 +3685,7 @@ class MainWindow(QMainWindow, MarkupMixin, FindMixin):
         if t.engine.path:
             menu.addSeparator()
             menu.addAction(_t("Klasörde göster"), lambda: self._reveal_in_folder(t.engine.path))
-        menu.exec(global_pos)
+        title_bar.run_modal(menu, global_pos)
 
     # ======================================================== dosya
     def _confirm_close_all(self):
@@ -2564,7 +3712,7 @@ class MainWindow(QMainWindow, MarkupMixin, FindMixin):
                           QMessageBox.Save | QMessageBox.Discard | QMessageBox.Cancel, self)
         box.button(QMessageBox.Discard).setText(_t("Kaydetme"))
         box.setDefaultButton(QMessageBox.Save)
-        box.exec()
+        title_bar.run_modal(box)
         clicked = box.clickedButton()
         if clicked == box.button(QMessageBox.Save):
             return "save"
@@ -2594,6 +3742,7 @@ class MainWindow(QMainWindow, MarkupMixin, FindMixin):
                     self.switch_tab(i)
                     return True
         eng = PDFEditor()
+        eng.on_rollback = self._engine_rolled_back
         try:
             if is_img:                          # resim: tek sayfalik PDF'e cevrilip acilir
                 doc, skipped = image_tools.images_to_pdf([path], "image")
@@ -2621,7 +3770,7 @@ class MainWindow(QMainWindow, MarkupMixin, FindMixin):
         self.tabs.append(tab)
         self.titlebar.strip.add_tab(self._tab_label(eng), eng.path or "", bool(eng.dirty))
         self._activate(len(self.tabs) - 1)
-        self.status(_t("Açıldı: {name}", name=os.path.basename(path)))
+        self.status(_t("Açıldı: {name}", name=os.path.basename(path)), quiet=True)
         return True
 
     # ---- parola
@@ -2635,7 +3784,7 @@ class MainWindow(QMainWindow, MarkupMixin, FindMixin):
         dlg.setTextEchoMode(QLineEdit.Password)
         dlg.setOkButtonText(_t("Aç"))
         dlg.setCancelButtonText(_t("Vazgeç"))
-        if dlg.exec() != QDialog.Accepted:
+        if title_bar.run_modal(dlg) != QDialog.Accepted:
             return None
         return dlg.textValue()
 
@@ -2644,7 +3793,7 @@ class MainWindow(QMainWindow, MarkupMixin, FindMixin):
             return
         from dialogs import PasswordDialog
         dlg = PasswordDialog(self, has_password=bool(self.engine.password))
-        if dlg.exec() and dlg.password:
+        if title_bar.run_modal(dlg) and dlg.password:
             self.engine.set_password(dlg.password)
             self._update_title()
             self.render_current_page()
@@ -2673,7 +3822,7 @@ class MainWindow(QMainWindow, MarkupMixin, FindMixin):
         import pdf_tables
         title = _t("Excel'e aktar")
         dlg = ExportExcelDialog(self, self.current_page, self.engine.page_count())
-        if dlg.exec() != QDialog.Accepted:
+        if title_bar.run_modal(dlg) != QDialog.Accepted:
             return False
         pages, whole = dlg.pages(), dlg.whole_page
         prog = None
@@ -2690,7 +3839,8 @@ class MainWindow(QMainWindow, MarkupMixin, FindMixin):
                     if prog.wasCanceled():
                         return False
                 if whole:
-                    sh = pdf_tables.page_sheet(self.engine, pno, images=dlg.images, text_fallback=dlg.text_tables)
+                    make = pdf_tables.page_layout if dlg.keep_layout else pdf_tables.page_sheet
+                    sh = make(self.engine, pno, images=dlg.images, text_fallback=dlg.text_tables)
                     if sh is not None:
                         found.append(sh)
                 else:
@@ -2699,6 +3849,7 @@ class MainWindow(QMainWindow, MarkupMixin, FindMixin):
             QApplication.restoreOverrideCursor()
             if prog is not None:
                 prog.setValue(len(pages))
+                prog.deleteLater()
         if not found:
             QMessageBox.information(
                 self, title,
@@ -2730,11 +3881,24 @@ class MainWindow(QMainWindow, MarkupMixin, FindMixin):
             return False
         QApplication.restoreOverrideCursor()
         self.status(msg + "  " + path)
-        box = QMessageBox(QMessageBox.Information, title, msg + "\n" + path, QMessageBox.NoButton, self)
+        notes = []
+        if whole and dlg.keep_layout:                 # aktarilamayan gorunur icerik SESSIZCE kaybolmaz
+            skipped = []
+            for sh in found:
+                skipped += [t for t in sh.skipped if t not in skipped]
+            if skipped:
+                text = " ".join(skipped)
+                notes.append(_t("Aktarılmayan eğik yazı (filigran): {t}",
+                                t=text if len(text) <= 120 else text[:117] + "..."))
+            odd = sorted({sh.paper[0] for sh in found if not sh.paper[1]})
+            if odd:
+                notes.append(_t("Sayfa boyutu standart değil; baskı {k} kâğıdına ayarlandı.", k=", ".join(odd)))
+        box = QMessageBox(QMessageBox.Information, title,
+                          msg + "\n" + path + ("\n\n" + "\n".join(notes) if notes else ""), QMessageBox.NoButton, self)
         b_open = box.addButton(_t("Dosyayı aç"), QMessageBox.AcceptRole)
         b_show = box.addButton(_t("Klasörde göster"), QMessageBox.ActionRole)
         box.addButton(_t("Kapat"), QMessageBox.RejectRole)
-        box.exec()
+        title_bar.run_modal(box)
         if box.clickedButton() is b_open:
             from PySide6.QtCore import QUrl
             from PySide6.QtGui import QDesktopServices
@@ -2761,10 +3925,10 @@ class MainWindow(QMainWindow, MarkupMixin, FindMixin):
         except Exception:
             before = 0
         dlg = CompressDialog(self, self._size_text(before) if before else "")
-        if dlg.exec() != QDialog.Accepted:
+        if title_bar.run_modal(dlg) != QDialog.Accepted:
             return False
         start = (os.path.splitext(src)[0] + "_kucuk.pdf") if src else (self.engine.suggested_path or "")
-        path, _ = QFileDialog.getSaveFileName(self, _t("Küçülterek kaydet"), start, _t("PDF Dosyaları (*.pdf)"))
+        path, _ = QFileDialog.getSaveFileName(self, _t("PDF sıkıştır"), start, _t("PDF Dosyaları (*.pdf)"))
         if not path:
             return False
         QApplication.setOverrideCursor(Qt.WaitCursor)
@@ -2785,7 +3949,7 @@ class MainWindow(QMainWindow, MarkupMixin, FindMixin):
                      p=round(100 * (before - after) / before))
         else:
             msg = _t("Boyut: {b}. Bu belge zaten sıkıştırılmış; daha fazla küçülmedi.", b=self._size_text(after))
-        QMessageBox.information(self, _t("Küçülterek kaydet"), msg)
+        QMessageBox.information(self, _t("PDF sıkıştır"), msg)
         return True
 
     # ---- son acilan klasor / dosya basina son sayfa (kapatip acinca da hatirlanir)
@@ -2873,7 +4037,9 @@ class MainWindow(QMainWindow, MarkupMixin, FindMixin):
 
     def save_pdf(self):
         """Acik dosyanin uzerine kaydeder (ilk seferde onay ister)."""
-        self._text_angle_commit()     # bekleyen aci onizlemesi
+        # Ekranda yazilmakta olan metin ONCE belgeye islenir: eskiden Ctrl+S duzenleme acikken
+        # ESKI yaziyi kaydediyordu, "degisti" isareti de yanmiyordu (audit 2026-10-12).
+        self._finish_edits()
         if not self.engine.doc:
             return False
         path = self.engine.path
@@ -2893,7 +4059,7 @@ class MainWindow(QMainWindow, MarkupMixin, FindMixin):
         return self._do_save(path)
 
     def save_pdf_as(self):
-        self._text_angle_commit()     # bekleyen aci onizlemesi
+        self._finish_edits()          # (bkz. save_pdf)
         if not self.engine.doc:
             return False
         start = self.engine.path or ""
@@ -2913,79 +4079,103 @@ class MainWindow(QMainWindow, MarkupMixin, FindMixin):
 
     # ======================================================== yazdirma
     def print_pdf(self):
-        """Yazdir (Ctrl+P): Windows'un yazici penceresi; tumu / gecerli sayfa / aralik."""
+        """Yazdir (Ctrl+P): kendi penceremiz (print_dialog: solda ayarlar, sagda onizleme). Altindaki
+        baglantiyla Windows'un yazici penceresi de acilabilir (surucunun kendi ayarlari icin)."""
         self._inline_text_done()               # (bekleyen aci onizlemesini de uygular)
         if not self.engine.doc:
             return
-        from PySide6.QtPrintSupport import QPrinter, QPrintDialog
         from PySide6.QtWidgets import QDialog
-        printer = QPrinter(QPrinter.HighResolution)
-        printer.setDocName(self._doc_name() or APP_NAME)
-        n = self.engine.page_count()
-        dlg = QPrintDialog(printer, self)
-        dlg.setWindowTitle(_t("Yazdır"))
-        dlg.setOption(QPrintDialog.PrintPageRange, True)
-        dlg.setOption(QPrintDialog.PrintCurrentPage, True)
-        dlg.setMinMax(1, n)
-        if dlg.exec() != QDialog.Accepted:
+        from print_dialog import PrintDialog
+        dlg = PrintDialog(self, self.engine.doc, self.current_page, self._doc_name() or APP_NAME, lambda: DARK)
+        if title_bar.run_modal(dlg) != QDialog.Accepted:
             return
-        rng = printer.printRange()
-        if rng == QPrinter.PageRange and printer.fromPage() > 0:
-            pages = list(range(printer.fromPage() - 1, min(printer.toPage(), n)))
-        elif rng == QPrinter.CurrentPage:
-            pages = [self.current_page]
-        else:
-            pages = list(range(n))
-        done = self._print_pages(printer, pages)
+        printer, pages, opts = dlg.printer(), dlg.pages(), dlg.options()
+        if dlg.use_system:
+            from PySide6.QtPrintSupport import QPrinter, QPrintDialog
+            n = self.engine.page_count()
+            sd = QPrintDialog(printer, self)
+            sd.setWindowTitle(_t("Yazdır"))
+            sd.setOption(QPrintDialog.PrintPageRange, True)
+            sd.setOption(QPrintDialog.PrintCurrentPage, True)
+            sd.setMinMax(1, n)
+            if title_bar.run_modal(sd) != QDialog.Accepted:
+                return
+            rng = printer.printRange()
+            if rng == QPrinter.PageRange and printer.fromPage() > 0:
+                pages = list(range(printer.fromPage() - 1, min(printer.toPage(), n)))
+            elif rng == QPrinter.CurrentPage:
+                pages = [self.current_page]
+            elif rng == QPrinter.AllPages:
+                pages = list(range(n))
+            opts["copies"] = printer.copyCount()
+            opts["collate"] = printer.collateCopies()
+            opts["gray"] = printer.colorMode() == QPrinter.GrayScale
+        done = self._print_pages(printer, pages, opts)
         if done:
             self.status(_t("{n} sayfa yazıcıya gönderildi.", n=done))
 
-    def _print_pages(self, printer, pages):
-        """Sayfalari yaziciya ciz: her sayfa yazdirilabilir alana ORANI KORUNARAK sigdirilir,
-        yatay sayfa dikey kagitta (ya da tersi) kendiliginden dondurulur. Ekrandaki son
+    def _print_pages(self, printer, pages, opts=None):
+        """Sayfalari yaziciya ciz (print_dialog.print_pages: onizlemeyle AYNI yerlesim). Ekrandaki son
         hal basilir (isaretlemeler dahil). Dondurur: basilan sayfa sayisi."""
         from PySide6.QtWidgets import QProgressDialog
-        painter = QPainter()
-        if not painter.begin(printer):
-            QMessageBox.warning(self, _t("Yazdırılamadı"), _t("Yazıcı başlatılamadı."))
-            return 0
+        import print_dialog
         prog = None
         if len(pages) > 3:
             prog = QProgressDialog(_t("Yazdırılıyor..."), _t("İptal"), 0, len(pages), self)
             prog.setWindowModality(Qt.WindowModal)
             prog.setMinimumDuration(400)
-        dpi = max(72, min(printer.resolution(), 300))       # 300 dpi yeter; bellek sisirmesin
-        done = 0
+
+        def step(i, n):
+            if prog is None:
+                return True
+            prog.setMaximum(n)
+            prog.setValue(i)
+            return not prog.wasCanceled()
         try:
-            for i, pno in enumerate(pages):
-                if prog is not None:
-                    prog.setValue(i)
-                    if prog.wasCanceled():
-                        break
-                if i and not printer.newPage():
-                    break
-                page = self.engine.doc[pno]
-                area = painter.viewport()
-                turn = (page.rect.width > page.rect.height) != (area.width() > area.height())
-                mat = fitz.Matrix(dpi / 72.0, dpi / 72.0)
-                if turn:
-                    mat = mat.prerotate(90)
-                pix = page.get_pixmap(matrix=mat, alpha=False)
-                img = QImage(pix.samples, pix.width, pix.height, pix.stride, QImage.Format_RGB888)
-                k = min(area.width() / img.width(), area.height() / img.height())
-                w_, h_ = int(img.width() * k), int(img.height() * k)
-                painter.drawImage(QRect(area.x() + (area.width() - w_) // 2,
-                                        area.y() + (area.height() - h_) // 2, w_, h_), img)
-                done += 1
+            done = print_dialog.print_pages(self.engine.doc, printer, pages, opts or {}, step)
         finally:
-            painter.end()
             if prog is not None:
-                prog.setValue(len(pages))
+                prog.setValue(prog.maximum())
+                prog.deleteLater()
+        if done is None:
+            QMessageBox.warning(self, _t("Yazdırılamadı"), _t("Yazıcı başlatılamadı."))
+            return 0
         return done
 
+    def _open_in_other_tab(self, path):
+        """Bu dosya BASKA bir sekmede acik mi (o sekmenin belgesi bu dosyaya bagli mi)."""
+        k = safe_write.key(path)
+        return any(t.engine is not self.engine and t.engine.path and safe_write.key(t.engine.path) == k
+                   for t in self.tabs)
+
     def _do_save(self, path, compress=None):
+        self._finish_edits()
+        if self._open_in_other_tab(path):
+            # iki sekme ayni dosyaya baglanirsa birindeki Kaydet digerinin kaydettigini uyarisiz ezer
+            QMessageBox.warning(self, _t("Kaydedilemedi"),
+                                _t("Bu dosya başka bir sekmede açık:\n{path}\n\n"
+                                   "Başka bir ad seçin ya da önce o sekmeyi kapatın.", path=path))
+            return False
+        if getattr(self.engine, "restricted", False):
+            # Belgenin sahibi duzenleme / kopyalama izinlerini kisitlamis. Sahip parolasini
+            # bilmedigimiz icin ayni korumayla kaydedemeyiz: SESSIZCE kaldirmak yerine sorulur.
+            r = QMessageBox.question(
+                self, _t("Belge koruması"),
+                _t("Bu belgenin sahibi düzenleme ya da kopyalama izinlerini kısıtlamış.\n"
+                   "Kaydedilen dosyada bu kısıtlamalar OLMAYACAK.\n\nYine de kaydedilsin mi?"),
+                QMessageBox.Yes | QMessageBox.Cancel, QMessageBox.Cancel)
+            if r != QMessageBox.Yes:
+                return False
         try:
             self.engine.save(path, compress=compress)
+            self.engine.restricted = False         # (kaydedilen dosya artik kisitsiz; bir daha sorma)
+        except RedactionError as e:
+            # karartma uygulanamadi: belge eski haline dondu, karartma hala beklemede -> dosya YAZILMADI
+            QMessageBox.critical(self, _t("Kaydedilemedi"),
+                                 _t("Karartma uygulanamadı; belge değiştirilmedi:\n{e}", e=e))
+            self.render_current_page()
+            self._refresh_panel()
+            return False
         except Exception as e:
             QMessageBox.critical(self, _t("Kaydedilemedi"),
                                  _t("Dosya kaydedilemedi (başka bir programda açık olabilir):\n{e}", e=e))
@@ -2999,7 +4189,7 @@ class MainWindow(QMainWindow, MarkupMixin, FindMixin):
         self.render_current_page()
         self._refresh_panel()
         self.status(_t("Kaydedildi: {path}", path=path) + (_t(
-            " · {n} bulanık alan kalıcı uygulandı (alttaki içerik silindi; Ctrl+Z ile kayıt "
+            " · {n} karartma kalıcı uygulandı (alttaki içerik silindi; Ctrl+Z ile kayıt "
             "öncesine dönülebilir)", n=n) if n else ""))
         return True
 
@@ -3028,7 +4218,7 @@ class MainWindow(QMainWindow, MarkupMixin, FindMixin):
     # ======================================================== resim <-> PDF
     def open_images_to_pdf(self, initial=None):
         dlg = image_tools.ImagesToPdfDialog(self, initial if isinstance(initial, list) else None, self._settings)
-        dlg.exec()
+        title_bar.run_modal(dlg)
         if dlg.created:
             self.open_pdf(dlg.created)
 
@@ -3040,12 +4230,14 @@ class MainWindow(QMainWindow, MarkupMixin, FindMixin):
             return
         self._inline_text_done()
         cur = self.current_page if pno is None or isinstance(pno, bool) else pno
-        image_tools.ExportPagesDialog(self, self.engine.doc, cur, self._export_base(), self._settings).exec()
+        title_bar.run_modal(
+            image_tools.ExportPagesDialog(self, self.engine.doc, cur, self._export_base(), self._settings))
 
     def extract_photos_dialog(self):
         if not self.engine.doc:
             return
-        image_tools.ExtractPhotosDialog(self, self.engine.doc, self.current_page, self._export_base()).exec()
+        title_bar.run_modal(
+            image_tools.ExtractPhotosDialog(self, self.engine.doc, self.current_page, self._export_base()))
 
     def copy_page_image(self, pno=None):
         if not self.engine.doc:
@@ -3064,13 +4256,86 @@ class MainWindow(QMainWindow, MarkupMixin, FindMixin):
         pm.setDevicePixelRatio(dpr)
         return pm
 
+    def _thumb_blank_pix(self, i):
+        """Henuz cizilmemis sayfa: ayni boyutta bos kagit (liste yerlesimi sonradan oynamasin).
+        Hangi kartlarin bos oldugu goruntunun kimliginden (cacheKey) bilinir: kartlar surukleyip
+        siralaninca / sayfa silinince de dogru kalir, sira numarasi tutulmaz."""
+        page = self.engine.doc[i]
+        dpr = self.devicePixelRatioF()
+        zoom = THUMB_H * dpr / max(page.rect.height, page.rect.width * 0.75)
+        pm = QPixmap(max(1, round(page.rect.width * zoom)), max(1, round(page.rect.height * zoom)))
+        pm.fill(QColor("#ffffff"))
+        pm.setDevicePixelRatio(dpr)
+        self._thumb_blank.add(pm.cacheKey())
+        return pm
+
     def _populate_thumbnails(self):
-        self.thumbs.set_items([self._thumb_pix(i) for i in range(self.engine.page_count())],
-                              self.current_page)
+        """Kucuk resimler. Kisa belgede hepsi hemen cizilir. Uzun belgede (THUMB_EAGER'dan cok
+        sayfa) once bos kagitlar konur, GORUNEN sayfalar hemen, kalanlar program bostayken
+        parca parca cizilir (_thumb_fill): 300 sayfalik belge acilirken / sayfa silinince
+        arayuz butun sayfalarin cizilmesini beklemez."""
+        n = self.engine.page_count()
+        # (_thumb_blank SIFIRLANMAZ: baska sekmenin sakli listesinde de bos kagit olabilir)
+        if n <= THUMB_EAGER:
+            self.thumbs.set_items([self._thumb_pix(i) for i in range(n)], self.current_page)
+            self.thumbs.ensure_visible(self.current_page)
+            return
+        self.thumbs.set_items([self._thumb_blank_pix(i) for i in range(n)], self.current_page)
         self.thumbs.ensure_visible(self.current_page)
+        self._thumb_fill(first=True)
+
+    def _thumb_vis(self):
+        """Listenin ekranda gorunen kismi (liste henuz gosterilmediyse gecerli sayfanin cevresi)."""
+        vis = self.thumbs.visibleRegion().boundingRect()
+        if vis.isEmpty():
+            vis = self.thumbs.item_rect(max(0, self.current_page)).adjusted(0, -600, 0, 600)
+        return vis
+
+    def _thumb_pending(self):
+        """Hala bos kagit olan kartlar; once gorunenler, sonra gecerli sayfaya yakin olanlar."""
+        blank = self._thumb_blank
+        if not blank:
+            return []
+        th = self.thumbs
+        todo = [i for i in range(th.count()) if th.item(i).cacheKey() in blank]
+        if not todo:
+            # (kume SILINMEZ: baska sekmenin sakli listesinde hala bos kagit olabilir. Eskiden
+            #  burada temizleniyordu: uzun belgeden baska sekmeye gecip donunce kalan kartlar
+            #  bos kaliyor, program da tamamlanmis sayiyordu - 2026-10-13)
+            return []
+        vis = self._thumb_vis()
+        cur = self.current_page
+        todo.sort(key=lambda i: (not th.item_rect(i).intersects(vis), abs(i - cur)))
+        return todo
+
+    def _thumb_fill(self, first=False):
+        """Bos kagitlari sirayla gercek kucuk resimle degistirir. Her seferinde kisa bir sure
+        calisir (first: gorunenler bekletilmeden cizilsin diye biraz daha uzun), sonra arayuze
+        yol verip kendini yeniden cagirir. Belge / sekme degistiyse durur."""
+        if not self.engine.doc or self.thumbs.count() != self.engine.page_count():
+            return
+        todo = self._thumb_pending()
+        if not todo:
+            return
+        th = self.thumbs
+        vis = self._thumb_vis()
+        t_end = time.perf_counter() + (0.03 if first else 0.012)
+        for k, i in enumerate(todo):
+            seen = first and th.item_rect(i).intersects(vis) and k < 40
+            if k and not seen and time.perf_counter() > t_end:
+                break
+            old = th.item(i).cacheKey()
+            try:
+                th.update_item(i, self._thumb_pix(i))
+            except Exception:
+                pass                           # (cizilemeyen sayfa: bos kagit olarak kalir)
+            self._thumb_blank.discard(old)     # kart artik bos sayilmaz; kayit birikmesin
+        if self._thumb_pending():
+            self._thumb_timer.start()
 
     def _update_thumb(self, i):
         if 0 <= i < self.thumbs.count():
+            self._thumb_blank.discard(self.thumbs.item(i).cacheKey())
             self.thumbs.update_item(i, self._thumb_pix(i))
 
     def _on_thumb_changed(self, row):
@@ -3105,9 +4370,23 @@ class MainWindow(QMainWindow, MarkupMixin, FindMixin):
     def on_wheel_zoom(self, delta_y, canvas_pos):
         if not self.engine.doc:
             return
+        self._zoom_to(self.canvas.zoom * (1.15 if delta_y > 0 else (1 / 1.15)), canvas_pos)
+
+    def zoom_by(self, factor):
+        """+ / - dugmeleri: gorunen alanin ortasi sabit kalarak."""
+        if not self.engine.doc:
+            return
+        vp = self.scroll.viewport()
+        c = self.canvas.mapFrom(vp, QPoint(vp.width() // 2, vp.height() // 2))
+        self._zoom_to(self.canvas.zoom * factor, QPointF(c))
+
+    def _zoom_to(self, zoom, canvas_pos):
+        """Akici yakinlastirma. Eskiden her adimda sayfanin TAMAMI yeni yakinlikta bastan
+        ciziliyordu (%250'de 116 ms, %400'de 237 ms, %600'de 517 ms: tekerlek takiliyordu).
+        Simdi eldeki goruntu aninda gerilir (canvas.preview_zoom), kullanici durunca keskini
+        BIR KEZ cizilir (_zoom_settle). canvas_pos: sabit kalacak nokta (tuval koordinati)."""
         old_zoom = self.canvas.zoom
-        factor = 1.15 if delta_y > 0 else (1 / 1.15)
-        new_zoom = max(MIN_ZOOM, min(old_zoom * factor, MAX_ZOOM))
+        new_zoom = max(MIN_ZOOM, min(zoom, MAX_ZOOM))
         if new_zoom == old_zoom:
             return
         hbar = self.scroll.horizontalScrollBar()
@@ -3117,10 +4396,31 @@ class MainWindow(QMainWindow, MarkupMixin, FindMixin):
         pad = self.canvas.pad_top
         rel_x = canvas_pos.x() / old_zoom
         rel_y = (canvas_pos.y() - pad) / old_zoom
-        self.canvas.zoom = new_zoom
-        self.render_current_page()
+        self.canvas.preview_zoom(new_zoom)
         hbar.setValue(int(rel_x * new_zoom - viewport_rel_x))
         vbar.setValue(int(rel_y * new_zoom + pad - viewport_rel_y))
+        self.lbl_zoom.setText(_t("%{z}", z=int(new_zoom * 100)))
+        if self.mk_text.isVisible():           # sayfa ustundeki yazi kutulari yakinlikla birlikte
+            self._mk_position_editor()
+        if self.txt_new.isVisible():
+            self._tx_editor_color()
+            self._position_text_editor()
+        self._zoom_timer.start()
+
+    def _zoom_settle(self):
+        """Yakinlastirma durdu: sayfanin keskin halini ciz."""
+        self._zoom_timer.stop()
+        if self.engine.doc and abs(self.canvas.stretch() - 1.0) > 1e-6:
+            self.render_current_page()
+
+    def _zoom_flush(self):
+        """Sayfa goruntusune piksel piksel bagli bir is baslamadan once (tiklama, surukleme,
+        duzenleme): bekleyen keskin cizimi HEMEN yap."""
+        if self._zoom_timer.isActive():
+            self._zoom_settle()
+        if self._region_timer.isActive():      # (kaydirma yeni bitti: gorunen alanin keskini hemen)
+            self._region_timer.stop()
+            self._region_settle()
 
     def on_pan_start(self, global_pos):
         self._pan_start_global = global_pos
@@ -3166,20 +4466,108 @@ class MainWindow(QMainWindow, MarkupMixin, FindMixin):
         settle()
         QTimer.singleShot(0, settle)
 
+    # ------------------------------------------- yuksek yakinlik: yalniz gorunen bolge cizilir
+    def _visible_px(self):
+        """Tuvalin ekranda gorunen kismi, sayfa goruntusu pikseli olarak (QRect; ust pay dusulmus,
+        sayfanin disina tasabilir)."""
+        cv, vp = self.canvas, self.scroll.viewport()
+        tl = cv.mapFrom(vp, QPoint(0, 0))
+        d = cv.devicePixelRatioF()
+        return QRect(int(tl.x() * d), int((tl.y() - cv.pad_top) * d),
+                     int(vp.width() * d) + 1, int(vp.height() * d) + 1)
+
+    def _region_for(self, vis, W, H):
+        """Keskin cizilecek bolge (QRect, sayfa goruntusu pikseli): gorunen alan + her yanda
+        REGION_MARGIN kadar pay (kisa kaydirmalarda yeniden cizim gerekmesin), en cok
+        REGION_PIXELS. Sol-ust kose mantiksal 4 pikselin katina oturur: %125 / %150 / %175
+        ekran olceginde de goruntu tam piksele denk gelsin (yoksa bulanik cizilir)."""
+        page = QRect(0, 0, W, H)
+        vis = vis.intersected(page)
+        if vis.isEmpty():                      # (tuval henuz ekranda degil: sol ustten bir ekranlik)
+            vp, d = self.scroll.viewport(), self.canvas.devicePixelRatioF()
+            vis = QRect(0, 0, max(1, int(vp.width() * d)), max(1, int(vp.height() * d))).intersected(page)
+        w = vis.width() * (1 + 2 * REGION_MARGIN)
+        h = vis.height() * (1 + 2 * REGION_MARGIN)
+        over = w * h / REGION_PIXELS
+        if over > 1:                           # butce asiliyor: pay kuculur (gorunen alan hep icinde)
+            w, h = max(vis.width(), w / over ** 0.5), max(vis.height(), h / over ** 0.5)
+        c = vis.center()
+        r = QRect(int(c.x() - w / 2), int(c.y() - h / 2), int(w), int(h)).intersected(page)
+        d = self.canvas.devicePixelRatioF()
+        step = 4 * d
+        x0 = int(round(int(r.left() / step) * step))
+        y0 = int(round(int(r.top() / step) * step))
+        return QRect(x0, y0, r.right() + 1 - x0, r.bottom() + 1 - y0)
+
+    def _region_need(self):
+        """Gorunen alan eldeki keskin bolgenin disina tasti mi / kenarina fazla yaklasti mi."""
+        cv = self.canvas
+        if not cv.has_page() or not cv.region or abs(cv.stretch() - 1.0) > 1e-6:
+            return False
+        W, H = cv.pix_full.width(), cv.pix_full.height()
+        vis = self._visible_px().intersected(QRect(0, 0, W, H))
+        if vis.isEmpty():
+            return False
+        have = cv.pix_rect()
+        if not have.contains(vis):
+            return True
+        want = self._region_for(vis, W, H)
+        sides = ((vis.left() - have.left(), vis.left() - want.left()),
+                 (have.right() - vis.right(), want.right() - vis.right()),
+                 (vis.top() - have.top(), vis.top() - want.top()),
+                 (have.bottom() - vis.bottom(), want.bottom() - vis.bottom()))
+        return any(cur < new * 0.4 - 8 for cur, new in sides)
+
+    def _engine_rolled_back(self, error=None):
+        """Motor yarida kalan bir islemi geri aldi (belge islemden onceki haline dondu): gorunum
+        tazelenir, kullaniciya soylenir. Olay akisi bitince calisir (islem hala yigindayken degil)."""
+        if not getattr(self, "_rollback_pending", False):
+            self._rollback_pending = True
+            QTimer.singleShot(0, self._after_rollback)
+
+    def _after_rollback(self):
+        self._rollback_pending = False
+        if not self.engine.doc:
+            return
+        self.drag = None
+        self._ghost_end()
+        self._mk_loaded = None
+        self.render_current_page()
+        self._refresh_panel()
+        self.status(_t("İşlem tamamlanamadı; belge değiştirilmedi."))
+
+    def _region_scrolled(self, *_):
+        if self._region_need():
+            self._region_timer.start()         # (kaydirma surdukce ertelenir: durunca cizilir)
+
+    def _region_settle(self):
+        if not self.engine.doc or not self._region_need():
+            return
+        if self.drag:                          # surukleme surerken goruntu degismez (nesnesiz arka plan ona bagli)
+            self._region_timer.start()
+            return
+        self.render_current_page()
+
     def render_current_page(self):
+        tm = getattr(self, "_zoom_timer", None)
+        if tm is not None:
+            tm.stop()                          # (keskin cizim simdi yapiliyor)
+        self._patched = False
         if not self.engine.doc:
             self.canvas.clear_page()
             return
         page = self.engine.doc[self.current_page]
         dpr = self.canvas.devicePixelRatioF()
         z = self.canvas.zoom
-        # cok buyuk yakinlastirmada bellek patlamasin
-        px = abs(page.rect.width * page.rect.height) * (z * dpr) ** 2
-        if px > MAX_RENDER_PIXELS:
-            # %800'de buyuk sayfalarda (A3 vb.) goruntu yuzlerce MB tutabilir:
-            # gerekirse ekran cozunurlugunun biraz altinda cizilir (hafif yumusama,
-            # ama bellek patlamaz). A4 %800'de bu sinira takilmaz.
-            dpr = max(0.25, dpr * (MAX_RENDER_PIXELS / px) ** 0.5)
+        scale = z * dpr
+        mat = fitz.Matrix(scale, scale)
+        # Sayfanin tamami cok buyukse yalniz gorunen bolge keskin cizilir (bkz. FULL_RENDER_PIXELS).
+        full = (page.rect * mat).irect         # tam sayfa goruntusunun boyutu (get_pixmap ile ayni yuvarlama)
+        region = None
+        if full.width * full.height > FULL_RENDER_PIXELS:
+            # (tuval once yeni boyutuna gelir: gorunen alan dogru yakinlikta olculsun)
+            self.canvas.fit_size(QSize(full.width, full.height), dpr)
+            region = self._region_for(self._visible_px(), full.width, full.height)
         doc = self.engine.doc
         hidden = []
         for x in getattr(self, "_render_hide", ()):
@@ -3188,13 +4576,32 @@ class MainWindow(QMainWindow, MarkupMixin, FindMixin):
                 doc.xref_set_key(x, "F", "2")
             except Exception:
                 pass
+        low = None
         try:
-            pix = page.get_pixmap(matrix=fitz.Matrix(z * dpr, z * dpr), alpha=False)
-            self._render_scale = z * dpr
+            if region is None:
+                pix = page.get_pixmap(matrix=mat, alpha=False)
+            else:
+                pix = page.get_pixmap(matrix=mat, clip=drag_ghost.clip_rect(region, scale), alpha=False)
+                # bolgenin disi: dusuk cozunurluklu tam sayfa (icerik degismedikce yeniden cizilmez)
+                # (anahtarda motorun KENDISI: kimlik numarasi kapanan sekmeden sonra baska belgeye
+                #  verilebilir, o zaman baska belgenin goruntusu dolgu olarak cikardi)
+                key = (self.engine, self.current_page, self.engine.version, page.rotation,
+                       tuple(getattr(self, "_render_hide", ())))
+                if self._low_cache[0] != key:
+                    ls = min(scale, (LOW_PIXELS / max(1.0, abs(page.rect.width * page.rect.height))) ** 0.5)
+                    self._low_cache = (key, pix_to_qimage(page.get_pixmap(matrix=fitz.Matrix(ls, ls), alpha=False)))
+                low = self._low_cache[1]
+            self._render_scale = scale
         finally:
             for x, (t, v) in hidden:
                 doc.xref_set_key(x, "F", v if t != "null" else "null")
-        self.canvas.set_page(pix_to_qimage(pix), dpr, page.rotation_matrix, page.derotation_matrix)
+        if region is None:
+            self.canvas.set_page(pix_to_qimage(pix), dpr, page.rotation_matrix, page.derotation_matrix)
+        else:
+            self.canvas.set_page(pix_to_qimage(pix), dpr, page.rotation_matrix, page.derotation_matrix,
+                                 full=QSize(full.width, full.height), org=QPoint(pix.x, pix.y), low=low)
+        if getattr(self, "_mk_live", False):   # not yerinde duzenleniyor: nesnesiz arka plani yeniden kur
+            self._mk_live_refresh()
         if self.editing_live():                # set_page nesnesiz arka plani sildi
             self._tx_live_cache = None
             if self.mode == "text" and self.current_span is not None:
@@ -3222,6 +4629,71 @@ class MainWindow(QMainWindow, MarkupMixin, FindMixin):
             self._mk_position_editor()
         if self.txt_new.isVisible():
             self._position_text_editor()
+
+    def render_patch(self, area):
+        """Sayfanin yalniz area bolgesini (donmemis sayfa uzayi, fitz.Rect) yeniden cizip eldeki
+        goruntuye yerlestirir -> True. Bolge cizimi tam sayfa ciziminin AYNI pikselleridir
+        (drag_ghost.clip_rect) ama sayfanin buyuklugunden bagimsiz, kucuk bir is. Yapilamazsa
+        (goruntu yok, yakinlastirma / surukleme / yerinde duzenleme suruyor) False: cagiran tam
+        sayfayi cizer."""
+        cv = self.canvas
+        if (not self.engine.doc or not cv.has_page() or cv.bg is not None or cv.ghost is not None
+                or getattr(self, "_render_hide", None) or getattr(self, "_mk_live", False)
+                or self.editing_live() or abs(cv.stretch() - 1.0) > 1e-6):
+            return False
+        page = self.engine.doc[self.current_page]
+        scale = cv.zoom * cv.devicePixelRatioF()
+        if getattr(self, "_render_scale", None) is not None and abs(self._render_scale - scale) > 1e-9:
+            return False
+        r = (fitz.Rect(area) * page.rotation_matrix).normalize() * scale
+        box = QRect(int(r.x0) - 2, int(r.y0) - 2, int(r.x1) - int(r.x0) + 5, int(r.y1) - int(r.y0) + 5) & cv.pix_rect()
+        if box.isEmpty():
+            return True                        # (degisen yer eldeki keskin bolgenin disinda)
+        pix = page.get_pixmap(matrix=fitz.Matrix(scale, scale), clip=drag_ghost.clip_rect(box, scale), alpha=False)
+        if (pix.x, pix.y, pix.width, pix.height) != (box.x(), box.y(), box.width(), box.height()):
+            return False
+        cv.patch(pix_to_qimage(pix), QPoint(pix.x, pix.y))
+        self._patched = True
+        return True
+
+    def thumb_later(self, pno):
+        """Kucuk resmi kullanici DURUNCA yenile (surguyle ayar: her adimda 10-16 ms'lik is)."""
+        self._thumb_late.add((self.engine, pno))
+        self._thumb_late_timer.start()
+
+    def thumb_flush(self):
+        """Ayarlama duruldu: kucuk resim(ler) ve sayfanin TAM cizimi. Bolge cizimi hizlidir ama
+        bolgenin siniri dönuk / saydam bir nesnenin icinden gecerse MuPDF o nesnenin kenar
+        piksellerini tam sayfa cizimine gore cok az farkli boyar (en cok ~11/255): surüklerken
+        gorulmez, durunca tam cizimle silinir. Fareyle baska bir surukleme basladiysa tam cizim
+        yapilmaz (o is bitince sayfa zaten cizilir)."""
+        self._thumb_late_timer.stop()
+        pending, self._thumb_late = self._thumb_late, set()
+        if (self._patched and self.engine.doc is not None and not self.drag
+                and not getattr(self, "_mk_live", False) and not self.editing_live()):
+            self.render_current_page()
+        for eng, pno in pending:
+            if eng is self.engine and eng.doc is not None:
+                self._update_thumb(pno)
+
+    # ---- surguyle ayarlama oturumu (markup_bar._SliderFeed) ------------------------------------
+    def adjust_begin(self):
+        """Surgu oynamaya basladi: bu oturumdaki degisiklikler TEK geri-al adimi (fare basiliyken
+        uzun duraklamada da), onceki oturumdan AYRI (ikinci suruklemeyi geri almak ilkini bozmaz)."""
+        self._adjust_seq += 1
+        self._adjust_engine = self.engine
+        self.engine.undo_hold = True
+
+    def adjust_end(self):
+        """Surgu birakildi / kutusu kapandi: ertelenen isler simdi."""
+        eng, self._adjust_engine = getattr(self, "_adjust_engine", None), None
+        if eng is not None:
+            eng.undo_hold = False
+        self._adjust_seq += 1
+        self._shape_style_flush()                  # (Duzenle > sekil stili: 350 ms beklemeden)
+        if self._text_angle_timer.isActive():      # (Duzenle > yazi acisi: 300 ms beklemeden uygula)
+            self._text_angle_commit()
+        self.thumb_flush()
 
     def after_edit(self, all_thumbs=False):
         """Bir duzenlemeden sonra: sayfayi yeniden ciz, kucuk resmi ve
@@ -3358,21 +4830,69 @@ class MainWindow(QMainWindow, MarkupMixin, FindMixin):
         if hasattr(self, "sh_opts_pill"):
             self._settle_bars()
 
-    def _on_shape_style_edit(self, *_):
-        if self._shape_loading:
-            return
+    def _shape_style_store(self):
+        """Seritteki sekil ayarlari = son kullanilan (yeni cizilecek sekil icin de gecerli)."""
         self.shape_style = {"width": self.spin_width.value(),
                             "color": [float(c) for c in self.btn_line_color.rgb],
                             "dashed": self.chk_dashed.isChecked(),
                             "dash": self.cmb_dash.currentData()}
-        self._shape_dash_visibility()
         self.save_style_setting("shape_style", self.shape_style)
+
+    def _on_shape_style_edit(self, *_):
+        if self._shape_loading:
+            return
+        self._shape_style_store()
+        self._shape_dash_visibility()
         # secim varken: stil ANINDA secime uygulanir (ayri "uygula" dugmesi yok). Cizim
         # araci acikken de gecerli: yeni cizilen nesne secili kalir, stili hemen ona.
         if self.mode == "shape" and self.sel_paths:
+            self._shape_pending = True
             self._shape_style_timer.start()
 
+    def _on_shape_width_edit(self, *_):
+        """Kalinlik kutusu degisti (surgu, tekerlek, ok tusu, yazma): secili cizime CANLI uygulanir.
+        Isaretle'deki kutu gibi: her deger PDF'e yazilir ve yalniz degisen bolge cizilir; onizleme
+        ayri bir cizim degil, kalici sonucun kendisidir (birakinca gorunum degismez). Tam sayfa
+        cizimi, kucuk resim ve buyuteclerin esitlenmesi kullanici durunca yapilir
+        (_apply_shape_style_now). Eskiden 350 ms duraklayana / surgu birakilana kadar sayfada
+        hicbir sey degismiyordu."""
+        if self._shape_loading:
+            return
+        self._shape_style_store()
+        if not (self.mode == "shape" and self.sel_paths and self.engine.doc is not None):
+            return
+        new_w = self.spin_width.value()
+        wide = max(new_w, self._shape_w_last or new_w)
+        self._shape_w_last = new_w
+        old = self._paths_area(self._sel_items(), wide)
+        self.engine.restyle_paths(self.current_page, self.sel_paths, width=new_w,
+                                  color=self.btn_line_color.rgb, dashed=self._shape_dash(),
+                                  group=("shapewidth", tuple(self.sel_paths), self._adjust_seq))
+        new = self._paths_area(self._sel_items(), wide)
+        self._shape_live = True
+        self._shape_pending = False            # (bu cagri renk ve kesikliyi de seritteki haliyle uyguladi)
+        if old is None or new is None or not self.render_patch(old | new):
+            self.render_current_page()
+        self._update_title()
+        self.canvas.update()
+        self._shape_style_timer.start()        # durunca: tam cizim + kucuk resim + alanlar
+
+    @staticmethod
+    def _paths_area(items, width):
+        """Cizimlerin sayfada boyanan alani (donmemis sayfa uzayi): kutulari + kalinlik payi.
+        Duz cizgi ve dikdortgende kontur kutudan kalinligin 0,71 kati kadar tasar (kose / uc);
+        sivri koseli sekilde gonye birlesimi 5 katina kadar uzayabilir."""
+        box = None
+        for it in items:
+            pad = width * (0.75 if it.kind in ("line", "rect") else 5.1) + 2.0
+            r = fitz.Rect(it.bbox.x0 - pad, it.bbox.y0 - pad, it.bbox.x1 + pad, it.bbox.y1 + pad)
+            box = r if box is None else fitz.Rect(min(box.x0, r.x0), min(box.y0, r.y0),
+                                                   max(box.x1, r.x1), max(box.y1, r.y1))
+        return box
+
     def _clear_selection(self):
+        if getattr(self, "_shape_style_timer", None) is not None:
+            self._shape_style_flush()          # (bekleyen stil, secim kalkmadan uygulanir)
         self.current_span = None
         self.hover_span = None
         self.sel_spans = []
@@ -3567,6 +5087,12 @@ class MainWindow(QMainWindow, MarkupMixin, FindMixin):
     def canvas_press(self, pt, pos, mods):
         if not self.engine.doc:
             return
+        self._zoom_flush()
+        self._shape_style_flush()              # (secim degismeden once: bekleyen stil eski secime)
+        # donuk yazi / not yerinde duzenleniyor ve ustune tiklandi: imleci koy
+        if self._tx_rot_click(pt, mods) or self._mk_live_click(pt, mods):
+            self._tx_sel_drag = True
+            return
         self._text_angle_commit()     # aci surgusunun bekleyen onizlemesi varsa once uygula
         self._press_pos = pos
         self._nudge_token += 1        # yeni tiklama: sonraki ok kaydirmalari yeni geri-al adimi
@@ -3585,7 +5111,13 @@ class MainWindow(QMainWindow, MarkupMixin, FindMixin):
     def canvas_move(self, pt, pos, mods, pressed):
         if not self.engine.doc:
             return
-        self.lbl_coords.setText(f"x {pt.x:.1f}  y {pt.y:.1f} pt")
+        if getattr(self, "_tx_sel_drag", False):
+            if pressed:                       # surukleyerek secim (donuk yazi / not, yerinde)
+                self._tx_rot_click(pt, mods, keep=True) or self._mk_live_click(pt, mods, keep=True)
+                return
+            self._tx_sel_drag = False
+        if not pressed:
+            self.lbl_coords.setText("")
         if self._select_tool_active() and not (self.drag and pressed):
             self._edit_hover(pt, pos)
         elif self.mode == "text":
@@ -3599,6 +5131,9 @@ class MainWindow(QMainWindow, MarkupMixin, FindMixin):
 
     def canvas_release(self, pt, pos, mods):
         if not self.engine.doc:
+            return
+        if getattr(self, "_tx_sel_drag", False):
+            self._tx_sel_drag = False
             return
         try:
             if self.mode == "text":
@@ -3618,6 +5153,18 @@ class MainWindow(QMainWindow, MarkupMixin, FindMixin):
             self.canvas.update()
 
     def canvas_double(self, pt):
+        self._zoom_flush()
+        if getattr(self, "_mk_live", False) and self._mk_live_click(pt, Qt.NoModifier):
+            cur = self.mk_text.textCursor()   # notu yerinde duzenlerken cift tik: kelimeyi sec
+            cur.select(QTextCursor.WordUnderCursor)
+            self.mk_text.setTextCursor(cur)
+            return
+        if getattr(self, "_tx_rot", False) and self.editing_live():
+            if self._tx_rot_click(pt, Qt.NoModifier):      # yerinde duzenlerken cift tik: kelimeyi sec
+                cur = self.txt_new.textCursor()
+                cur.select(QTextCursor.WordUnderCursor)
+                self.txt_new.setTextCursor(cur)
+            return
         if self.mode == "shape" and self.shape_tool == "select":
             # bukme tutamacina cift tik = cizgiyi duzlestir
             if self._handle_at(self.canvas.to_px(pt)) == "bend":
@@ -3636,6 +5183,7 @@ class MainWindow(QMainWindow, MarkupMixin, FindMixin):
     def canvas_context(self, pt, global_pos):
         if not self.engine.doc:
             return
+        self._zoom_flush()
         menu = QMenu(self)
         if self._select_tool_active() and not self.txt_new.isVisible():
             # Duzenle: tiklanan nesne neyse onun menusu (toplu secimin uyesi degilse o secilir)
@@ -3659,11 +5207,13 @@ class MainWindow(QMainWindow, MarkupMixin, FindMixin):
             menu.addAction(_t("Sil"), self.delete_selected)
         elif self.mode == "text" and self._group_active() and (self.sel_paths or self.sel_images) \
                 and self._in_selection_box(pt):
+            menu.addAction(_t("Kopyala\tCtrl+C"), self.copy_text)
             menu.addAction(_t("Seçili {n} öğeyi sil", n=n_sel), self.delete_selected)
             menu.addAction(_t("Seçimi kaldır"), lambda: self._set_selection([], []))
         elif self.mode == "text" and self.sel_spans and (
                 (lambda s: s is not None and any(self._span_key(s) == self._span_key(x) for x in self.sel_spans))(
                     self.engine.find_span_at(self.current_page, pt.x, pt.y))):
+            menu.addAction(_t("Kopyala\tCtrl+C"), self.copy_text)
             menu.addAction(_t("Seçili {n} yazıyı sil", n=len(self.sel_spans)), self.delete_selected)
             menu.addAction(_t("Seçimi kaldır"), lambda: self._set_text_selection([]))
         elif self.mode == "text":
@@ -3677,7 +5227,7 @@ class MainWindow(QMainWindow, MarkupMixin, FindMixin):
                 menu.addAction(_t("Çoğalt\tCtrl+D"), self.duplicate_text)
                 menu.addSeparator()
                 menu.addAction(_t("Sil"), self.delete_selected)
-            elif getattr(self, "_text_clip", None) is not None or QApplication.clipboard().text().strip():
+            elif getattr(self, "_clip", None) is not None or QApplication.clipboard().text().strip():
                 menu.addAction(_t("Buraya yapıştır\tCtrl+V"), lambda: self.paste_text(at=pt))
         elif self.mode == "shape":
             item = self.engine.path_at(self.current_page, pt.x, pt.y, self._tol(5))
@@ -3688,7 +5238,10 @@ class MainWindow(QMainWindow, MarkupMixin, FindMixin):
             if len(sel) == 1 and sel[0].kind == "curve":
                 menu.addAction(_t("Düzleştir"), self.straighten_selected_line)
             if self.sel_paths:
+                menu.addAction(_t("Kopyala\tCtrl+C"), self.copy_text)
                 menu.addAction(_t("Seçimi sil"), self.delete_selected)
+            elif getattr(self, "_clip", None) is not None:
+                menu.addAction(_t("Buraya yapıştır\tCtrl+V"), lambda: self.paste_text(at=pt))
                 menu.addAction(_t("Seçimi kaldır"), self._deselect_paths)
             menu.addAction(_t("Sayfadaki tüm çizgileri seç"), self._select_all_paths)
         elif self.mode == "markup":
@@ -3696,7 +5249,7 @@ class MainWindow(QMainWindow, MarkupMixin, FindMixin):
         menu.addSeparator()
         menu.addMenu(self._page_menu(self.current_page))
         self.canvas.update()
-        menu.exec(global_pos)
+        title_bar.run_modal(menu, global_pos)
 
     # ---------------- metin modu ----------------
     def _text_press(self, pt, mods):
@@ -3711,6 +5264,9 @@ class MainWindow(QMainWindow, MarkupMixin, FindMixin):
                 self.drag = {"kind": "textrot", "start": pt, "cur": pt, "moved": False,
                              "a0": self.engine.span_angle(sp)}
                 return
+        if self._group_rot_hit(self.canvas.to_px(pt)):
+            self._group_rot_press(pt)
+            return
         span = None
         # secili metin (ör. dev filigran) uzerindeyse onu tut; baskasina gecme
         if self.current_span is not None and self.current_span.hit(pt):
@@ -3805,9 +5361,13 @@ class MainWindow(QMainWindow, MarkupMixin, FindMixin):
             self._inline_text_done()
             return
         shift = bool(mods & Qt.ShiftModifier)
-        # 1) tutamaclar: yazinin dondurme tutamaci / cizimin ya da resmin boyut tutamaclari
+        # 1) tutamaclar: yazinin / toplu secimin dondurme tutamaci, cizimin ya da resmin boyut tutamaclari
         if self._rot_handle_hit(self.canvas.to_px(pt)):
             self._text_press(pt, mods)
+            return
+        if self._group_rot_hit(pos):
+            self._enter_sub("text")
+            self._group_rot_press(pt)
             return
         if self.mode == "shape" and self._handle_at(pos):
             self._shape_press(pt, pos, mods)
@@ -3870,7 +5430,7 @@ class MainWindow(QMainWindow, MarkupMixin, FindMixin):
 
     def _edit_hover(self, pt, pos):
         """Sec araci, fare basili degil: altindaki yazi / cizim / resim vurgulanir, imlec degisir."""
-        if self._rot_handle_hit(pos):
+        if self._rot_handle_hit(pos) or self._group_rot_hit(pos):
             self.update_cursor(self._mk_handle_cursor("rot"))
             return
         if self.mode == "shape":
@@ -3899,12 +5459,7 @@ class MainWindow(QMainWindow, MarkupMixin, FindMixin):
           tek yazi                          -> "text"  (yazi ayarlari, dondurme, cift tikla duzenleme)
           2+ yazi / yazi + cizim / resim(ler) -> toplu secim (birlikte tasinir / silinir;
                                                 tek basina bir resim ayrica boyutlandirilir)"""
-        uniq, seen = [], set()
-        for s in self.engine.unique_spans(list(spans)):    # (her satir en cok bir kez)
-            k = self._span_key(s)
-            if k not in seen:
-                seen.add(k)
-                uniq.append(s)
+        uniq = self._unique_selection(spans)                 # (her satir en cok bir kez)
         n_paths = len(self.engine.get_paths(self.current_page)) if paths else 0
         paths = sorted({i for i in paths if 0 <= i < n_paths})
         n_img = len(self.engine.get_images(self.current_page)) if images else 0
@@ -3919,7 +5474,7 @@ class MainWindow(QMainWindow, MarkupMixin, FindMixin):
             if n == 1:
                 self.status(_t("Resim seçili — sürükleyerek taşıyın, köşelerinden boyutlandırın, Delete ile silin."))
             else:
-                self.status(_t("{n} öğe seçili — sürükleyerek birlikte taşıyın, Delete ile silin.", n=n))
+                self.status(_t("{n} öğe seçili — sürükleyerek birlikte taşıyın, üstteki tutamaçla döndürün, Delete ile silin.", n=n))
         elif not uniq:
             self.sel_spans, self.sel_images, self.current_span = [], [], None
             self._enter_sub("shape" if paths else "text")
@@ -3948,6 +5503,16 @@ class MainWindow(QMainWindow, MarkupMixin, FindMixin):
     @staticmethod
     def _span_key(sp):
         return (sp.page_num, round(sp.origin[0], 2), round(sp.origin[1], 2))
+
+    def _unique_selection(self, spans):
+        """Secilen yazilar, her satir en cok bir kez (bkz. _set_selection)."""
+        out, seen = [], set()
+        for s in self.engine.unique_spans(list(spans)):
+            k = self._span_key(s)
+            if k not in seen:
+                seen.add(k)
+                out.append(s)
+        return out
 
     def _selected_spans(self):
         """Secili yazilar: toplu secim varsa o, yoksa tek secili yazi."""
@@ -3991,7 +5556,7 @@ class MainWindow(QMainWindow, MarkupMixin, FindMixin):
             if images:
                 pdf_images.delete(doc, page, images)
             if lines:
-                return pdf_content.remove_texts_at(doc, page, [ln.origin for ln in lines])
+                return self._preview_remove_texts(doc, page, lines)
         rect = None
         for sp in spans:
             r = self.canvas.poly_px(sp.quad()).boundingRect()
@@ -4016,7 +5581,69 @@ class MainWindow(QMainWindow, MarkupMixin, FindMixin):
                 self.engine.move_images(self.current_page, images, dx, dy)
             moved = self.engine.move_spans(spans, dx, dy)      # tek geciste (yazi basina degil)
         self.after_edit()
-        self.sel_spans = [self._find_span_near(n) or n for n in moved]
+        # (tekillestir: paragrafin her satiri ayni paragrafi bulur; tekrar eden secim bir SONRAKI
+        # tasimada ayni yaziyi birkac kez yazdiriyordu - yapistirilmis grubu iki kez tasiyinca)
+        self.sel_spans = self._unique_selection([self._find_span_near(n) or n for n in moved])
+        self._refresh_panel()
+        self.canvas.update()
+
+    # -- toplu dondurme: dis cercevenin ustundeki tutamac (tek yazidaki gibi), ortak merkez
+    def _group_rot_px(self):
+        """Toplu secimin dondurme tutamacinin ekrandaki yeri (mantiksal px) | None."""
+        if self.mode != "text" or not self._group_active() or self.txt_new.isVisible():
+            return None
+        bb = self._group_bbox()
+        if bb is None:
+            return None
+        r = self.canvas.rect_px(bb)
+        return QPointF(r.center().x(), r.top() - 4 - GROUP_ROT_PX)
+
+    def _group_rot_hit(self, pos):
+        if self.drag is not None:
+            return False
+        q = self._group_rot_px()
+        return q is not None and abs(q.x() - pos.x()) <= HANDLE_PX + 4 and abs(q.y() - pos.y()) <= HANDLE_PX + 4
+
+    def _group_pivot(self):
+        """Dondurme merkezi: secimin sinir kutusunun ortasi. Ayni secim art arda dondurulurken
+        ILK merkez korunur (donmus grubun kutusu buyur, ortasi kayar: grup yavas yavas yer
+        degistirirdi)."""
+        bb = self._group_bbox()
+        piv = getattr(self, "_grot_pivot", None)
+        if piv is not None and bb is not None and all(abs(a - b) < 0.05 for a, b in zip(piv[1], bb)):
+            return piv[0]
+        return fitz.Point((bb.x0 + bb.x1) / 2, (bb.y0 + bb.y1) / 2)
+
+    def _group_rot_press(self, pt):
+        self.drag = {"kind": "grot", "start": pt, "cur": pt, "moved": False, "c": self._group_pivot()}
+
+    def _group_drag_angle(self, d):
+        """Surukleme acisi (ekranda saat yonu, derece): merkezden basilan noktaya ve imlece giden
+        yonlerin farki. Shift: 15 derece adim; yoksa 0 / 90 / 180 / 270'e 3 derece kala oturur."""
+        cv = self.canvas
+        c, a, b = cv.to_px(d["c"]), cv.to_px(d["start"]), cv.to_px(d["cur"])
+        deg = math.degrees(math.atan2(b.y() - c.y(), b.x() - c.x()) - math.atan2(a.y() - c.y(), a.x() - c.x()))
+        return self._snap_angle(deg, d.get("keep"))
+
+    def _group_rotate(self, delta, center, group=None):
+        """Toplu secimi (yazilar + cizimler + resimler) center etrafinda delta derece dondur: TEK
+        geri-al adimi. Yazilar hem yerini hem acisini degistirir (pdf_engine.rotate_spans); cizim
+        ve resimler ayni donusumle. Secim, donmus haliyle korunur."""
+        spans, paths, images = list(self.sel_spans), list(self.sel_paths), list(self.sel_images)
+        c = fitz.Point(center)
+        m = fitz.Matrix(1, 0, 0, 1, -c.x, -c.y) * fitz.Matrix(delta) * fitz.Matrix(1, 0, 0, 1, c.x, c.y)
+        new = []
+        with self.engine.undo_batch(group):
+            if paths:                                  # (sira numaralari degismez)
+                self.engine.transform_paths(self.current_page, paths, m)
+            if images:
+                self.engine.transform_images(self.current_page, images, m)
+            if spans:
+                new = self.engine.rotate_spans(spans, delta, c)
+        self.after_edit()
+        self.sel_spans = self._unique_selection([self._find_span_near(n) or n for n in new])
+        bb = self._group_bbox()
+        self._grot_pivot = (c, tuple(bb)) if bb is not None else None
         self._refresh_panel()
         self.canvas.update()
 
@@ -4046,8 +5673,8 @@ class MainWindow(QMainWindow, MarkupMixin, FindMixin):
         if not path:
             return
         try:
-            with open(path, "wb") as f:
-                f.write(data)
+            with safe_write.Writer() as w:
+                w.write(path, data)
         except OSError as e:
             QMessageBox.critical(self, _t("Kaydedilemedi"), str(e))
             return
@@ -4102,6 +5729,14 @@ class MainWindow(QMainWindow, MarkupMixin, FindMixin):
                 d["cur"] = self._axis_lock(d["start"], pt) if mods & Qt.ShiftModifier else pt
                 self.canvas.update()
                 return
+            if d["kind"] == "grot":                         # toplu secim donduruluyor
+                if not d["moved"]:
+                    self._ghost_group()                     # hepsi yerinden kalkar, kendi goruntusu doner
+                d["moved"] = True
+                d["cur"] = pt
+                d["keep"] = bool(mods & Qt.ShiftModifier)
+                self.canvas.update()
+                return
             if not d["moved"] and d["kind"] in ("text", "textrot") and self.current_span is not None:
                 self._ghost_text(self.current_span)        # yazi yerinden kalkar, kendisi gider
             d["moved"] = True
@@ -4126,6 +5761,9 @@ class MainWindow(QMainWindow, MarkupMixin, FindMixin):
             if abs(q.x() - pos.x()) <= HANDLE_PX + 4 and abs(q.y() - pos.y()) <= HANDLE_PX + 4:
                 self.update_cursor(self._mk_handle_cursor("rot"))
                 return
+        if self._group_rot_hit(pos):
+            self.update_cursor(self._mk_handle_cursor("rot"))
+            return
         span = self.engine.find_span_at(self.current_page, pt.x, pt.y)
         if self.current_span is not None and self.current_span.hit(pt):
             span = self.current_span
@@ -4171,6 +5809,15 @@ class MainWindow(QMainWindow, MarkupMixin, FindMixin):
                 self.after_edit()
                 self.status(_t("Resim boyutlandırıldı."))
             return
+        if d["kind"] == "grot":
+            delta = self._group_drag_angle(d)
+            if abs(delta) > 0.05:
+                solo = self._solo_image() is not None
+                n = len(self.sel_spans) + len(self.sel_paths) + len(self.sel_images)
+                self._group_rotate(delta, d["c"])
+                a = f"{delta:+.0f}"
+                self.status(_t("Resim döndürüldü: {a}°", a=a) if solo else _t("{n} öğe döndürüldü: {a}°", n=n, a=a))
+            return
         if d["kind"] == "tgroup":
             dx, dy = d["cur"].x - d["start"].x, d["cur"].y - d["start"].y
             if abs(dx) > 0.05 or abs(dy) > 0.05:
@@ -4211,7 +5858,16 @@ class MainWindow(QMainWindow, MarkupMixin, FindMixin):
         return self.engine.expand(best)          # paragrafin satiriysa paragrafin tamami
 
     def _select_text_span(self, span):
-        QTimer.singleShot(0, self._warm_text_scan)
+        # On tarama EKRAN CIZILDIKTEN SONRA: sifir sureli zamanlayici boyama olayindan once
+        # calisiyordu -> birakilan yazi, sonraki islem icin yapilan bu hazirlik (70-230 ms) bitene
+        # kadar ekrana gelmiyordu. Kisa gecikmeli tek zamanlayici: once boyanir; art arda secimler
+        # tek taramaya iner.
+        t = getattr(self, "_warm_timer", None)
+        if t is None:
+            t = self._warm_timer = QTimer(self)
+            t.setSingleShot(True)
+            t.timeout.connect(self._warm_text_scan)
+        t.start(40)
         self.pending_insert = None
         self.current_span = span
         self._text_loading = True           # secili metnin ayarlarini gostermek = degisiklik degil
@@ -4261,6 +5917,26 @@ class MainWindow(QMainWindow, MarkupMixin, FindMixin):
             if key in n:
                 return fam
         return "Arial"
+
+    def _rot_preview(self, d, sp):
+        """Dondurme onizlemesinin goruntusu (bkz. pdf_engine.rotation_preview), surukleme basina
+        bir kez: (pixmap, origin x, origin y, kutu) - mantiksal px, origin'e gore. Zoom degisirse
+        yeniden hazirlanir."""
+        cv = self.canvas
+        key = (self._span_key(sp), sp.text, round(cv.zoom, 4), round(cv.dpr, 3))
+        got = d.get("rotpix")
+        if got is None or got[0] != key:
+            res = self.engine.rotation_preview(sp, cv.zoom * cv.dpr)
+            out = None
+            if res is not None:
+                pix, ox, oy, box = res
+                img = QImage(pix.samples, pix.width, pix.height, pix.stride,
+                             QImage.Format_RGBA8888_Premultiplied).copy()
+                pm = QPixmap.fromImage(img)
+                pm.setDevicePixelRatio(cv.dpr)
+                out = (pm, ox / cv.dpr, oy / cv.dpr, tuple(v / cv.dpr for v in box))
+            got = d["rotpix"] = (key, out)
+        return got[1]
 
     def _text_drag_angle(self, d):
         if "target" in d:                       # aci kutusu / surgu: hedef aci dogrudan
@@ -4352,14 +6028,35 @@ class MainWindow(QMainWindow, MarkupMixin, FindMixin):
         self._rotate_text_by(delta, group=group)
 
     # ---------------- yazi: kopyala / yapistir / cogalt ----------------
+    def _has_selection(self):
+        return bool(self.current_span is not None or self.sel_spans or self.sel_paths or self.sel_images)
+
     def copy_text(self):
-        sp = self.current_span
-        if sp is None:
+        """Secimi kopyala (Ctrl+C): tek yazi, toplu secim (yazilar + cizgiler + resimler) ya da
+        yalniz cizgiler. Kopya BAGIMSIZDIR (pdf_engine.Clip): kaynak sonradan degisse ya da sekmesi
+        kapansa da yapistirilir. Kopyalanamayan oge varsa sayisi soylenir (sessizce atilmaz)."""
+        if not self.engine.doc or not self._has_selection():
             return
-        self._text_clip = (sp, sp.text.replace("\xa0", " "))
+        spans = self._selected_spans()
+        clip = self.engine.snapshot_selection(self.current_page, spans, self.sel_paths, self.sel_images)
+        bad = clip.skipped["path"] + clip.skipped["image"]
+        if not len(clip):
+            self.status(_t("Seçim kopyalanamadı: bu çizim / resim türü kopyalanamıyor."))
+            return
+        self._clip = clip
         self._paste_n = 0
-        QApplication.clipboard().setText(self._text_clip[1])
-        self.status(_t("Yazı kopyalandı. Yapıştırmak için Ctrl+V."))
+        cb = QApplication.clipboard()
+        if clip.texts:
+            cb.setText(clip.text)
+        else:
+            cb.clear()
+        if bad:
+            self.status(_t("{n} öğe kopyalandı; {k} öğe kopyalanamadı (desteklenmeyen çizim / resim türü).",
+                           n=len(clip), k=bad))
+        elif len(clip) == 1 and clip.texts:
+            self.status(_t("Yazı kopyalandı. Yapıştırmak için Ctrl+V."))
+        else:
+            self.status(_t("{n} öğe kopyalandı. Yapıştırmak için Ctrl+V.", n=len(clip)))
 
     def duplicate_text(self):
         """Secili yazinin kopyasi, biraz sag-alta (Ctrl+D)."""
@@ -4372,25 +6069,19 @@ class MainWindow(QMainWindow, MarkupMixin, FindMixin):
         self._select_text_span(self._find_span_near(new) or new)
         self.status(_t("Yazı çoğaltıldı."))
 
-    def paste_text(self, at=None):
-        """Kopyalanan yaziyi ayni gorunumle yapistir (at: sayfa noktasi = yazinin basi).
-        Panoda baska programdan gelen duz metin varsa yeni yazi olarak eklenir."""
+    def paste_text(self, at=None, mouse_at=None):
+        """Kopyalanani yapistir. at (sag tik "Buraya yapistir") / mouse_at (Ctrl+V'de fare sayfanin
+        uzerindeyse): kopyanin GORUNEN sinir kutusunun sol-ust kosesi oraya.
+        Panoda baska programdan gelen duz metin varsa yeni yazi olarak eklenir (mouse_at onu
+        etkilemez: eskisi gibi gorunen alanin ortasina)."""
         if not self.engine.doc:
             return
-        clip = getattr(self, "_text_clip", None)
+        clip = getattr(self, "_clip", None)
         text = QApplication.clipboard().text()
-        if clip is not None and (not text or text == clip[1]):
-            sp = clip[0]
-            if at is not None:
-                dx, dy = at.x - sp.origin[0], at.y - sp.origin[1]
-            elif sp.page_num == self.current_page:
-                self._paste_n = getattr(self, "_paste_n", 0) + 1
-                step = max(8.0, sp.size * 0.9) * self._paste_n       # ust uste binmesin
-                dx = dy = step
-            else:
-                dx = dy = 0.0                                       # baska sayfa: ayni yere
-            new = self.engine.duplicate_span(sp, dx, dy, self.current_page)
-        elif text.strip():
+        if clip is not None and (not text or text == clip.text):
+            self._paste_clip(clip, at if at is not None else mouse_at)
+            return
+        if text.strip():
             if at is None:                      # gorunen alanin ortasi
                 vp = self.scroll.viewport()
                 c = self.canvas.mapFrom(vp, QPoint(vp.width() // 2, vp.height() // 2))
@@ -4412,6 +6103,66 @@ class MainWindow(QMainWindow, MarkupMixin, FindMixin):
         if new is not None:
             self._select_text_span(self._find_span_near(new) or new)
         self.status(_t("Yapıştırıldı."))
+
+    def _mouse_on_page(self):
+        """Fare ekranda GORUNEN PDF sayfasinin uzerindeyse sayfa noktasi, degilse None (arac
+        cubugu / panel / baska pencere / sayfanin disindaki bos tuval). Yakinlik, kaydirma ve sayfa
+        donusu canvas.to_pdf'te."""
+        cv = self.canvas
+        if not cv.has_page():
+            return None
+        g = QCursor.pos()
+        under = QApplication.widgetAt(g)
+        if under is not cv:
+            return None
+        pos = cv.mapFromGlobal(g)
+        vp = self.scroll.viewport()
+        if not vp.rect().contains(vp.mapFromGlobal(g)):
+            return None
+        pt = cv.to_pdf(QPointF(pos))
+        pg = self.engine.doc[self.current_page]
+        r = fitz.Rect(pg.rect * pg.derotation_matrix)
+        r.normalize()
+        return pt if r.contains(pt) else None
+
+    def _paste_clip(self, clip, at=None):
+        """Kopyalanan secimi yapistir: TEK geri-al adimi; yarida hata olursa hedefte bir sey
+        kalmaz (motorun islem guvenligi). at verilirse (fare konumu / sag tik): kopyanin EKRANDA
+        GORUNEN sinir kutusunun sol-ust kosesi oraya - tek yazi da grup da (eskiden tek yazida
+        yazinin taban cizgisinin basiydi). Donuk sayfada "gorunen sol-ust" sayfanin kendi
+        koordinatindaki sol-ust degildir: kutunun dort kosesi ekran yonune cevrilip secilir.
+        at yoksa: ayni sayfaya biraz sag-alta (ust uste binmesin), baska sayfaya / belgeye ayni yere."""
+        same = clip.source is not None and clip.source() is self.engine and clip.page_num == self.current_page
+        if at is not None:
+            b, disp = clip.bbox, self.canvas.disp
+            ref = min((b.tl, b.tr, b.bl, b.br), key=lambda q: (q * disp).x + (q * disp).y)
+            dx, dy = at.x - ref.x, at.y - ref.y
+        elif same:
+            self._paste_n = getattr(self, "_paste_n", 0) + 1
+            dx = dy = max(8.0, clip.first_size() * 0.9) * self._paste_n
+        else:
+            dx = dy = 0.0
+        try:
+            spans, paths, images = self.engine.paste_clip(self.current_page, clip, dx, dy)
+        except Exception:
+            return                                       # (motor geri yukledi; kullaniciya _after_rollback soyler)
+        if self.mode not in ("text", "shape"):
+            self.set_mode("text")
+        self.after_edit()
+        # (paragrafin her satiri ayri aranir: yapistirilan yer komsu yaziyla farkli gruplanabilir -
+        # secimde satir eksik kalirsa sonra suruklenince geride kalirdi)
+        spans = [self._find_span_near(ln) or ln for s in spans for ln in (getattr(s, "lines", None) or [s])]
+        if paths and not spans and not images and self.mode != "shape":
+            self.set_mode("shape")
+        self._set_selection(spans, paths, images)
+        self.status(_t("Yapıştırıldı.") if len(clip) == 1 else _t("{n} öğe yapıştırıldı.", n=len(clip)))
+
+    def _font_rejected(self, name, why):
+        """Secilen kurulu font PDF'e yazilamiyor: secilmedi (FontCombo onceki secime dondu)."""
+        reason = {"glyphs": _t("Türkçe harfleri yok"), "open": _t("dosyası açılamıyor")}.get(
+            why, _t("dosyası bulunamadı"))
+        QMessageBox.information(self, _t("Bilgi"), _t("\"{name}\" yazı tipi PDF'e yazılamıyor ({reason}); seçilmedi.",
+                                                    name=name, reason=reason))
 
     def _on_text_color(self, rgb):
         self.selected_color = rgb
@@ -4935,23 +6686,27 @@ class MainWindow(QMainWindow, MarkupMixin, FindMixin):
             return
         d = cv.dpr
         page_img = cv._pix.toImage()
+        page_img.setDevicePixelRatio(1.0)      # (asagida HAM piksel olarak kullanilir - bkz. _ghost_set)
+        # r: SAYFA goruntusu pikseli. Yuksek yakinlikta eldeki goruntu sayfanin bir bolgesidir
+        # (cv.pix_org'dan baslar): bolgenin disinda kalan kisim islenmez.
+        org = cv.pix_org
         r = QRect(int(rect_px.x() * d), int((rect_px.y() - cv.pad_top) * d),
-                  int(rect_px.width() * d) + 2, int(rect_px.height() * d) + 2).intersected(page_img.rect())
+                  int(rect_px.width() * d) + 2, int(rect_px.height() * d) + 2).intersected(cv.pix_rect())
         if r.isEmpty():
             return
         res = drag_ghost.render_without(self.engine.doc, self.current_page, self._render_scale, remove, r,
-                                        isolate=isolate)
+                                        isolate=isolate, base=cv.pix_rect() if cv.region else None)
         if res is None:
             return
         part, r, obj = res
-        if obj is not None and drag_ghost.composes(page_img.copy(r), part, obj):
+        if obj is not None and drag_ghost.composes(page_img.copy(r.translated(-org)), part, obj):
             self._ghost_painter = None
             self._ghost_set(QPixmap.fromImage(obj), part, r, page_img=page_img)
             return
         if bg_only:                            # nesne baska yolla cizilir (_ghost_painter)
             self._ghost_set(None, part, r, page_img=page_img)
             return
-        pm = drag_ghost.diff_ghost(page_img.copy(r), part)
+        pm = drag_ghost.diff_ghost(page_img.copy(r.translated(-org)), part)
         if pm is not None:
             self._ghost_painter = None
             self._ghost_set(pm, part, r, page_img=page_img)
@@ -4963,8 +6718,14 @@ class MainWindow(QMainWindow, MarkupMixin, FindMixin):
         d = cv.dpr
         if page_img is None:
             page_img = cv._pix.toImage()
+        # YUKSEK DPI TUZAGI: toImage() ekran olcegini (1,25 / 1,5 / 2) tasir; olcekli goruntuye
+        # cizen QPainter koordinatlari MANTIKSAL birim sayar -> nesnesiz parca (r: ham piksel)
+        # yanlis yere, buyutulmus cizilir, eski yazi yerinde kalirdi. %100 olmayan her ekranda
+        # duzenlerken / tasirken eski yazi alttan gorunuyordu (1.3.0'a kadar; gelistirme
+        # ekrani %100 oldugu icin fark edilmedi).
+        page_img.setDevicePixelRatio(1.0)
         qp = QPainter(page_img)
-        qp.drawImage(r.topLeft(), part)
+        qp.drawImage(r.topLeft() - cv.pix_org, part)       # (r sayfa pikseli; goruntu pix_org'dan baslar)
         qp.end()
         bg = QPixmap.fromImage(page_img)
         bg.setDevicePixelRatio(d)
@@ -4977,7 +6738,7 @@ class MainWindow(QMainWindow, MarkupMixin, FindMixin):
         lines = getattr(span, "lines", None) or [span]          # paragraf: tum satirlari
 
         def remove(doc, page):
-            return pdf_content.remove_texts_at(doc, page, [ln.origin for ln in lines])
+            return self._preview_remove_texts(doc, page, lines)
         rect = self.canvas.poly_px(span.quad()).boundingRect().adjusted(-4, -4, 4, 4)
         blend = self.engine._blend_of(self.engine.doc[self.current_page], span)
         if any(ln.opacity < 0.98 for ln in lines) or (blend and blend != "Normal"):
@@ -4989,6 +6750,18 @@ class MainWindow(QMainWindow, MarkupMixin, FindMixin):
             self._ghost_diff(rect, remove, bg_only=True, isolate=True)
         else:
             self._ghost_diff(rect, remove, isolate=True)
+
+    def _preview_remove_texts(self, doc, page, lines):
+        """Onizleme kopyasinda (gecici belge) yazilari kaldir. Komutunda bulunamayan yazi (eski
+        surumle tasinmis / yapistirilmis belgede ayni satirdaki iki yazi tek komutta olabilir)
+        geometrik yolla kaldirilir: kopya atilacak, asil belgeye dokunulmaz. Eskiden TEK yazi
+        bulunamayinca butun onizleme dusuyordu (tasirken yazilar gorunmuyor / tek yazinin eski
+        goruntusu yerinde kaliyordu) ve yazi basina tarayan yavas yola giriliyordu (~1 sn)."""
+        done = pdf_content.remove_texts_each(doc, page, [ln.run() for ln in lines])
+        for ln, ok in zip(lines, done):
+            if not ok:
+                self.engine._redact_span(page, ln)
+        return True
 
     def _paint_text_ghost(self, p, cv, lines, dd, blend):
         disp = math.degrees(math.atan2(cv.disp.b, cv.disp.a))
@@ -5032,7 +6805,7 @@ class MainWindow(QMainWindow, MarkupMixin, FindMixin):
         # gorunur). Cift tikla duzenlemeye girilince ardindan gelen fare "birakildi" olayi
         # (canvas_release) burayi cagirip arka plani siliyordu: yazi silinince arkada
         # orijinali gorunuyordu. Duzenleme bitince (_tx_live False) normal calisir.
-        if self.editing_live():
+        if self.live_bg():
             return
         cv = self.canvas
         if cv.bg is not None or cv.ghost is not None:
@@ -5115,12 +6888,37 @@ class MainWindow(QMainWindow, MarkupMixin, FindMixin):
         pen.setCosmetic(True)
         return pen
 
+    def _sel_pen(self):
+        """Secili yazi / resim cercevesi: Isaretle'deki notlar ve sekillerle AYNI dil - mavi,
+        kesikli (eskiden kirmizi duz cizgiydi: kirmizi "hata" gibi duruyor, belgedeki kirmizi
+        icerikle de karisiyordu - kullanici, 2026-10-12). Uzerine gelme cercevesi daha soluk."""
+        return self._pen(ACCENT, 1.3, Qt.DashLine)
+
+    @staticmethod
+    def _frame_poly(cv, span):
+        """Yazinin secim cercevesi (ekran px): dortgeni, USTTEN biraz payli. Yazi tipinin
+        "ust cizgisi" buyuk harfin tepesidir; İ, Ş, Ö, Ü gibi harflerin noktasi / aksani onun
+        ustune tasar ve cerceve cizgisi onlari kesiyordu. Pay yazi boyutuyla orantili (yazinin
+        kendi yonunde: donuk yazida da dogru tarafa)."""
+        poly = cv.poly_px(span.quad())
+        a, b, c, d = poly[0], poly[1], poly[2], poly[3]
+        ux, uy = a.x() - d.x(), a.y() - d.y()
+        n = math.hypot(ux, uy)                 # yazinin ekrandaki yuksekligi (px)
+        if n < 1e-6:
+            return poly
+        lines = len(getattr(span, "lines", None) or [1])
+        # birkac piksel: kucuk yazida 2, buyudukce en cok 5 (buyuk / egik yazida oranli pay
+        # fazla aciliyor, dondurme noktasi cercevenin icinde kaliyordu - kullanici, 2026-10-12)
+        pad = max(2.0, min(5.0, 0.11 * n / lines))
+        u = QPointF(ux / n * pad, uy / n * pad)
+        return QPolygonF([a + u, b + u, c, d])
+
     def _paint_text_overlay(self, p, cv):
         hs = self.hover_span
         if hs is not None and hs is not self.current_span and not self.drag:
-            p.setPen(self._pen(ACCENT, 1, Qt.DashLine, 170))
+            p.setPen(self._pen(ACCENT, 1, Qt.DashLine, 105))    # (secili olandan soluk ve ince)
             p.setBrush(Qt.NoBrush)
-            p.drawPolygon(cv.poly_px(hs.quad()))
+            p.drawPolygon(self._frame_poly(cv, hs))
         d = self.drag
         if d and d["kind"] == "tband" and d["moved"]:      # alan cizerek secme
             # duz cerceve: "tamami icinde" (soldan saga); kesikli: "degen" (sagdan sola)
@@ -5129,6 +6927,9 @@ class MainWindow(QMainWindow, MarkupMixin, FindMixin):
             c.setAlpha(30)
             p.setBrush(QBrush(c))
             p.drawRect(cv.rect_px(fitz.Rect(d["start"], d["cur"])))
+        if self._group_active() and d and d.get("moved") and d["kind"] == "grot":
+            self._paint_group_rot(p, cv, d)
+            return
         if self._group_active():                           # toplu secim: her nesnenin cercevesi + dis kutu
             off = QPointF(0, 0)
             if d and d.get("moved") and d["kind"] == "tgroup":
@@ -5136,10 +6937,10 @@ class MainWindow(QMainWindow, MarkupMixin, FindMixin):
                 dd = d["cur"] - d["start"]
                 self.lbl_coords.setText(f"\u0394x {dd.x:+.1f}  \u0394y {dd.y:+.1f} pt")
             p.setBrush(Qt.NoBrush)
-            p.setPen(self._pen(TEXT_SEL, 1.5))
+            p.setPen(self._sel_pen())
             outer = None
             for s in self.sel_spans:
-                poly = cv.poly_px(s.quad()).translated(off)
+                poly = self._frame_poly(cv, s).translated(off)
                 p.drawPolygon(poly)
                 r = poly.boundingRect()
                 outer = r if outer is None else outer.united(r)
@@ -5160,20 +6961,21 @@ class MainWindow(QMainWindow, MarkupMixin, FindMixin):
                         p.restore()
                     else:
                         p.drawPixmap(new_r.toRect(), cv.crop(old_r))
-                    p.setPen(self._pen(TEXT_SEL, 1.5))
+                    p.setPen(self._sel_pen())
                     p.drawRect(new_r)
                     r = new_r
                     self.lbl_coords.setText(f"{d['nb'].width:.1f} \u00d7 {d['nb'].height:.1f} pt")
                 else:
                     poly = cv.poly_px(it.quad).translated(off)
-                    p.setPen(self._pen(TEXT_SEL, 1.5))
+                    p.setPen(self._sel_pen())
                     p.drawPolygon(poly)
                     r = poly.boundingRect()
                 outer = r if outer is None else outer.united(r)
             if solo is not None and not (d and d.get("moved")):    # tek resim: boyut tutamaclari
-                p.setPen(self._pen(TEXT_SEL, 1.5))
+                p.setPen(self._pen(ACCENT, 1.2))
                 for _name, hp in self._image_handles():
                     self._paint_handle(p, cv.to_px(hp), False, HANDLE_PX)
+                self._paint_group_rot_handle(p, cv, outer.top() if outer is not None else None)
                 return
             if resizing:
                 return
@@ -5182,7 +6984,7 @@ class MainWindow(QMainWindow, MarkupMixin, FindMixin):
                 dragging = d and d.get("moved") and d["kind"] == "tgroup"
                 m = fitz.Matrix(1, 0, 0, 1, d["cur"].x - d["start"].x, d["cur"].y - d["start"].y) if dragging else None
                 if not (dragging and cv.ghost is not None):   # (tasirken cizimin kendisi gidiyor)
-                    p.setPen(self._pen(TEXT_SEL, 2, alpha=200))
+                    p.setPen(self._pen(ACCENT, 2, alpha=200))
                     self._paint_polys(p, cv, items, m)
                 pb = self._sel_bbox()
                 if pb is not None:
@@ -5191,13 +6993,15 @@ class MainWindow(QMainWindow, MarkupMixin, FindMixin):
             if outer is not None:
                 p.setPen(self._pen(ACCENT, 1, Qt.DashLine, 200))
                 p.drawRect(outer.adjusted(-4, -4, 4, 4))
+                if not (d and d.get("moved")):
+                    self._paint_group_rot_handle(p, cv, outer.top() - 4)
             return
         sp = self.current_span
         if sp is None:
             return
         if self.txt_new.isVisible():           # yazarken: sadece kutu (cerceve / tutamac kutudan tasmasin)
             return
-        poly = cv.poly_px(sp.quad())
+        poly = self._frame_poly(cv, sp)
         d = self.drag
         if d and d["moved"] and d["kind"] == "textrot":
             # canli: YAZININ KENDISI (font/boyut/renk) yeni aciyla cizilir. Eskiden
@@ -5212,6 +7016,23 @@ class MainWindow(QMainWindow, MarkupMixin, FindMixin):
             p.save()
             p.translate(cv.to_px(o))
             p.rotate(target + math.degrees(math.atan2(cv.disp.b, cv.disp.a)))
+            # Bırakınca yazilacak yazinin AYNISI (cok satirli paragraf satirlariyla): motor surukleme
+            # basinda bir kez cizer (_rot_preview); burada yalniz cevrilip konur. Eskiden Qt tek
+            # satir yaziyordu: iki satirlik yazi donerken tek uzun satira donusuyordu.
+            pv = self._rot_preview(d, sp)
+            if pv is not None:
+                pm, ox, oy, box = pv
+                p.setRenderHint(QPainter.SmoothPixmapTransform, True)
+                p.drawPixmap(QPointF(-ox, -oy), pm)
+                p.setPen(self._sel_pen())
+                p.setBrush(Qt.NoBrush)
+                p.drawRect(QRectF(*box))
+                p.restore()
+                p.setPen(self._pen(ACCENT, 1, Qt.DashLine, 110))
+                p.setBrush(Qt.NoBrush)
+                p.drawPolygon(poly)
+                self.lbl_coords.setText(_t("açı {a}°  (Shift: 15° adım)", a=f"{target:.0f}"))
+                return
             f = QFont(self._preview_family(sp.font))
             f.setPixelSize(max(1, round(sp.size * cv.zoom)))
             f.setBold(sp.is_bold)
@@ -5222,12 +7043,12 @@ class MainWindow(QMainWindow, MarkupMixin, FindMixin):
             p.drawText(QPointF(0, 0), sp.text.replace("\xa0", " "))
             # yazinin (donmemis) kutusu, yeni aciyla
             fm = p.fontMetrics()
-            p.setPen(self._pen(TEXT_SEL, 1.5))
+            p.setPen(self._sel_pen())
             p.setBrush(Qt.NoBrush)
             p.drawRect(QRectF(0, -fm.ascent(), fm.horizontalAdvance(sp.text.replace("\xa0", " ")),
                               fm.ascent() + fm.descent()))
             p.restore()
-            p.setPen(self._pen(TEXT_SEL, 1, Qt.DashLine))
+            p.setPen(self._pen(ACCENT, 1, Qt.DashLine, 110))
             p.setBrush(Qt.NoBrush)
             p.drawPolygon(poly)
             self.lbl_coords.setText(_t("açı {a}°  (Shift: 15° adım)", a=f"{target:.0f}"))
@@ -5237,7 +7058,7 @@ class MainWindow(QMainWindow, MarkupMixin, FindMixin):
             if d["kind"] == "text":
                 self._paint_guides(p, cv, d.get("guides"))
             if cv.ghost is not None:              # yazinin kendisi kayiyor; secim cercevesi onunla
-                p.setPen(self._pen(TEXT_SEL, 2))
+                p.setPen(self._sel_pen())
                 p.setBrush(Qt.NoBrush)
                 p.drawPolygon(poly.translated(off))
                 dd = d["cur"] - d["start"]
@@ -5248,26 +7069,67 @@ class MainWindow(QMainWindow, MarkupMixin, FindMixin):
                 p.setOpacity(0.8)
                 p.drawPixmap(src.topLeft() + off, cv.crop(src))
                 p.setOpacity(1.0)
-            p.setPen(self._pen(TEXT_SEL, 1, Qt.DashLine))
+            p.setPen(self._pen(ACCENT, 1, Qt.DashLine, 110))
             p.setBrush(Qt.NoBrush)
             p.drawPolygon(poly)
-            p.setPen(self._pen(TEXT_SEL, 2))
+            p.setPen(self._sel_pen())
             p.drawPolygon(poly.translated(off))
             dd = d["cur"] - d["start"]
             self.lbl_coords.setText(f"Δx {dd.x:+.1f}  Δy {dd.y:+.1f} pt")
             return
-        p.setPen(self._pen(TEXT_SEL, 2))
+        p.setPen(self._sel_pen())
         p.setBrush(Qt.NoBrush)
         p.drawPolygon(poly)
-        # dondurme tutamaci + sap
-        q = sp.quad()
-        top = cv.to_px((q[0] + q[1]) * 0.5)
+        # dondurme tutamaci + sap (sap cercevenin ust kenarindan cikar)
+        top = (poly[0] + poly[1]) * 0.5
         hp = cv.to_px(self._text_rot_handle(sp))
-        p.setPen(self._pen(TEXT_SEL, 1))
+        p.setPen(self._pen(ACCENT, 1))
         p.drawLine(top, hp)
-        p.setPen(self._pen(TEXT_SEL, 1.2))
-        p.setBrush(QBrush(TEXT_SEL))
+        p.setPen(self._pen(ACCENT, 1.2))
+        p.setBrush(QBrush(QColor(ACCENT)))
         p.drawEllipse(hp, HANDLE_PX + 0.5, HANDLE_PX + 0.5)
+
+    def _paint_group_rot_handle(self, p, cv, top):
+        """Toplu secimin dondurme tutamaci: dis cercevenin ust kenarinin ortasindan yukari sap +
+        dolu yuvarlak (tek yazidakiyle ayni)."""
+        hp = self._group_rot_px()
+        if hp is None:
+            return
+        if top is not None:
+            p.setPen(self._pen(ACCENT, 1))
+            p.drawLine(QPointF(hp.x(), top), hp)
+        p.setPen(self._pen(ACCENT, 1.2))
+        p.setBrush(QBrush(QColor(ACCENT)))
+        p.drawEllipse(hp, HANDLE_PX + 0.5, HANDLE_PX + 0.5)
+        p.setBrush(Qt.NoBrush)
+
+    def _paint_group_rot(self, p, cv, d):
+        """Toplu secim donduruluyor: nesnelerin KENDI goruntusu (yerinden kalkmis hali, bkz.
+        _ghost_group) ve cerceveleri ortak merkez etrafinda yeni aciyla."""
+        delta = self._group_drag_angle(d)
+        c = cv.to_px(d["c"])
+        p.save()
+        p.translate(c)
+        p.rotate(delta)
+        p.translate(-c)
+        gh = cv.ghost
+        if gh is not None and gh[0] is not None:
+            p.setRenderHint(QPainter.SmoothPixmapTransform, True)
+            p.drawPixmap(cv.to_px(gh[1]), gh[0])
+        p.setPen(self._sel_pen())
+        p.setBrush(Qt.NoBrush)
+        for s in self.sel_spans:
+            p.drawPolygon(self._frame_poly(cv, s))
+        for it in self._sel_image_items():
+            p.drawPolygon(cv.poly_px(it.quad))
+        if self.sel_paths and (gh is None or gh[0] is None):      # (goruntu yoksa cizimlerin hatti)
+            p.setPen(self._pen(ACCENT, 2, alpha=200))
+            self._paint_polys(p, cv, self._sel_items())
+        p.restore()
+        p.setPen(self._pen(ACCENT, 1.2))                   # merkez
+        p.drawLine(c + QPointF(-5, 0), c + QPointF(5, 0))
+        p.drawLine(c + QPointF(0, -5), c + QPointF(0, 5))
+        self.lbl_coords.setText(_t("açı {a}°  (Shift: 15° adım)", a=f"{delta:.0f}"))
 
     @staticmethod
     def _paint_handle(p, q, round_, size, filled=False):
@@ -5451,6 +7313,7 @@ class MainWindow(QMainWindow, MarkupMixin, FindMixin):
     def canvas_key(self, ev):
         if not self.engine.doc:
             return False
+        self._zoom_flush()
         key, mods = ev.key(), ev.modifiers()
         steps = {Qt.Key_Left: (-1, 0), Qt.Key_Right: (1, 0), Qt.Key_Up: (0, -1), Qt.Key_Down: (0, 1)}
         if key == Qt.Key_Escape:
@@ -5494,15 +7357,17 @@ class MainWindow(QMainWindow, MarkupMixin, FindMixin):
             self._text_edit_begin()
             return True
         plain = not (mods & (Qt.ControlModifier | Qt.AltModifier | Qt.MetaModifier))
-        if self.mode in ("text", "insert") and mods & Qt.ControlModifier and not mods & Qt.AltModifier:
-            if key == Qt.Key_C and self.current_span is not None:
-                self.copy_text()
+        if self.mode in ("text", "insert", "shape") and mods & Qt.ControlModifier and not mods & Qt.AltModifier \
+                and key in (Qt.Key_C, Qt.Key_V) and (self.mode != "shape" or key == Qt.Key_C or getattr(self, "_clip", None)):
+            if key == Qt.Key_C:
+                if self._has_selection():
+                    self.copy_text()
                 return True
+            self.paste_text(mouse_at=self._mouse_on_page())
+            return True
+        if self.mode in ("text", "insert") and mods & Qt.ControlModifier and not mods & Qt.AltModifier:
             if key == Qt.Key_D and self.current_span is not None:
                 self.duplicate_text()
-                return True
-            if key == Qt.Key_V:
-                self.paste_text()
                 return True
         if self.mode in ("text", "insert", "shape") and plain \
                 and key in (Qt.Key_V, Qt.Key_T, Qt.Key_L, Qt.Key_K, Qt.Key_D):
@@ -5673,7 +7538,10 @@ class MainWindow(QMainWindow, MarkupMixin, FindMixin):
         self.status(msg)
 
     # ======================================================== sayfa islemleri
-    def _page_menu(self, pno):
+    def _page_menu(self, pno, side=False):
+        """side: sol menudeki "Sayfa islemleri"nden acildi - sol menude ZATEN olan islemler
+        (Resim olarak kaydet) burada tekrar edilmez. Sayfa kucuk resmine sag tikta hepsi var
+        (o sayfa icin)."""
         m = QMenu(_t("Sayfa {n}", n=pno + 1), self)
         m.addAction(ic("fa5s.undo"), _t("Sola döndür"), lambda: self._page_op("rotate", pno, -90))
         m.addAction(ic("fa5s.redo"), _t("Sağa döndür"), lambda: self._page_op("rotate", pno, 90))
@@ -5685,7 +7553,8 @@ class MainWindow(QMainWindow, MarkupMixin, FindMixin):
         m.addAction(ic("fa5s.file-image"), _t("Arkasına resim ekle..."), lambda: self._page_op("image", pno + 1))
         m.addAction(ic("fa5s.copy"), _t("Çoğalt"), lambda: self._page_op("dup", pno))
         m.addSeparator()
-        m.addAction(ic("fa5s.image"), _t("Resim olarak kaydet..."), lambda: self.export_pages_dialog(pno))
+        if not side:
+            m.addAction(ic("fa5s.image"), _t("Resim olarak kaydet..."), lambda: self.export_pages_dialog(pno))
         m.addAction(ic("fa5s.clipboard"), _t("Panoya resim olarak kopyala"), lambda: self.copy_page_image(pno))
         m.addSeparator()
         up = m.addAction(ic("fa5s.arrow-up"), _t("Yukarı taşı"), lambda: self.move_page_to(pno, pno - 1))
@@ -5715,7 +7584,7 @@ class MainWindow(QMainWindow, MarkupMixin, FindMixin):
         if not self.engine.doc:
             return
         pno = index if index >= 0 else self.current_page
-        self._page_menu(pno).exec(global_pos)
+        title_bar.run_modal(self._page_menu(pno), global_pos)
 
     def _page_op(self, op, pno, arg=None):
         e = self.engine
@@ -5804,11 +7673,11 @@ class MainWindow(QMainWindow, MarkupMixin, FindMixin):
         return None
 
     def open_merge_dialog(self):
-        MergeDialog(self, self._current_file_for_tools()).exec()
+        title_bar.run_modal(MergeDialog(self, self._current_file_for_tools()))
 
     def open_split_dialog(self):
         f = self._current_file_for_tools()
-        SplitDialog(self, f if f and self.engine.page_count() > 1 else None).exec()
+        title_bar.run_modal(SplitDialog(self, f if f and self.engine.page_count() > 1 else None))
 
     def _need_doc(self):
         if not self.engine.doc:
@@ -5817,7 +7686,7 @@ class MainWindow(QMainWindow, MarkupMixin, FindMixin):
         return True
 
     def open_watermark_dialog(self):
-        if self._need_doc() and WatermarkDialog(self, self.engine, self.current_page).exec():
+        if self._need_doc() and title_bar.run_modal(WatermarkDialog(self, self.engine, self.current_page)):
             self._clear_selection()
             self.after_edit(all_thumbs=True)
             self.status(_t("Filigran eklendi (Ctrl+Z ile geri alınabilir)."))
@@ -5832,7 +7701,7 @@ class MainWindow(QMainWindow, MarkupMixin, FindMixin):
                 "Düz bir forma yazı yazmak için \"Yeni metin\" aracıyla ilgili boşluğa "
                 "tıklayıp yazabilirsiniz."))
             return
-        if FormDialog(self, self.engine).exec():
+        if title_bar.run_modal(FormDialog(self, self.engine)):
             self.after_edit(all_thumbs=True)
             self.status(_t("Form alanları güncellendi."))
 
@@ -5846,10 +7715,10 @@ class MainWindow(QMainWindow, MarkupMixin, FindMixin):
             box.setTextFormat(Qt.RichText)
             box.setTextInteractionFlags(Qt.TextBrowserInteraction)
             box.setText(TESSERACT_HELP)
-            box.exec()
+            title_bar.run_modal(box)
             return
         dlg = OcrDialog(self, self.engine, self.current_page)
-        if dlg.exec():
+        if title_bar.run_modal(dlg):
             self._clear_selection()
             self.after_edit(all_thumbs=True)
             self.status(_t("OCR tamamlandı: {n} kelime tanındı.", n=dlg.result_words))
@@ -6000,7 +7869,10 @@ def main():
     # Qt'nin kendi metinleri (Evet/Hayir/Iptal, renk secici...) secili dilde
     from PySide6.QtCore import QTranslator, QLibraryInfo
     qt_tr = QTranslator(app)
-    if qt_tr.load(f"qtbase_{i18n.qt_code()}", QLibraryInfo.path(QLibraryInfo.TranslationsPath)):
+    qt_dir = QLibraryInfo.path(QLibraryInfo.TranslationsPath)
+    # once tam kod (qtbase_pt_BR), yoksa yalniz dil (qtbase_de)
+    if (qt_tr.load(f"qtbase_{i18n.language().replace('-', '_')}", qt_dir)
+            or qt_tr.load(f"qtbase_{i18n.qt_code()}", qt_dir)):
         app.installTranslator(qt_tr)
     # Tek pencere: Revora zaten aciksa dosya orada yeni sekme olur, bu surec kapanir.
     # (--new ya da REVORA_MULTI=1: ayri pencere; dil degisince yeniden baslatma boyle acilir.)
@@ -6018,7 +7890,7 @@ def main():
         _listen(app, win)
     except Exception:
         pass
-    win.show()
+    win.showMaximized()                        # (kullanici: hep ekrani kaplamis acilsin)
     win.raise_()
     win.activateWindow()
     active = None

@@ -17,7 +17,7 @@ import math
 from PySide6.QtWidgets import (QWidget, QHBoxLayout, QVBoxLayout, QGridLayout,
                                QDoubleSpinBox, QSpinBox, QCheckBox, QComboBox, QTextEdit,
                                QButtonGroup, QMessageBox, QSlider, QLineEdit, QLabel, QApplication)
-from PySide6.QtGui import QPainter, QColor, QPen, QBrush, QPolygonF, QPainterPath, QFont, QFontMetrics, QIcon
+from PySide6.QtGui import QPainter, QColor, QPen, QBrush, QPolygonF, QPainterPath, QFont, QFontMetrics, QIcon, QImage, QPixmap, QTextCursor
 from PySide6.QtCore import Qt, QTimer, QPointF, QRectF, QEvent, QObject, QSize
 import fitz
 
@@ -26,6 +26,7 @@ import pdf_blur
 import curve_math
 import markup_bar
 import drag_ghost
+import title_bar
 from font_resolver import FONT_DISPLAY_NAMES
 from i18n import _t
 
@@ -74,7 +75,8 @@ TOOLS = (("select", "mdi6.cursor-default-outline", _t("Seç / taşı")), (None, 
          ("number", "mdi6.numeric-1-circle-outline", _t("Numara (her tıklamada sıradaki)")),
          ("eraser", "mdi6.eraser", _t("Silgi — üstünden geçtiğin işaretlemeleri siler")), (None, None, None),
          ("magnifier", "mdi6.magnify-plus-outline", _t("Büyüteç")),
-         ("blur", "mdi6.blur", _t("Bulanıklaştır")))
+         ("blur", "mdi6.blur",
+          _t("Karart — seçili alanı gizler; kaydedince alttaki içerik kalıcı olarak kaldırılır")))
 TOOL_KEYS = {"select": "V", "arrow": "O", "line": "L", "rect": "K", "ellipse": "D", "note": "N",
              "pen": "P", "highlight": "H", "number": "1", "eraser": "E", "magnifier": "M", "blur": "B"}
 KEY_TOOLS = {Qt.Key_V: "select", Qt.Key_O: "arrow", Qt.Key_L: "line", Qt.Key_K: "rect",
@@ -100,29 +102,7 @@ NOTE_STYLE_KEYS = ("color", "width", "opacity", "head_scale", "fill_on", "fill_c
 HEAD_SCALES = ((_t("Küçük"), 0.7), (_t("Orta"), 1.0), (_t("Büyük"), 1.5))
 TOOL_KIND = {"arrow": "arrow", "line": "arrow", "ellipse": "ellipse", "rect": "rect", "note": "note",
              "magnifier": "magnifier", "blur": "blur", "pen": "ink", "highlight": "ink", "number": "number"}
-# Ayarlar > Klavye kisayollari'nda gosterilen Isaretle kisayollari
-SHORTCUTS = (
-    (_t("Araçlar"), None),
-    ("V  O  L  K  D  N", _t("Seç · Ok · Çizgi · Kutu · Daire · Not")),
-    ("P  H  1  E", _t("Kalem · Fosforlu kalem · Numara · Silgi")),
-    ("M  B", _t("Büyüteç · Bulanıklaştır")),
-    ("S  /  G", _t("İmza ekle · Görüntü ekle")),
-    (_t("Fosforlu kalem"), _t("Yazının üstünden başla: kelimelere oturur · boşta: serbest")),
-    (_t("Çizim"), None),
-    ("Shift", _t("Ok/çizgi/kalem 45° adım · kare / tam daire · oranı koru")),
-    (_t("Shift (görüntü, imza)"), _t("Oranı bozarak boyutlandır")),
-    ("Alt", _t("Kutu / daire / bulanık: merkezden çiz ve ölçekle")),
-    (_t("Alt (ok/çizgi ucu)"), _t("Açı sabit, sadece uzunluk")),
-    (_t("Ctrl + sürükle"), _t("Nesnenin üstünden de yeni çizim başlat")),
-    (_t("Orta tutamaç"), _t("Çizgiyi / oku bük · çift tık: düzleştir")),
-    (_t("Düzenleme"), None),
-    ("Delete", _t("Sil")),
-    ("Ctrl + D", _t("Çoğalt")),
-    (_t("Oklar (+Shift)"), _t("İnce kaydırma (5 kat)")),
-    (_t("F2 / çift tık"), _t("Not yazısını düzenle · Esc: bitir")),
-    ("Esc", _t("Seçimi bırak · ikinci kez: Seç aracı")),
-    (_t("Sağ tık"), _t("Çoğalt, öne getir / arkaya gönder, düzleştir")),
-)
+# (Klavye kisayollari sayfasinin listesi: settings_dialog.shortcut_groups)
 MAG_TEXT_KEYS = ("label_on", "caption_on", "show_scale", "label_font", "label_size",
                  "label_bold", "label_color")
 
@@ -303,7 +283,8 @@ class MarkupMixin:
         self._mk_text_timer.timeout.connect(self._mk_apply_text)
         self._blur_cache = None
         self._mag_cache = None
-        self._mk_bar_buttons = []          # tema degisince ikonlari yeniden renklenecekler
+        if not hasattr(self, "_mk_bar_buttons"):   # (sol menu satirlari bu listeye ONCE eklenmis olabilir)
+            self._mk_bar_buttons = []      # tema degisince ikonlari yeniden renklenecekler
 
         def tb(name, tip, checkable=True, text=None):
             b = markup_bar.tool_button(name, tip, checkable, text, self.dark)
@@ -473,7 +454,7 @@ class MarkupMixin:
             lm.addWidget(w)
         l2.addWidget(self.mk_mag_box)
         # buyutec yazi ayarlari: acilir kutu
-        self.mk_mag_pop = markup_bar.Popover(self)
+        self.mk_mag_pop = markup_bar.Popover(self, keep=True)      # (bir kez kurulur, yeniden gosterilir)
         pg = QGridLayout(self.mk_mag_pop)
         pg.setContentsMargins(10, 10, 10, 10)
         pg.setHorizontalSpacing(8)
@@ -624,7 +605,8 @@ class MarkupMixin:
 
     def _slider(self, spin, lo, hi, scale=1.0):
         """Ust serit sayi kutusuna ▾ surgu ekle (tema rengi de takip edilir)."""
-        self._mk_bar_buttons.append(markup_bar.attach_slider(spin, lo, hi, scale, self.dark))
+        self._mk_bar_buttons.append(markup_bar.attach_slider(spin, lo, hi, scale, self.dark,
+                                                             begin=self.adjust_begin, end=self.adjust_end))
 
     def _mk_color_buttons(self):
         return (self.mk_color, self.mk_fill, self.mk_text_color, self.mk_outline_color, self.mk_lcolor,
@@ -842,15 +824,23 @@ class MarkupMixin:
             self.lbl_blur_level.setText(str(st["level"]))
             self.canvas.update()
         m = self._mk_sel()
+        relayout = kind == "magnifier"        # tur/etiket degisince alanlarin etkinligi
         if m is not None:
             geom = geom_from(kind, m["p"])
             if kind == "magnifier":
                 geom = self._mag_geom_for(m["p"], st, geom)
             P = params_from(kind, st, geom)
-            self.engine.update_markup(self.current_page, m["id"], P, group=("mkstyle", m["id"]))
-            self._mk_changed()
-        if kind == "magnifier":
-            self._refresh_panel()             # tur/etiket degisince alanlarin etkinligi
+            if kind == "note":                 # donuk not: boyut / yazi tipi degisince baslangic kaymasin
+                pdf_markup.note_keep_start(m["p"], P)
+            if kind == "magnifier":            # (yalniz carpan / renk degistiyse serit ayni kalir)
+                keys = ("mode", "label_on", "caption_on", "dashed", "label")
+                relayout = any(m["p"].get(k) != P.get(k) for k in keys)
+            old = self._mk_area(m)
+            self.engine.update_markup(self.current_page, m["id"], P,
+                                      group=("mkstyle", m["id"], self._adjust_seq))
+            self._mk_changed(old)
+        if relayout:
+            self._refresh_panel()
 
     # ---------------------------------------------- buyutec yardimcilari
     def _page_box(self):
@@ -944,12 +934,20 @@ class MarkupMixin:
         m = self._mk_sel()
         if m is None or m["kind"] != "blur":
             return
-        self.engine.finalize_blurs(self.current_page, m["id"])
+        try:
+            self.engine.finalize_blurs(self.current_page, m["id"])
+        except Exception as e:                  # (belge eski haline dondu; karartma hala beklemede)
+            QMessageBox.critical(self, _t("Hata"), _t("Karartma uygulanamadı; belge değiştirilmedi:\n{e}", e=e))
+            self.after_edit()
+            return
         self.sel_markup = None
         self.after_edit()
-        self.status(_t("Bulanık alan sayfaya işlendi; alttaki içerik silindi. (Geri almak: Ctrl+Z)"))
+        self.status(_t("Karartma sayfaya işlendi; alttaki içerik silindi. (Geri almak: Ctrl+Z)"))
 
     def _mk_on_text(self):
+        if getattr(self, "_mk_live", False):   # yerinde canli duzenleme: not onizlemeyle cizilir,
+            self.canvas.update()               # belgeye yazma duzenleme BITINCE (tek geri-al adimi)
+            return
         if not self._mk_loading and self._mk_sel() is not None:
             self._mk_text_timer.start()        # her tusta degil, yazmaya ara verince uygula
             if self.mk_text.isVisible():
@@ -963,6 +961,7 @@ class MarkupMixin:
         P["text"] = self.mk_text.toPlainText()
         if P["text"] == m["p"].get("text"):
             return
+        pdf_markup.note_keep_start(m["p"], P)      # donuk not: yazinin baslangici yerinde kalsin
         self.engine.update_markup(self.current_page, m["id"], P, group=("mktext", m["id"]))
         self._mk_changed()
 
@@ -1001,6 +1000,7 @@ class MarkupMixin:
             cb.addItem(_t("Kendi şablonunu sil…"), "@delete")
         cb.setCurrentIndex(max(cb.findData(keep), 0) if keep else 0)
         cb.blockSignals(False)
+        markup_bar.fit_combo(cb)
 
     def _mk_preset_chosen(self, index):
         key = self.mk_preset.itemData(index)
@@ -1106,10 +1106,30 @@ class MarkupMixin:
         self._mk_fill_presets()
         self._mk_sync_preset(self._mk_match_preset())
 
-    def _mk_changed(self):
-        """Isaretleme degisti: sayfayi ve kucuk resmi yenile (paneli bastan kurmadan)."""
-        self.render_current_page()
-        self._update_thumb(self.current_page)
+    def _mk_area(self, m):
+        """Isaretlemenin sayfada kapladigi alan (donmemis sayfa uzayi): PDF nesnelerinin kutulari.
+        Gorunum bu kutularin disina tasamaz -> degisiklikte yalniz burasi yeniden cizilir."""
+        try:
+            page = self.engine.doc[self.current_page]
+            box = fitz.Rect()
+            for x in m["xrefs"]:
+                box |= page.load_annot(x).rect
+            return box if not box.is_empty else None
+        except Exception:
+            return None
+
+    def _mk_changed(self, old=None):
+        """Isaretleme degisti: sayfayi ve kucuk resmi yenile (paneli bastan kurmadan).
+        old: degisiklikten ONCEKI alan (bkz. _mk_area). Verilirse nesne yerinde, kucuk bir ayarla
+        degismistir (surgu, tekerlek, deger yazma): yalniz eski + yeni alan yeniden cizilir, kucuk
+        resim kullanici durunca yenilenir. Her adimda tam sayfa + kucuk resim cizmek surguyu
+        adim basina ~90 ms'ye cikariyordu."""
+        new = self._mk_area(self._mk_sel()) if old is not None and self._mk_sel() is not None else None
+        if old is not None and new is not None and self.render_patch(old | new):
+            self.thumb_later(self.current_page)
+        else:
+            self.render_current_page()
+            self._update_thumb(self.current_page)
         self._update_title()
         self.canvas.update()
 
@@ -1149,6 +1169,7 @@ class MarkupMixin:
             self.mk_text.setPlainText(m["p"].get("text", ""))
         finally:
             self._mk_loading = False
+        self._mk_live_begin(m)
         self._mk_position_editor()
         self.mk_text.show()
         self.mk_text.raise_()
@@ -1164,6 +1185,9 @@ class MarkupMixin:
         m = self._mk_sel()
         if m is None or m["kind"] != "note":
             self.mk_text.hide()
+            return
+        if getattr(self, "_mk_live", False):   # yerinde duzenleme: kutu ekran disinda (yalniz klavye)
+            self.mk_text.setGeometry(-4000, -4000, 60, 30)
             return
         P = m["p"]
         box = pdf_markup.note_geometry(P)[0]
@@ -1183,11 +1207,156 @@ class MarkupMixin:
         ed = getattr(self, "mk_text", None)
         if ed is None or not ed.isVisible():
             return
-        if self._mk_text_timer.isActive():
+        if getattr(self, "_mk_live", False):   # yerinde duzenleme bitti: yaziyi BIR KEZ uygula
+            self._mk_live = False
+            self._mk_live_cache = None
+            self._tx_sel_drag = False
+            self._ghost_end()                  # (orijinal not yeniden gorunur; degistiyse asagida yeniden cizilir)
+            self._mk_text_timer.stop()
+            self._mk_apply_text()
+        elif self._mk_text_timer.isActive():
             self._mk_text_timer.stop()
             self._mk_apply_text()
         ed.hide()
         self.canvas.setFocus()
+
+    # ---------------------------------------------- not: yerinde, canli duzenleme
+    def _mk_live_begin(self, m):
+        """Notu METIN gibi yerinde duzenle (kullanici, 2026-10-12: ustte beyaz kutu, altta
+        notun eski hali cirkin duruyordu). Not sayfadan kaldirilir (nesnesiz arka plan:
+        canvas.bg); yazilan metinle birlikte PDF motoruyla canli cizilir (pdf_markup.preview:
+        kutu, kontur, golge, ok - kaydedilecek olanin aynisi); imlec ve secim notun ustunde,
+        donukse onun acisinda BIZ cizeriz. QTextEdit ekran disinda, yalniz klavye icin.
+        Donuk sayfada / arka plan uretilemezse eski kutuya dusulur (_mk_live False)."""
+        self._mk_live = False
+        self._mk_live_cache = None
+        try:
+            flat = self.engine.doc[self.current_page].rotation == 0
+        except Exception:
+            flat = False
+        if not flat:
+            return
+        self._zoom_flush()
+        self._ghost_end()
+        self._mk_ghost(m)
+        self._mk_live = self.canvas.bg is not None
+        if self._mk_live:
+            self._tx_caret_on = True
+            self._tx_caret_timer.start()
+
+    def _mk_live_refresh(self):
+        """Sayfa yeniden cizildi (yakinlik, stil degisimi): nesnesiz arka plani yeniden kur."""
+        m = self._mk_sel()
+        if m is None or m["kind"] != "note":
+            self._mk_live = False
+            return
+        self._mk_live_cache = None
+        self._mk_ghost(m)
+        if self.canvas.bg is None:             # uretilemedi: eski kutuya don
+            self._mk_live = False
+            self._mk_position_editor()
+
+    def _mk_live_params(self, m):
+        P = dict(m["p"])
+        P["text"] = self.mk_text.toPlainText()
+        return pdf_markup.note_keep_start(m["p"], P)   # donuk not: yazdikca baslangic kaymasin
+
+    def _mk_live_geom(self, P):
+        box, inner, lines, baselines = pdf_markup.note_geometry(P)
+        f, size = pdf_markup.note_font(P), P["size"]
+        _, cen = pdf_markup.frame("note", P)
+        return {"box": box, "inner": inner, "lines": lines, "base": baselines, "size": size,
+                "adv": (lambda t: f.text_length(t, fontsize=size) if t else 0.0),
+                "asc": (f.ascender if f.ascender > 0 else 0.9) * size,
+                "desc": (-f.descender if f.descender < 0 else 0.22) * size,
+                "cen": cen, "ang": pdf_markup.angle_of(P)}
+
+    def _paint_mk_live(self, p, cv, m):
+        P = self._mk_live_params(m)
+        scale = cv.zoom * cv.dpr
+        key = (json.dumps(P, sort_keys=True, default=str), round(scale, 4))
+        c = getattr(self, "_mk_live_cache", None)
+        if c is None or c[0] != key:
+            try:
+                pix, x, y = pdf_markup.preview("note", P, scale)
+                img = QImage(pix.samples, pix.width, pix.height, pix.stride,
+                             QImage.Format_RGBA8888_Premultiplied).copy()
+                pm = QPixmap.fromImage(img)
+                pm.setDevicePixelRatio(cv.dpr)
+                c = (key, pm, x / cv.dpr, y / cv.dpr)
+            except Exception:
+                c = (key, None, 0, 0)
+            self._mk_live_cache = c
+        if c[1] is not None:
+            p.drawPixmap(QPointF(c[2], c[3] + cv.pad_top), c[1])
+        g = self._mk_live_geom(P)
+        cen, z, lines, inner = g["cen"], cv.zoom, g["lines"], g["inner"]
+
+        def L(x, y):                           # sayfa noktasi -> notun yerel ekseni (px, merkeze gore)
+            return QPointF((x - cen.x) * z, (y - cen.y) * z)
+        p.save()
+        p.translate(cv.to_px(cen))
+        p.rotate(g["ang"] + self._disp_angle(cv))
+        box = g["box"]
+        p.setPen(self._pen(QColor(37, 99, 235), 1, Qt.SolidLine, 150))   # duzenlendigini belli eden ince cerceve
+        p.setBrush(Qt.NoBrush)
+        p.drawRoundedRect(QRectF(L(box.x0, box.y0), L(box.x1, box.y1)).adjusted(-2, -2, 2, 2), 3, 3)
+        cur = self.mk_text.textCursor()
+        doc = self.mk_text.document()
+
+        def lc(pos):
+            b = doc.findBlock(pos)
+            return max(0, min(b.blockNumber(), len(lines) - 1)), max(0, pos - b.position())
+        if cur.hasSelection():
+            (l0, c0), (l1, c1) = lc(cur.selectionStart()), lc(cur.selectionEnd())
+            p.setPen(Qt.NoPen)
+            p.setBrush(QColor(37, 99, 235, 90))
+            for ln in range(l0, l1 + 1):
+                a = inner.x0 + (g["adv"](lines[ln][:c0]) if ln == l0 else 0.0)
+                b = inner.x0 + (g["adv"](lines[ln][:c1]) if ln == l1 else g["adv"](lines[ln]) + g["size"] * 0.3)
+                y = g["base"][ln]
+                p.drawRect(QRectF(L(a, y - g["asc"]), L(b, y + g["desc"])))
+        if getattr(self, "_tx_caret_on", True):
+            ln, col = lc(cur.position())
+            x, y = inner.x0 + g["adv"](lines[ln][:col]), g["base"][ln]
+            pen = QPen(QColor(17, 17, 17))
+            pen.setWidthF(max(1.2, min(2.0, g["size"] * z / 14.0)))
+            pen.setCapStyle(Qt.FlatCap)
+            p.setPen(pen)
+            p.drawLine(L(x, y - g["asc"]), L(x, y + g["desc"]))
+        p.restore()
+
+    def _mk_live_pos_at(self, pt):
+        """Sayfa noktasi -> not yazisindaki imlec konumu; notun disindaysa None."""
+        m = self._mk_sel()
+        if m is None:
+            return None
+        g = self._mk_live_geom(self._mk_live_params(m))
+        q = pdf_markup.rot_pt(pt, g["cen"], -g["ang"]) if g["ang"] else fitz.Point(pt)
+        pad = self._tol(8)
+        if not (g["box"] + (-pad, -pad, pad, pad)).contains(q):
+            return None
+        lines, base = g["lines"], g["base"]
+        ln = min(range(len(lines)), key=lambda k: abs((base[k] - g["asc"] / 2 + g["desc"] / 2) - q.y))
+        line = lines[ln]
+        col = min(range(len(line) + 1), key=lambda i: abs(g["inner"].x0 + g["adv"](line[:i]) - q.x))
+        return self.mk_text.document().findBlockByNumber(ln).position() + col
+
+    def _mk_live_click(self, pt, mods, keep=False):
+        """Not yerinde duzenlenirken nota tiklandi: imleci oraya koy (Shift / surukleme: secim).
+        Notun disina tiklandiysa False (cagiran duzenlemeyi bitirir)."""
+        if not (getattr(self, "_mk_live", False) and self.mk_text.isVisible()):
+            return False
+        pos = self._mk_live_pos_at(pt)
+        if pos is None:
+            return False
+        cur = self.mk_text.textCursor()
+        anchor = keep or bool(mods & Qt.ShiftModifier)
+        cur.setPosition(pos, QTextCursor.KeepAnchor if anchor else QTextCursor.MoveAnchor)
+        self.mk_text.setTextCursor(cur)
+        self.mk_text.setFocus()
+        self._tx_caret_moved()
+        return True
 
     # ---------------------------------------------- klavye
     def _mk_key(self, ev):
@@ -1318,10 +1487,16 @@ class MarkupMixin:
             return
         P = dict(m["p"])
         P["angle"] = 0.0 if abs(deg) < 1e-6 else deg
+        old = self._mk_area(m)
         self.engine.update_markup(self.current_page, m["id"], P,
-                                  group=("mkangle", m["id"]) if group else None)
-        self._mk_changed()
-        self._refresh_panel()
+                                  group=("mkangle", m["id"], self._adjust_seq) if group else None)
+        self._mk_changed(old)
+        # Aci kutusu guncel kalsin (tutamacla / dugmeyle dondurmede). Seridin tamami yeniden
+        # kurulmaz: aciyla gorunurluk degismez, ve seridi gizleyip gostermek acik surgu kutusunun
+        # bekleyen cizimini siliyordu (surgude eski + yeni iki nokta).
+        self.mk_angle.blockSignals(True)
+        self.mk_angle.setValue(int(round(deg)))
+        self.mk_angle.blockSignals(False)
 
     def _mk_rotate_by(self, delta):
         m = self._mk_sel()
@@ -1626,7 +1801,7 @@ class MarkupMixin:
             if tool == "line":
                 P["head"] = "none"
             mid = self.engine.add_markup(pno, kind, P)
-            self._mk_after_create(mid, _t("Bulanık alan eklendi — alttaki içerik dosyayı kaydedince kalıcı "
+            self._mk_after_create(mid, _t("Karartma eklendi — alttaki içerik dosyayı kaydedince kalıcı "
                                        "silinir.") if kind == "blur" else
                                   _t("Çizildi — sürükleyerek taşıyın, tutamaçlarla düzenleyin."))
             return
@@ -1810,7 +1985,7 @@ class MarkupMixin:
     def _mk_new_signature(self):
         import signature
         dlg = signature.SignatureDialog(self)
-        if not dlg.exec() or dlg.result_sig is None:
+        if not title_bar.run_modal(dlg) or dlg.result_sig is None:
             return
         sigs = signature.load(self._settings)
         signature.store(self._settings, [dlg.result_sig] + sigs)
@@ -1953,7 +2128,7 @@ class MarkupMixin:
         p.setPen(QPen(QColor(255, 255, 255, 170), 1))
         p.setBrush(Qt.NoBrush)
         p.drawRect(rp)
-        name = {"blur": _t("Bulanıklaştır"), "pixel": _t("Pikselleştir"), "solid": _t("Siyah kutu")}.get(mode, _t("Bulanıklaştır"))
+        name = {"blur": _t("Bulanık"), "pixel": _t("Pikselli"), "solid": _t("Siyah kutu")}.get(mode, _t("Bulanık"))
         text = name + (f" [{level}]" if mode != "solid" else "")
         f = QFont(self.font())
         f.setBold(True)
@@ -2097,7 +2272,12 @@ class MarkupMixin:
                "düzenlenemez, karşı taraf da silemez. (Ctrl+Z ile geri alınabilir.)\n\nDevam edilsin mi?", n=n))
         if r != QMessageBox.Yes:
             return
-        self.engine.flatten_markups()
+        try:
+            self.engine.flatten_markups()
+        except Exception as e:                  # (karartma uygulanamadi: belge eski haline dondu)
+            QMessageBox.critical(self, _t("Hata"), _t("Karartma uygulanamadı; belge değiştirilmedi:\n{e}", e=e))
+            self.after_edit(all_thumbs=True)
+            return
         self.sel_markup = None
         self.after_edit(all_thumbs=True)
         self.status(_t("İşaretlemeler sayfaya işlendi."))
@@ -2367,14 +2547,108 @@ class MarkupMixin:
         pts = d["pts"]
         if len(pts) == 1:
             p.drawPoint(cv.to_px(pts[0]))
-        else:
-            # PDF'e yazilacak egrinin aynisi (yumusatilmis) -> birakinca cizgi zıplamaz
-            if not d.get("straight"):
-                pts = pdf_markup.smooth_points(pts, self._tol(8))
+        elif d.get("straight"):
             path = QPainterPath(cv.to_px(pts[0]))
             for a_, c1, c2, b_ in pdf_markup.smooth_segments(pts):
                 path.cubicTo(cv.to_px(c1), cv.to_px(c2), cv.to_px(b_))
             p.drawPath(path)
+        else:
+            self._paint_free_stroke(p, cv, d, pen)
+
+    def _free_state(self, d, cv):
+        """Cizilmekte olan kalem / fosforlu cizgisinin durumu -> (saklanan durum, yumusatilmis
+        noktalar). Egri PDF'e yazilacak olanin aynisidir (birakinca cizgi ziplamaz) ama her karede
+        bastan kurulmaz: yumusatmanin kesinlesen bas kismi (pdf_markup.StrokeSmoother) ve onun
+        ekran yolu d["_free"]de saklanir. Yakinlik ya da nokta listesi degisirse bastan kurulur."""
+        pts = d["pts"]
+        key = (id(pts), self._tol(8), cv.zoom, cv.pad_top, tuple(cv.disp))
+        c = d.get("_free")
+        if c is None or c["key"] != key or c["fed"] > len(pts):
+            c = d["_free"] = {"key": key, "fed": 0, "sm": pdf_markup.StrokeSmoother(key[1]),
+                              "path": None, "segs": 0, "layer": None, "lkey": None}
+        sm = c["sm"]
+        sm.add(pts[c["fed"]:])
+        c["fed"] = len(pts)
+        S = sm.points()
+        ready = sm.stable() - 2                # (parca i icin S[i-1 .. i+2] kesinlesmis olmali)
+        c["new"] = None                        # bu karede kesinlesen parcalarin yolu (katmana eklenecek)
+        if ready > c["segs"]:
+            if c["path"] is None:
+                c["path"] = QPainterPath(cv.to_px(S[0]))
+            piece = QPainterPath(cv.to_px(S[c["segs"]]))
+            for a_, c1, c2, b_ in pdf_markup.smooth_segments(S, c["segs"], ready):
+                q1, q2, q3 = cv.to_px(c1), cv.to_px(c2), cv.to_px(b_)
+                c["path"].cubicTo(q1, q2, q3)
+                piece.cubicTo(q1, q2, q3)
+            c["segs"], c["new"] = ready, piece
+        return c, S
+
+    def _free_tail(self, c, S, cv):
+        """Henuz kesinlesmemis kuyruk (yeni nokta geldikce degisir)."""
+        tail = QPainterPath(cv.to_px(S[c["segs"]]))
+        for a_, c1, c2, b_ in pdf_markup.smooth_segments(S, c["segs"]):
+            tail.cubicTo(cv.to_px(c1), cv.to_px(c2), cv.to_px(b_))
+        return tail
+
+    def _free_path(self, d, cv):
+        """Cizginin TAMAMININ yolu (kesinlesen kisim + kuyruk)."""
+        c, S = self._free_state(d, cv)
+        path = QPainterPath(c["path"]) if c["path"] is not None else QPainterPath(cv.to_px(S[0]))
+        for a_, c1, c2, b_ in pdf_markup.smooth_segments(S, c["segs"]):
+            path.cubicTo(cv.to_px(c1), cv.to_px(c2), cv.to_px(b_))
+        return path
+
+    def _paint_free_stroke(self, p, cv, d, pen):
+        """Cizgiyi ciz. Uzun cizimde butun yolu her karede yeniden boyamak yavastir (3000 noktada
+        ~70 ms; genis fosforlu kalemde daha cok): kesinlesen kisim gorunen alan boyunda saydam bir
+        KATMANA bir kez boyanir, her karede katman + kisa kuyruk cizilir. Katman opak renkle
+        boyanip saydamlik en sonda verilir: yari saydam kalemde ust uste binen yerler koyulasmaz
+        (tek parca cizimle ayni gorunum)."""
+        c, S = self._free_state(d, cv)
+        vis = cv.visibleRegion().boundingRect()
+        if c["path"] is None or vis.isEmpty():
+            p.drawPath(self._free_tail(c, S, cv))          # (kisa cizim: katmana gerek yok)
+            return
+        col = pen.color()
+        alpha = col.alphaF()
+        solid = QPen(pen)
+        solid.setColor(QColor(col.red(), col.green(), col.blue()))
+        dpr = cv.devicePixelRatioF()
+        lkey = (vis.x(), vis.y(), vis.width(), vis.height(), dpr, pen.widthF(), col.rgb())
+        fresh = c["lkey"] != lkey
+        if fresh:                                          # (ilk kez / gorunen alan ya da kalem degisti)
+            layer = QImage(int(vis.width() * dpr + 0.999), int(vis.height() * dpr + 0.999),
+                           QImage.Format_ARGB32_Premultiplied)
+            layer.setDevicePixelRatio(dpr)
+            layer.fill(Qt.transparent)
+            c["layer"], c["lkey"] = layer, lkey
+        add = c["path"] if fresh else c["new"]
+        if add is not None:
+            lp = QPainter(c["layer"])
+            lp.setRenderHint(QPainter.Antialiasing)
+            lp.translate(-vis.x(), -vis.y())
+            lp.setPen(solid)
+            lp.setBrush(Qt.NoBrush)
+            lp.drawPath(add)
+            lp.end()
+        tail = self._free_tail(c, S, cv)
+        if alpha >= 0.999:
+            p.drawImage(vis.topLeft(), c["layer"])
+            p.drawPath(tail)
+            return
+        frame = c["layer"].copy()                          # (kuyruk katmanla TEK parca gibi birlessin)
+        frame.setDevicePixelRatio(dpr)
+        fp = QPainter(frame)
+        fp.setRenderHint(QPainter.Antialiasing)
+        fp.translate(-vis.x(), -vis.y())
+        fp.setPen(solid)
+        fp.setBrush(Qt.NoBrush)
+        fp.drawPath(tail)
+        fp.end()
+        p.save()
+        p.setOpacity(alpha)
+        p.drawImage(vis.topLeft(), frame)
+        p.restore()
 
     def _paint_markup_overlay(self, p, cv):
         acc = QColor(37, 99, 235)
@@ -2391,6 +2665,9 @@ class MarkupMixin:
                 p.setBrush(Qt.NoBrush)
                 p.drawRect(cv.rect_px(pdf_markup.bbox(m)).adjusted(-4, -4, 4, 4))
         m = self._mk_sel()
+        if m is not None and m["kind"] == "note" and getattr(self, "_mk_live", False):
+            self._paint_mk_live(p, cv, m)      # yerinde duzenleme: not canli, imlec / secim ustunde
+            m = None                           # (yazarken secim cercevesi / tutamaclar cizilmez)
         if m is not None:
             if d and d["moved"] and d["kind"] in ("mkmove", "mkhandle"):
                 P2 = self._mk_drag_params(m, d)

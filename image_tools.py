@@ -22,9 +22,11 @@ from PySide6.QtGui import QImage, QImageReader, QPixmap, QTransform
 from PySide6.QtCore import Qt, QBuffer, QByteArray, QIODevice, QSize
 import fitz
 from i18n import _t
+import safe_write
 from merge_split import (_btn, _icon, _header, _muted_label, _separator, _fmt_size, _color,
                          DropZone, done_box, paint_merge_card, DANGER)
 from reorder_view import ReorderView
+from title_bar import action_buttons, run_modal
 from PySide6.QtGui import QPalette
 
 IMAGE_EXTS = (".png", ".jpg", ".jpeg", ".bmp", ".gif", ".tif", ".tiff", ".webp")
@@ -298,10 +300,9 @@ class ExportPagesDialog(QDialog):
         ft.addStretch()
         cancel = _btn(_t("Vazgeç"))
         cancel.clicked.connect(self.reject)
-        self.btn_ok = _btn(_t("Kaydet"), _icon("fa5s.image", "#ffffff"), "primary")
+        self.btn_ok = _btn(_t("Kaydet"), _icon("fa5s.image", _color(QPalette.BrightText)), "primary")
         self.btn_ok.clicked.connect(self.do_export)
-        ft.addWidget(cancel)
-        ft.addWidget(self.btn_ok)
+        ft.addWidget(action_buttons(self.btn_ok, cancel))
         v.addLayout(ft)
         self._update()
 
@@ -348,9 +349,11 @@ class ExportPagesDialog(QDialog):
             reveal = folder
         QApplication.setOverrideCursor(Qt.WaitCursor)
         try:
-            for p, out in targets:
-                with open(out, "wb") as f:
-                    f.write(page_image_bytes(self.doc, p, dpi, fmt))
+            # (once goruntu hazirlanir, sonra gecici dosyaya yazilir: hazirlama hata verirse var
+            #  olan resim bosalmaz; birden cok sayfada ya hepsi yazilir ya hicbiri)
+            with safe_write.Writer() as w:
+                for p, out in targets:
+                    w.write(out, page_image_bytes(self.doc, p, dpi, fmt))
         except Exception as e:
             QApplication.restoreOverrideCursor()
             QMessageBox.critical(self, _t("Hata"), _t("Resim kaydedilemedi:\n{e}", e=e))
@@ -392,10 +395,9 @@ class ExtractPhotosDialog(QDialog):
         ft.addStretch()
         cancel = _btn(_t("Vazgeç"))
         cancel.clicked.connect(self.reject)
-        self.btn_ok = _btn(_t("Kaydet"), _icon("fa5s.images", "#ffffff"), "primary")
+        self.btn_ok = _btn(_t("Kaydet"), _icon("fa5s.images", _color(QPalette.BrightText)), "primary")
         self.btn_ok.clicked.connect(self.do_extract)
-        ft.addWidget(cancel)
-        ft.addWidget(self.btn_ok)
+        ft.addWidget(action_buttons(self.btn_ok, cancel))
         v.addLayout(ft)
         self._all = None
         self.r_cur.setChecked(True)
@@ -461,9 +463,9 @@ class ExtractPhotosDialog(QDialog):
                 targets.append((_unique(os.path.join(folder, f"{name}_foto_s{it['page'] + 1}_{k}.{ext}")), data))
             reveal = folder
         try:
-            for out, data in targets:
-                with open(out, "wb") as f:
-                    f.write(data)
+            with safe_write.Writer() as w:
+                for out, data in targets:
+                    w.write(out, data)
         except Exception as e:
             QMessageBox.critical(self, _t("Hata"), _t("Fotoğraf kaydedilemedi:\n{e}", e=e))
             return
@@ -580,10 +582,9 @@ class ImagesToPdfDialog(QDialog):
         ft.addStretch()
         cancel = _btn(_t("Vazgeç"))
         cancel.clicked.connect(self.reject)
-        self.btn_make = _btn(_t("PDF oluştur"), _icon("fa5s.file-pdf", "#ffffff"), "primary")
+        self.btn_make = _btn(_t("PDF oluştur"), _icon("fa5s.file-pdf", _color(QPalette.BrightText)), "primary")
         self.btn_make.clicked.connect(self.do_make)
-        ft.addWidget(cancel)
-        ft.addWidget(self.btn_make)
+        ft.addWidget(action_buttons(self.btn_make, cancel))
         v.addLayout(ft)
         if initial:
             self.add_paths(initial)
@@ -650,7 +651,7 @@ class ImagesToPdfDialog(QDialog):
         first = os.path.splitext(paths[0])[0]
         start = first + ".pdf" if n == 1 else os.path.join(os.path.dirname(paths[0]), "resimler.pdf")
         out, _ = QFileDialog.getSaveFileName(self, _t("PDF'i kaydet"), start, _t("PDF Dosyaları (*.pdf)"))
-        if not out:
+        if not out or safe_write.blocked(self, out):           # (hedef bir sekmede acik: yazilmaz)
             return
         size, margin = self.cb_size.currentData(), self.cb_margin.currentData()
         _set(self.settings, "img2pdf_size", size)
@@ -659,11 +660,14 @@ class ImagesToPdfDialog(QDialog):
         QApplication.setOverrideCursor(Qt.WaitCursor)
         try:
             doc, skipped = images_to_pdf(paths, size, margin)
-            if not len(doc):
-                raise ValueError(_t("Hiçbir resim eklenemedi."))
-            doc.save(out, garbage=3, deflate=True)
-            pages = len(doc)
-            doc.close()
+            try:
+                if not len(doc):
+                    raise ValueError(_t("Hiçbir resim eklenemedi."))
+                with safe_write.Writer() as w:
+                    doc.save(w.path(out), garbage=3, deflate=True)
+                pages = len(doc)
+            finally:
+                doc.close()
         except Exception as e:
             QApplication.restoreOverrideCursor()
             QMessageBox.critical(self, _t("Hata"), _t("PDF oluşturulamadı:\n{e}", e=e))
@@ -679,7 +683,7 @@ class ImagesToPdfDialog(QDialog):
         open_btn = box.addButton(_t("Uygulamada aç"), QMessageBox.AcceptRole)
         show = box.addButton(_t("Klasörde göster"), QMessageBox.ActionRole)
         box.addButton(_t("Tamam"), QMessageBox.RejectRole)
-        box.exec()
+        run_modal(box)
         if box.clickedButton() is show:
             from merge_split import reveal
             reveal(out)

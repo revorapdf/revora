@@ -8,10 +8,10 @@ from PySide6.QtWidgets import (
     QDialog, QVBoxLayout, QHBoxLayout, QFormLayout, QLabel, QPushButton, QTextEdit,
     QLineEdit, QDoubleSpinBox, QSpinBox, QCheckBox, QComboBox, QColorDialog,
     QRadioButton, QButtonGroup, QDialogButtonBox, QScrollArea, QWidget, QMessageBox,
-    QProgressDialog, QApplication
+    QProgressDialog, QApplication, QFrame, QSizePolicy
 )
-from PySide6.QtGui import QColor
-from PySide6.QtCore import Qt, Signal
+from PySide6.QtGui import QColor, QCursor, QPainter, QPen
+from PySide6.QtCore import Qt, Signal, QCollator, QLocale, QSize, QEvent, QRectF
 
 from font_resolver import FONT_DISPLAY_NAMES
 from i18n import _t
@@ -277,6 +277,86 @@ def ensure_tesseract_env():
             return
 
 
+# arayuz dili -> Tesseract dil kodu (OCR penceresinde o dil varsayilan olur)
+_UI_TO_OCR = {"tr": "tur", "en": "eng", "de": "deu", "fr": "fra", "es": "spa", "it": "ita",
+              "pt": "por", "pl": "pol", "nl": "nld"}
+
+
+def _ocr_names():
+    """Tesseract dil kodu -> gorunen ad (arayuzun dilinde)."""
+    return {"tur": _t("Türkçe"), "eng": _t("İngilizce"), "deu": _t("Almanca"), "fra": _t("Fransızca"),
+            "spa": _t("İspanyolca"), "ita": _t("İtalyanca"), "por": _t("Portekizce"),
+            "pol": _t("Lehçe"), "nld": _t("Felemenkçe")}
+
+
+def ocr_installed():
+    """Tesseract'ta KURULU dil paketlerinin kodlari (tessdata klasorundeki *.traineddata).
+    Klasor okunamazsa bos liste."""
+    import os
+    try:
+        td = os.environ.get("TESSDATA_PREFIX")
+        if not td or not os.path.isdir(td):
+            import fitz
+            td = fitz.get_tessdata()
+        ext = ".traineddata"
+        return sorted(f[:-len(ext)] for f in os.listdir(td)
+                      if f.endswith(ext) and f[:-len(ext)] not in ("osd", "equ"))
+    except Exception:
+        return []
+
+
+def _ocr_ui(ui_lang=None):
+    import i18n
+    return _UI_TO_OCR.get((ui_lang or i18n.language()).split("-")[0], "eng")
+
+
+def _ocr_have(installed=None):
+    have, seen = [], set()
+    for c in (ocr_installed() if installed is None else installed):
+        if c not in seen:
+            seen.add(c)
+            have.append(c)
+    return have
+
+
+def ocr_choices(ui_lang=None, installed=None):
+    """OCR penceresindeki dil secenekleri: [(gorunen ad, Tesseract dil dizgisi), ...].
+    YALNIZ Tesseract'ta kurulu paketler (kurulu olmayani secmek tanimayi hata ile bitirir) ve,
+    ikisi de kuruluysa, "arayuz dili + Ingilizce" birlesimi (karisik belgeler icin). Siralama:
+    ekranda gorunen ada gore, arayuz dilinin alfabesiyle (Turkcede I / I ayri, Almancada o = o).
+    Adi bilinmeyen paket kod adiyla gorunur. Hangisinin SECILI gelecegi ayri: bkz. ocr_default."""
+    import i18n
+    names = _ocr_names()
+    ui = _ocr_ui(ui_lang)
+    have = _ocr_have(installed)
+    out = [(names.get(c, c), c) for c in have]
+    if ui != "eng" and ui in have and "eng" in have:
+        out.append((names[ui] + " + " + names["eng"], ui + "+eng"))
+    coll = QCollator(QLocale((ui_lang or i18n.language()).replace("-", "_")))
+    coll.setCaseSensitivity(Qt.CaseInsensitive)
+    import functools
+    out.sort(key=functools.cmp_to_key(lambda x, y: coll.compare(x[0], y[0]) or (x[1] > y[1]) - (x[1] < y[1])))
+    return out
+
+
+def ocr_default(ui_lang=None, installed=None):
+    """Pencere acildiginda secili gelecek dil dizgisi (siralamadan bagimsiz): arayuz dili ve
+    Ingilizce kuruluysa birlesimi; yalniz arayuz dili kuruluysa o; arayuz dilinin paketi yoksa
+    Ingilizce; o da yoksa None (kullanici kurulu paketlerden secer)."""
+    ui = _ocr_ui(ui_lang)
+    have = _ocr_have(installed)
+    if ui in have:
+        return ui + "+eng" if ui != "eng" and "eng" in have else ui
+    return "eng" if "eng" in have else None
+
+
+def ocr_missing(ui_lang=None, installed=None):
+    """Arayuz dilinin Tesseract paketi kurulu DEGILSE o dilin gorunen adi (pencerede uyari icin);
+    kuruluysa None."""
+    ui = _ocr_ui(ui_lang)
+    return None if ui in _ocr_have(installed) else _ocr_names().get(ui, ui)
+
+
 class OcrDialog(QDialog):
     def __init__(self, parent, engine, current_page):
         super().__init__(parent)
@@ -292,9 +372,10 @@ class OcrDialog(QDialog):
         v.addWidget(info)
         form = QFormLayout()
         self.lang = QComboBox()
-        self.lang.addItem(_t("Türkçe + İngilizce"), "tur+eng")
-        self.lang.addItem(_t("Türkçe"), "tur")
-        self.lang.addItem(_t("İngilizce"), "eng")
+        choices = ocr_choices()
+        for label, code in choices:
+            self.lang.addItem(label, code)
+        self.lang.setCurrentIndex(max(self.lang.findData(ocr_default()), 0))
         form.addRow(_t("Dil"), self.lang)
         self.dpi = QSpinBox()
         self.dpi.setRange(150, 600)
@@ -305,7 +386,25 @@ class OcrDialog(QDialog):
         self.scope.r_cur.setChecked(True)
         form.addRow(_t("Sayfalar"), self.scope)
         v.addLayout(form)
+        # arayuz dilinin paketi kurulu degilse (Almanca arayuz, Almanca paketi yok) acikca soyle:
+        # yoksa kullanici neden kendi dilini listede goremedigini bilmez, Ingilizceyle tanitir
+        missing = ocr_missing()
+        self.note = None
+        if not choices:
+            self.note = QLabel(_t("Tesseract'ta kurulu dil paketi bulunamadı."))
+        elif missing:
+            self.note = QLabel(_t("Tesseract'ta {lang} dil paketi kurulu değil; bu dildeki belgelerde "
+                                  "tanıma hatalı olabilir.", lang=missing))
+        if self.note is not None:
+            self.note.setWordWrap(True)
+            v.addWidget(self.note)
+        hint = QLabel(_t("Listede olmayan bir dil için Tesseract kurulumunu yeniden çalıştırıp "
+                         "<b>Additional language data</b> altından o dili ekleyin."))
+        hint.setObjectName("fieldLabel")
+        hint.setWordWrap(True)
+        v.addWidget(hint)
         bb = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        bb.button(QDialogButtonBox.Ok).setEnabled(bool(choices))
         bb.button(QDialogButtonBox.Ok).setText(_t("Tanımayı başlat"))
         bb.button(QDialogButtonBox.Cancel).setText(_t("Vazgeç"))
         bb.accepted.connect(self._apply)
@@ -404,7 +503,7 @@ class CompressDialog(QDialog):
 
     def __init__(self, parent, size_text=""):
         super().__init__(parent)
-        self.setWindowTitle(_t("Küçülterek kaydet"))
+        self.setWindowTitle(_t("PDF sıkıştır"))
         self.level = "medium"
         v = QVBoxLayout(self)
         v.setContentsMargins(20, 16, 20, 16)
@@ -426,7 +525,7 @@ class CompressDialog(QDialog):
             lab.setWordWrap(True)
             lab.setContentsMargins(24, 0, 0, 6)
             v.addWidget(lab)
-        note = QLabel(_t("Yazılar ve çizimler etkilenmez. Küçültülmüş belge seçeceğiniz adla kaydedilir; "
+        note = QLabel(_t("Yazılar ve çizimler etkilenmez. Sıkıştırılmış belge seçeceğiniz adla kaydedilir; "
                          "açık kalan belge o olur ve geri alma geçmişi sıfırlanır."))
         note.setWordWrap(True)
         v.addSpacing(4)
@@ -440,56 +539,315 @@ class CompressDialog(QDialog):
         self.setMinimumWidth(440)
 
 
+# ---------------------------------------------------------------- pencere yapi taslari
+def _theme(key, default):
+    """Gecerli temanin rengi (main.DARK); ana pencere yuklu degilse varsayilan."""
+    import sys
+    m = sys.modules.get("main") or sys.modules.get("__main__")
+    try:
+        return m.DARK[key]
+    except Exception:
+        return default
+
+
+def section_label(text):
+    lab = QLabel(text)
+    lab.setObjectName("dlgSection")
+    return lab
+
+
+class FocusRing(QWidget):
+    """KLAVYEYLE gezinirken odaktaki denetimin cevresinde ince halka (pencerenin ustunde, fareyi
+    engellemeyen bir katman). Fareyle tiklayinca cikmaz: yalniz Tab / ok tuslariyla gelen odakta.
+    Tek yerden: dugme, onay kutusu, bolmeli secim ve secim karti ayni gostergeyi alir (stil
+    sayfasindaki ":focus" fare tiklamasinda da yanar ve secili / odakli ayrimini karistirir).
+    owner: pencere. target_of(w): odaktaki denetim icin halkanin saracagi parca (ör. kartin tamami)."""
+
+    KEYBOARD = (Qt.TabFocusReason, Qt.BacktabFocusReason, Qt.ShortcutFocusReason)
+
+    def __init__(self, owner, target_of=None):
+        super().__init__(owner)
+        self._owner, self._target_of, self._target = owner, target_of, None
+        self.setAttribute(Qt.WA_TransparentForMouseEvents, True)
+        self.setFocusPolicy(Qt.NoFocus)
+        self.hide()
+        app = QApplication.instance()
+        if app is not None:
+            app.installEventFilter(self)
+
+    def eventFilter(self, obj, ev):
+        t = ev.type()
+        if t == QEvent.FocusIn and isinstance(obj, QWidget) and obj.window() is self._owner.window() \
+                and obj is not self and self._owner.isAncestorOf(obj):
+            if ev.reason() in self.KEYBOARD and not isinstance(obj, QLineEdit):
+                self._show(obj)
+            else:
+                self.hide()
+        elif t in (QEvent.FocusOut, QEvent.MouseButtonPress) and self.isVisible() and (
+                obj is self._focus or t == QEvent.MouseButtonPress):
+            self.hide()
+        elif t in (QEvent.Resize, QEvent.Move) and self.isVisible() and obj is self._target:
+            self._place()
+        return False
+
+    _focus = None
+
+    def _show(self, w):
+        self._focus = w
+        self._target = (self._target_of(w) if self._target_of else None) or w
+        self._place()
+        self.show()
+        self.raise_()
+
+    def _place(self):
+        t = self._target
+        r = t.rect()
+        if isinstance(t, (QCheckBox, QRadioButton)):          # (satiri degil, kutu + yazisini sar)
+            r.setWidth(min(r.width(), t.sizeHint().width()))
+        r = r.translated(t.mapTo(self._owner, t.rect().topLeft())).adjusted(-4, -3, 4, 3)
+        self._radius = 13 if t.objectName() == "choiceCard" else 7     # (kartin kosesiyle es merkezli)
+        self.setGeometry(r)
+
+    _radius = 7
+
+    def paintEvent(self, _ev):
+        p = QPainter(self)
+        p.setRenderHint(QPainter.Antialiasing)
+        p.setPen(QPen(QColor(_theme("focus", "#5b9cf8")), 1.6))
+        p.setBrush(Qt.NoBrush)
+        p.drawRoundedRect(QRectF(self.rect()).adjusted(1, 1, -1, -1), self._radius, self._radius)
+
+
+class Segmented(QWidget):
+    """Yan yana, biri secili dugmeler (bolmeli secim). buttons: secenek sirasiyla QPushButton.
+    Hucreler ESIT genislikte: genislik yaziya gore degil, en uzun etiketin gerektirdigi kadar ve
+    hepsinde ayni (kullanici 2026-10-13: "yazi boyuna gore hucreler buyuyup kuculuyor, duzensiz").
+    En uzun etiket hangi dilde olursa olsun sigar; yer artarsa hucreler esit buyur."""
+
+    changed = Signal(int)
+
+    def __init__(self, labels, current=0):
+        super().__init__()
+        h = QHBoxLayout(self)
+        h.setContentsMargins(0, 0, 0, 0)
+        h.setSpacing(0)
+        self.group = QButtonGroup(self)
+        self.buttons = []
+        for i, text in enumerate(labels):
+            b = QPushButton(text)
+            b.setObjectName("segL" if i == 0 else ("segR" if i == len(labels) - 1 else "segM"))
+            b.setCheckable(True)
+            b.setCursor(QCursor(Qt.PointingHandCursor))
+            b.setChecked(i == current)
+            b.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+            self.group.addButton(b, i)
+            self.buttons.append(b)
+            h.addWidget(b, 1)
+        self.group.idClicked.connect(self.changed)
+        self.equalize()
+
+    def equalize(self):
+        """Hucre genisligi = en genis etiketin istedigi (stil dolgusu dahil). -> o genislik"""
+        for b in self.buttons:
+            b.setMinimumWidth(0)
+            b.ensurePolished()
+        self.cell = max(b.sizeHint().width() for b in self.buttons) if self.buttons else 0
+        for b in self.buttons:
+            b.setMinimumWidth(self.cell)
+        return self.cell
+
+    def index(self):
+        return self.group.checkedId()
+
+
+class ChoiceCard(QFrame):
+    """"Hangisi?" sorusunun bir secenegi: simge + baslik + tek satir aciklama, sagda secim isareti.
+    Kartin HER yerine tiklanir. Yalniz bu secenege ait bir ayar varsa kartin icinde durur (add_inside)
+    ve kart secili degilken pasiftir: ayarin neye ait oldugu ve su an gecerli olup olmadigi bir
+    bakista gorulur."""
+
+    def __init__(self, icon_name, title, desc):
+        super().__init__()
+        self.setObjectName("choiceCard")
+        self.setAttribute(Qt.WA_Hover, True)
+        self.setCursor(QCursor(Qt.PointingHandCursor))
+        self._icon_name = icon_name
+        self._inside = []
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(14, 12, 14, 12)
+        outer.setSpacing(10)
+        top = QHBoxLayout()
+        top.setSpacing(12)
+        self.icon = QLabel()
+        self.icon.setFixedSize(26, 26)
+        self.icon.setAttribute(Qt.WA_TransparentForMouseEvents, True)
+        top.addWidget(self.icon, 0, Qt.AlignTop)
+        col = QVBoxLayout()
+        col.setSpacing(2)
+        self.title = QLabel(title)
+        self.title.setObjectName("cardTitle")
+        self.desc = QLabel(desc)
+        self.desc.setObjectName("cardDesc")
+        self.desc.setWordWrap(True)
+        for lab in (self.title, self.desc):
+            lab.setAttribute(Qt.WA_TransparentForMouseEvents, True)
+            col.addWidget(lab)
+        top.addLayout(col, 1)
+        self.radio = QRadioButton()                  # secim isareti + klavye (Tab, ok tuslari)
+        self.radio.setCursor(QCursor(Qt.PointingHandCursor))
+        # ekran okuyucu: isaretin yazisi yok, adi ve aciklamasi kartin basligi / aciklamasidir
+        self.radio.setAccessibleName(title)
+        self.radio.setAccessibleDescription(desc)
+        self.setAccessibleName(title)
+        top.addWidget(self.radio, 0, Qt.AlignVCenter)
+        outer.addLayout(top)
+        self._outer = outer
+        self.radio.toggled.connect(self._sync)
+        self._sync(False)
+
+    def add_inside(self, widget):
+        """Yalniz bu secenege ait ayar: aciklamanin altinda, kart secili degilken pasif."""
+        row = QHBoxLayout()
+        row.setContentsMargins(38, 0, 0, 0)          # (simge + bosluk: basligin hizasi)
+        row.addWidget(widget)
+        row.addStretch()
+        self._outer.addLayout(row)
+        self._inside.append(widget)
+        widget.setEnabled(self.radio.isChecked())
+
+    def mousePressEvent(self, ev):
+        if ev.button() == Qt.LeftButton:
+            self.radio.setChecked(True)
+            self.radio.setFocus()
+        super().mousePressEvent(ev)
+
+    def _sync(self, on):
+        for w in self._inside:
+            w.setEnabled(on)
+        for w in (self, self.title):
+            w.setProperty("sel", "true" if on else "false")
+            w.style().unpolish(w)
+            w.style().polish(w)
+        try:
+            import qtawesome as qta
+            col = _theme("accent", "#5b9cf8") if on else _theme("muted", "#8a8a8a")
+            self.icon.setPixmap(qta.icon(self._icon_name, color=col).pixmap(QSize(26, 26)))
+        except Exception:
+            pass
+
+
+class PageScopeBar(QWidget):
+    """PageScope'un bolmeli dugmeli hali: Tum sayfalar | Bu sayfa (n) | Aralik + aralik kutusu.
+    Kutu yalniz "Aralik" seciliyken etkin (pasifken soluk); secilince imlec kutuya gecer."""
+
+    def __init__(self, current, count):
+        super().__init__()
+        self.current, self.count = current, count
+        h = QHBoxLayout(self)
+        h.setContentsMargins(0, 0, 0, 0)
+        h.setSpacing(10)
+        self.seg = Segmented([_t("Tüm sayfalar"), _t("Bu sayfa ({n})", n=current + 1), _t("Aralık")])
+        self.r_all, self.r_cur, self.r_rng = self.seg.buttons
+        self.txt = QLineEdit()
+        self.txt.setObjectName("scopeRange")
+        self.txt.setPlaceholderText(_t("ör. 1-3, 5"))
+        self.txt.setAccessibleName(_t("Aralık"))
+        self.txt.setAccessibleDescription(_t("ör. 1-3, 5"))
+        self.seg.setAccessibleName(_t("Sayfalar"))
+        # DORT ESIT SUTUN: uc dugme + aralik kutusu ayni genislikte ve ayni boyda; satir pencerenin
+        # icerik genisligini tam doldurur (saginda bosluk kalmaz, kartlarin kenarlariyla hizali).
+        self.txt.setMinimumWidth(self.seg.cell)
+        self.txt.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+        self.txt.setFixedHeight(self.r_all.sizeHint().height())
+        h.addWidget(self.seg, 3)
+        h.addWidget(self.txt, 1)
+        self.seg.group.buttonToggled.connect(self._sync)
+        self._sync()
+
+    def _sync(self, *_):
+        on = self.r_rng.isChecked()
+        self.txt.setEnabled(on)
+        if on:
+            self.txt.setFocus()
+
+    def pages(self):
+        if self.r_all.isChecked():
+            return list(range(self.count))
+        if self.r_cur.isChecked():
+            return [self.current]
+        return parse_page_range(self.txt.text(), self.count)
+
+
 # ---------------------------------------------------------------- Excel'e aktar
 class ExportExcelDialog(QDialog):
     """Excel'e aktarma secenekleri.
-    Sonuc: pages(), whole_page, images, single_sheet, numbers, text_tables."""
+    Sonuc: pages(), whole_page, keep_layout, images, single_sheet, numbers, text_tables.
+
+    Duzen (2026-10-13, kullanici: "sezgisel degil, karisik; gecersiz secenekler etkin gibi"):
+    once ASIL karar - ne aktarilsin - uc buyuk kartla (mode: "page" / "layout" / "tables");
+    sonra hangi sayfalar; en altta butun kiplerde ortak ayarlar. Yalniz bir kipe ait ayar o
+    kartin icinde ("tablolar nereye" -> Yalnizca tablolar karti). O an gecerli olmayan her sey
+    pasif ve soluk; pencere kip degisince boy degistirmez."""
+
+    MODES = ("page", "layout", "tables")
 
     def __init__(self, parent, current_page, page_count):
         super().__init__(parent)
+        self.setObjectName("ringDialog")             # (yerel odak cercevesi yerine FocusRing)
         self.setWindowTitle(_t("Excel'e aktar"))
         v = QVBoxLayout(self)
-        v.setContentsMargins(20, 16, 20, 16)
-        v.setSpacing(6)
-        v.addWidget(QLabel(_t("Sayfalar")))
-        self.scope = PageScope(current_page, page_count)
+        v.setContentsMargins(24, 18, 24, 18)
+        v.setSpacing(8)
+
+        # Ilk iki secenek de SAYFANIN TAMAMINI aktarir, ikisinde de hucreler duzenlenebilir; fark
+        # yerlesimde. Basliklar farki, aciklamalar ortak yani soyler ("Sayfanin tamami; ...").
+        v.addWidget(section_label(_t("Aktarım biçimi")))
+        self.card_page = ChoiceCard(
+            "mdi6.text-box-outline", _t("Okunaklı yerleşim"),
+            _t("Sayfanın tamamı; içerik rahat okunan, düzenlenebilir hücrelere yerleşir."))
+        # PDF yerlesimi: sutun / satir olculeri, yazi boyutlari ve baski ayarlari PDF'ten alinir
+        # (pdf_tables.page_layout). Secili degilken eski, okunakli aktarim (page_sheet) calisir.
+        self.card_layout = ChoiceCard(
+            "mdi6.printer-outline", _t("PDF yerleşimini koru"),
+            _t("Sayfanın tamamı; PDF'in ölçüleri ve baskı düzeniyle. Hücreler düzenlenebilir."))
+        self.card_tables = ChoiceCard(
+            "mdi6.table", _t("Yalnızca tablolar"),
+            _t("Yalnız tablolardaki veriler; tablo dışındaki yazılar ve resimler alınmaz."))
+        # ("tek sekmede": "tek sayfada" baski sayfasina sigdirmak diye okunabiliyordu)
+        self.tables_seg = Segmented([_t("Her tablo ayrı sekmede"), _t("Tümü tek sekmede")])
+        self.tables_seg.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Fixed)      # (iki esit hucre, yazi kadar)
+        self.tables_seg.setAccessibleName(_t("Yalnızca tablolar"))
+        self.r_tabs, self.r_one = self.tables_seg.buttons
+        self.card_tables.add_inside(self.tables_seg)
+        self.cards = dict(zip(self.MODES, (self.card_page, self.card_layout, self.card_tables)))
+        g = QButtonGroup(self)
+        for c in self.cards.values():
+            g.addButton(c.radio)
+            v.addWidget(c)
+        self.card_page.radio.setChecked(True)
+
+        v.addSpacing(10)
+        v.addWidget(section_label(_t("Sayfalar")))
+        self.scope = PageScopeBar(current_page, page_count)
         v.addWidget(self.scope)
-        v.addSpacing(8)
-        v.addWidget(QLabel(_t("Ne aktarılsın?")))
-        self.r_page = QRadioButton(_t("Tüm sayfa — yazılar, tablolar ve resimler, sayfadaki yerleşimiyle"))
-        self.r_tables = QRadioButton(_t("Yalnızca tablolar"))
-        self.r_page.setChecked(True)
-        g1 = QButtonGroup(self)
-        for r in (self.r_page, self.r_tables):
-            g1.addButton(r)
-        v.addWidget(self.r_page)
+
+        v.addSpacing(10)
+        v.addWidget(section_label(_t("Seçenekler")))
         self.chk_img = QCheckBox(_t("Resimleri de aktar (logo, fotoğraf, grafik görüntüsü)"))
         self.chk_img.setChecked(True)
-        self.chk_img.setContentsMargins(24, 0, 0, 0)
-        row = QHBoxLayout()
-        row.setContentsMargins(24, 0, 0, 4)
-        row.addWidget(self.chk_img)
-        v.addLayout(row)
-        v.addWidget(self.r_tables)
-        self.r_tabs = QRadioButton(_t("Her tablo ayrı sekmede"))
-        self.r_one = QRadioButton(_t("Hepsi tek sayfada, alt alta"))
-        self.r_tabs.setChecked(True)
-        g2 = QButtonGroup(self)
-        row2 = QHBoxLayout()
-        row2.setContentsMargins(24, 0, 0, 4)
-        for r in (self.r_tabs, self.r_one):
-            g2.addButton(r)
-            row2.addWidget(r)
-        row2.addStretch()
-        v.addLayout(row2)
-        v.addSpacing(8)
         self.chk_num = QCheckBox(_t("Sayıları sayı olarak aktar (toplanabilir, sıralanabilir)"))
         self.chk_num.setChecked(True)
-        v.addWidget(self.chk_num)
         self.chk_text = QCheckBox(_t("Çizgisiz tabloları da ara (deneysel; yanlış sonuç verebilir)"))
-        v.addWidget(self.chk_text)
+        opts = QVBoxLayout()
+        opts.setSpacing(9)
+        opts.setContentsMargins(2, 2, 0, 0)
+        for w in (self.chk_img, self.chk_num, self.chk_text):
+            opts.addWidget(w)
+        v.addLayout(opts)
+
+        v.addSpacing(6)
         self.note = QLabel()
-        self.note.setObjectName("fieldLabel")
+        self.note.setObjectName("dlgNote")           # (neyin AKTARILMADIGINI soyler: okunur olmali)
         self.note.setWordWrap(True)
         self.note.setMinimumHeight(self.note.fontMetrics().lineSpacing() * 2)
         self.note.setAlignment(Qt.AlignLeft | Qt.AlignTop)
@@ -500,20 +858,49 @@ class ExportExcelDialog(QDialog):
         bb.accepted.connect(self._apply)
         bb.rejected.connect(self.reject)
         v.addWidget(bb)
-        self.setMinimumWidth(500)
+        self.setMinimumWidth(640)
         self._pages = []
-        self.r_page.toggled.connect(self._sync)
+        g.buttonToggled.connect(self._sync)
         self._sync()
+        # klavye odagi: kartin isaretinde degil KARTIN cevresinde gosterilir
+        by_radio = {c.radio: c for c in self.cards.values()}
+        self.focus_ring = FocusRing(self, lambda w: by_radio.get(w))
+
+    def _even_cards(self):
+        """Kart aciklamalari ESIT yukseklikte: bir dilde biri iki satira inerse hepsine iki satirlik
+        yer ayrilir -> ilk iki kart ayni boyda kalir (yoksa kartlar dilden dile duzensiz boylanir)."""
+        descs = [c.desc for c in self.cards.values()]
+        w = min(d.width() for d in descs)
+        if w <= 0:
+            return
+        h = max(d.heightForWidth(w) for d in descs)
+        if any(d.minimumHeight() != h for d in descs):
+            for d in descs:
+                d.setAlignment(Qt.AlignLeft | Qt.AlignTop)
+                d.setMinimumHeight(h)
+
+    def showEvent(self, ev):
+        super().showEvent(ev)
+        self._even_cards()
+
+    def resizeEvent(self, ev):
+        super().resizeEvent(ev)
+        self._even_cards()
+
+    @property
+    def mode(self):
+        return next((m for m, c in self.cards.items() if c.radio.isChecked()), "page")
+
+    def set_mode(self, mode):
+        self.cards[mode].radio.setChecked(True)
 
     def _sync(self, *_):
-        whole = self.r_page.isChecked()
-        self.chk_img.setEnabled(whole)
-        self.r_tabs.setEnabled(not whole)
-        self.r_one.setEnabled(not whole)
+        whole = self.mode != "tables"
+        self.chk_img.setEnabled(whole)               # (tablo kipinde resim alinmaz)
         self.note.setText(
-            _t("Her PDF sayfası ayrı bir Excel sekmesi olur. Eğik filigran yazıları ve vektör çizimler aktarılmaz.")
-            if whole else
-            _t("Yalnızca tablolar aktarılır; tablo dışındaki yazılar ve resimler alınmaz."))
+            _t("Her PDF sayfası ayrı bir Excel sekmesi olur. Eğik filigran yazıları ve tablo dışındaki "
+               "çizimler (çizgi, şekil) aktarılmaz.")
+            if whole else "")
 
     def _apply(self):
         try:
@@ -530,7 +917,11 @@ class ExportExcelDialog(QDialog):
 
     @property
     def whole_page(self):
-        return self.r_page.isChecked()
+        return self.mode != "tables"
+
+    @property
+    def keep_layout(self):
+        return self.mode == "layout"
 
     @property
     def images(self):

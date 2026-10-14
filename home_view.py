@@ -16,34 +16,40 @@ from PySide6.QtWidgets import (QWidget, QFrame, QLabel, QVBoxLayout, QHBoxLayout
 
 import fitz
 from i18n import _t
+from title_bar import run_modal
 
 MAX_SHOWN = 8
 THUMB_H = 150
 
+# renkler temadan (main.DARK): set_colors ile yerinde guncellenir; sablon asagida
+COLORS = {"text": "#ededed", "text2": "#b4b4b4", "muted": "#7a7a7a", "disabled": "#5f5f5f",
+          "tool_hover": "#303030", "bar": "#262626", "sel": "#2e2e2e", "focus_soft": "#565656",
+          "border_input": "#3a3a3a", "bg": "#1b1b1b"}
+
 QSS = """
 #homeRoot, #homeInner { background: transparent; }
-#homeTitle { font-size: 21pt; font-weight: 500; color: #f2f4f8; }
-#homeSub { font-size: 10.5pt; color: #8f959d; }
-#homeSection { font-size: 8.5pt; font-weight: 600; color: #6f7680; letter-spacing: 1.5px; }
-#homeLink { color: #9aa0a6; border: none; background: transparent; font-size: 9pt; padding: 2px 4px; }
-#homeLink:hover { color: #e6e8eb; }
+#homeTitle { font-size: 21pt; font-weight: 500; color: %(text)s; }
+#homeSub { font-size: 10.5pt; color: %(muted)s; }
+#homeSection { font-size: 8.5pt; font-weight: 600; color: %(muted)s; letter-spacing: 1.5px; }
+#homeLink { color: %(text2)s; border: none; background: transparent; font-size: 9pt; padding: 2px 4px; }
+#homeLink:hover { color: %(text)s; }
 #homeGear { border: none; border-radius: 10px; background: transparent; padding: 8px; }
-#homeGear:hover { background: #24262b; }
+#homeGear:hover { background: %(tool_hover)s; }
 /* duz tasarim: kenarlik yok, tek ton yuzey; uzerine gelince bir ton acilir */
-#homeCard, #homeRecent { background: #1d1e22; border: 1px solid #1d1e22; border-radius: 16px; }
-#homeCard:hover, #homeRecent:hover { background: #26282d; border-color: #26282d; }
-#homeCard:focus, #homeRecent:focus { border-color: #4b6ea8; }
-#homeCardTitle { font-size: 11pt; font-weight: 600; color: #eef0f4; background: transparent; }
-#homeCardSub { font-size: 9pt; color: #8f959d; background: transparent; }
+#homeCard, #homeRecent { background: %(bar)s; border: 1px solid %(bar)s; border-radius: 16px; }
+#homeCard:hover, #homeRecent:hover { background: %(sel)s; border-color: %(sel)s; }
+#homeCard:focus, #homeRecent:focus { border-color: %(focus_soft)s; }
+#homeCardTitle { font-size: 11pt; font-weight: 600; color: %(text)s; background: transparent; }
+#homeCardSub { font-size: 9pt; color: %(muted)s; background: transparent; }
 #homeIcon { border-radius: 12px; }
-#homeKey { color: #8f959d; background: transparent; border: 1px solid #3a3d44;
+#homeKey { color: %(muted)s; background: transparent; border: 1px solid %(border_input)s;
            border-radius: 6px; padding: 2px 7px; font-size: 8.5pt; }
-#homeThumb { background: #17181b; border-top-left-radius: 15px; border-top-right-radius: 15px; }
-#homeRecentName { font-size: 10pt; font-weight: 600; color: #e6e8eb; background: transparent; }
-#homeRecentSub { font-size: 8.5pt; color: #7d848f; background: transparent; }
-#homeEmpty { border: 1px dashed #34373e; border-radius: 16px; background: transparent; }
-#homeEmptyText { color: #7d848f; font-size: 10pt; background: transparent; }
-#homeTip { color: #5f666f; font-size: 9pt; }
+#homeThumb { background: %(bg)s; border-top-left-radius: 15px; border-top-right-radius: 15px; }
+#homeRecentName { font-size: 10pt; font-weight: 600; color: %(text)s; background: transparent; }
+#homeRecentSub { font-size: 8.5pt; color: %(muted)s; background: transparent; }
+#homeEmpty { border: 1px dashed %(border_input)s; border-radius: 16px; background: transparent; }
+#homeEmptyText { color: %(muted)s; font-size: 10pt; background: transparent; }
+#homeTip { color: %(disabled)s; font-size: 9pt; }
 """
 
 
@@ -71,6 +77,11 @@ class _Card(QFrame):
 
 
 class ActionCard(_Card):
+    def set_accent(self, color):
+        """Yalniz ikon (cevresinde kutu yok): birincil kartinki vurgu renginde, digerleri notr."""
+        self._tile.setStyleSheet("background: transparent;")
+        self._tile.setPixmap(self._icon_fn(self._icon_name, color).pixmap(QSize(26, 26)))
+
     def __init__(self, icon_fn, icon_name, color, title, sub, primary=False, key=None):
         super().__init__("homeCard")
         self.setProperty("primary", "true" if primary else "false")
@@ -81,13 +92,10 @@ class ActionCard(_Card):
         v.setSpacing(3)
         tile = QLabel()
         tile.setObjectName("homeIcon")
-        tile.setFixedSize(42, 42)
-        tile.setAlignment(Qt.AlignCenter)
-        c = QColor(color)
-        # tek vurgu: yalnizca birincil kartin ikon zemini renkli, digerleri notr
-        tile.setStyleSheet(f"background: rgba({c.red()},{c.green()},{c.blue()},0.16);" if primary
-                           else "background: rgba(255,255,255,0.06);")
-        tile.setPixmap(icon_fn(icon_name, color).pixmap(QSize(22, 22)))
+        tile.setFixedSize(28, 34)
+        tile.setAlignment(Qt.AlignLeft | Qt.AlignVCenter)
+        self._tile, self._icon_fn, self._icon_name, self._primary = tile, icon_fn, icon_name, primary
+        self.set_accent(color)
         top = QHBoxLayout()
         top.setContentsMargins(0, 0, 0, 0)
         top.addWidget(tile)
@@ -157,7 +165,7 @@ class _Thumb(QWidget):
         r = QRectF(self.rect())
         clip.addRoundedRect(r.adjusted(0, 0, 0, 16), 15, 15)     # sadece ust koseler yuvarlak
         p.setClipPath(clip)
-        p.fillRect(self.rect(), QColor("#17181b"))
+        p.fillRect(self.rect(), QColor(COLORS["bg"]))
         if self.pm is not None:
             sz = self.pm.deviceIndependentSize()
             x = (self.width() - sz.width()) / 2
@@ -183,7 +191,7 @@ class RecentCard(_Card):
         v.setContentsMargins(1, 1, 1, 12)
         v.setSpacing(0)
         self.thumb = _Thumb()
-        self.thumb.icon = icon_fn("mdi6.file-pdf-box", "#5b6270")
+        self.thumb.icon = icon_fn("mdi6.file-pdf-box", "#6a6a6a")
         v.addWidget(self.thumb)
         v.addSpacing(10)
         box = QVBoxLayout()
@@ -216,7 +224,7 @@ class RecentCard(_Card):
         a_dir = m.addAction(_t("Klasörünü göster"))
         m.addSeparator()
         a_rm = m.addAction(_t("Listeden kaldır"))
-        a = m.exec(self.mapToGlobal(pos))
+        a = run_modal(m, self.mapToGlobal(pos))
         if a is a_open:
             self.clicked.emit()
         elif a is a_dir:
@@ -265,7 +273,7 @@ class HomeView(QScrollArea):
         self.setWidgetResizable(True)
         self.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
         self.viewport().setAutoFillBackground(False)
-        self.setStyleSheet(QSS)
+        self.setStyleSheet(QSS % COLORS)
         self._cache = {}                 # yol -> (mtime, pixmap, sayfa, kilitli)
         self._cards = []
         self._queue = []
@@ -297,7 +305,7 @@ class HomeView(QScrollArea):
         head.addWidget(logo, 0, Qt.AlignVCenter)
         tv = QVBoxLayout()
         tv.setSpacing(0)
-        t = QLabel("Revora PDF")
+        t = QLabel("Revora")
         t.setObjectName("homeTitle")
         s = QLabel(_t("Bir PDF açın ya da aşağıdan bir işlem seçin."))
         s.setObjectName("homeSub")
@@ -307,7 +315,8 @@ class HomeView(QScrollArea):
         if settings_fn is not None:            # acilista ust serit yok: Ayarlar burada
             gear = QToolButton()
             gear.setObjectName("homeGear")
-            gear.setIcon(icon_fn("mdi6.cog-outline", "#9aa0a6"))
+            self._gear, self._icon_fn = gear, icon_fn
+            gear.setIcon(icon_fn("mdi6.cog-outline", "#b4b4b4"))
             gear.setIconSize(QSize(20, 20))
             gear.setCursor(QCursor(Qt.PointingHandCursor))
             gear.setToolTip(_t("Ayarlar (Ctrl+,)"))
@@ -349,7 +358,7 @@ class HomeView(QScrollArea):
         el = QVBoxLayout(self.empty)
         el.setAlignment(Qt.AlignCenter)
         ei = QLabel()
-        ei.setPixmap(icon_fn("mdi6.tray-arrow-down", "#5b6270").pixmap(QSize(30, 30)))
+        ei.setPixmap(icon_fn("mdi6.tray-arrow-down", "#6a6a6a").pixmap(QSize(30, 30)))
         ei.setAlignment(Qt.AlignCenter)
         et = QLabel(_t("Açtığınız dosyalar burada görünecek.\n"
                        "Bir PDF ya da resmi pencereye sürükleyip bırakabilirsiniz."))
@@ -379,6 +388,17 @@ class HomeView(QScrollArea):
         return l
 
     # ---------------------------------------------------------------- icerik
+    def set_colors(self, colors, accent):
+        """Tema degisti: renkleri yerinde guncelle (kartlar ve onizleme zemini ayni sozlugu okur)."""
+        COLORS.update({k: colors[k] for k in COLORS if k in colors})
+        self.setStyleSheet(QSS % COLORS)
+        for card in self.findChildren(ActionCard):
+            card.set_accent(accent if card._primary else COLORS["text2"])
+        gear = getattr(self, "_gear", None)
+        if gear is not None:
+            gear.setIcon(self._icon_fn("mdi6.cog-outline", COLORS["text2"]))
+        self.viewport().update()
+
     def refresh(self):
         """Son dosyalar listesini yeniden kur (ekran her gosterildiginde)."""
         for c in self._cards:

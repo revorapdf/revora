@@ -116,6 +116,12 @@ def move(doc, page, indices, dx, dy):
     return _apply(doc, page, {i: D for i in indices})
 
 
+def transform(doc, page, indices, matrix):
+    """Resimleri sayfa uzayinda matrix ile donustur (toplu secimi ortak merkez etrafinda dondurme)."""
+    D = fitz.Matrix(matrix)
+    return _apply(doc, page, {i: D for i in indices})
+
+
 def scale(doc, page, index, old, new):
     """Resmi old sinir kutusundan new sinir kutusuna tasi / boyutlandir."""
     old, new = fitz.Rect(old), fitz.Rect(new)

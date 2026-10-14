@@ -15,9 +15,9 @@ Birlesik baslik cubugu: Windows'un baslik seridi yerine uygulamanin kendi seridi
 Renkler main.py'deki tema sozlugunden (DARK / LIGHT) alinir: set_colors().
 """
 # import sirasi kurali: PySide6, fitz'ten once (bu modul fitz kullanmiyor)
-from PySide6.QtWidgets import QWidget, QHBoxLayout, QAbstractButton, QToolTip, QDialog
+from PySide6.QtWidgets import QWidget, QHBoxLayout, QAbstractButton, QToolTip, QDialog, QDialogButtonBox
 from PySide6.QtGui import QPainter, QColor, QPen, QPixmap, QFont, QPainterPath
-from PySide6.QtCore import Qt, Signal, QRect, QRectF, QPoint, QPointF, QSize, QEvent, QObject
+from PySide6.QtCore import Qt, Signal, QRect, QRectF, QPoint, QPointF, QSize, QEvent, QObject, QTimer
 import win_frame
 from i18n import _t
 
@@ -25,13 +25,50 @@ BAR_H = 40          # serit yuksekligi
 TAB_H = 32          # sekme yuksekligi (alta yasli; ustte pencereyi boyutlandirma payi kalir)
 HOME_W = 46         # logo (baslangic) dugmesinin kapladigi genislik
 PLUS_W = 38         # "+" dugmesinin kapladigi genislik
-TAB_MAX = 210
+TAB_MAX = 226
+TAB_LEAD = -1       # ilk sekme sol menunun kenar cizgisine YAPISIK baslar (sol kenari o cizginin devami)
+CORNER_R = 9        # ilk sekme secili degilken arac cubugunun sol ust kosesindeki kavis (CornerPiece)
 TAB_MIN = 44
 DRAG_MIN = 90       # sekmeler ne kadar cogalirsa cogalsin surukleme icin kalan bos alan
 BTN_W = 46          # pencere dugmesi genisligi (Windows olcusu)
 
-_DEFAULT = {"bg": "#17181b", "surface": "#26282c", "border": "#33363c", "text": "#e6e8eb",
-            "text2": "#c4c8d0", "muted": "#9aa0a6", "tool_hover": "#2f3238", "tool_press": "#33373d"}
+_DEFAULT = {"bg": "#1b1b1b", "surface": "#2c2c2c", "border": "#323232", "text": "#ededed",
+            "text2": "#b4b4b4", "muted": "#7a7a7a", "tool_hover": "#303030", "tool_press": "#363636",
+            "side": "#212121", "bar": "#262626"}
+BACK_W = 96         # acilis ekraninda "Geri" dugmesinin genisligi
+
+
+class LogoCache:
+    """Logonun EKRANA GIDECEK hali: kaynak (256 x 256), cizilecegi fiziksel boyuta (mantiksal boyut
+    x ekran olcegi) bir kez SmoothTransformation ile kucultulur ve saklanir.
+    Kaynagi dogrudan 19 x 19'a cizdirmek (drawPixmap, 13 kat kucultme) kenarlari basamakli
+    yapiyordu: boyayici o oranda yalniz komsu pikselleri karistirir, aradaki 12 pikseli atlar.
+    pixmap(olcek): olcek degismedikce AYNI nesneyi verir (her cizimde yeniden olcekleme yok);
+    pencere baska olcekli ekrana gecince yenisi hazirlanir."""
+
+    def __init__(self, source, size):
+        self.source, self.size = source, size
+        self._dpr, self._pm = None, None
+
+    def pixmap(self, dpr):
+        if self._pm is None or self._dpr != dpr:
+            px = max(1, int(round(self.size * dpr)))
+            im = self.source.toImage().scaled(px, px, Qt.IgnoreAspectRatio, Qt.SmoothTransformation)
+            pm = QPixmap.fromImage(im)
+            pm.setDevicePixelRatio(dpr)
+            self._dpr, self._pm = dpr, pm
+        return self._pm
+
+    def draw(self, p, x, y, dpr):
+        """Logoyu (x, y) noktasina ciz. Hazir pixmap ekran pikseliyle BIRE BIR konur (yeniden
+        olceklenmez, ekran pikseline oturur): %125 / %150 gibi kesirli olceklerde ikinci bir
+        yumusatma bulaniklik yapardi. Boyut tam ekran pikseline yuvarlandigi icin mantiksal olcu
+        o olceklerde 19 yerine 19,2 / 18,7 olur (gozle ayirt edilmez)."""
+        pm = self.pixmap(dpr)
+        smooth = p.testRenderHint(QPainter.SmoothPixmapTransform)
+        p.setRenderHint(QPainter.SmoothPixmapTransform, False)
+        p.drawPixmap(QPointF(x, y), pm)
+        p.setRenderHint(QPainter.SmoothPixmapTransform, smooth)
 
 
 class TabStrip(QWidget):
@@ -40,6 +77,9 @@ class TabStrip(QWidget):
     moved = Signal(int, int)                # (eski_sira, yeni_sira): surukleyerek siralandi
     newRequested = Signal()                 # "+"
     contextRequested = Signal(int, QPoint)  # sag tik: (sekme, ekran konumu)
+    backRequested = Signal()                # acilis ekranindaki "Geri": acik belgeye don
+    cornerChanged = Signal(bool)            # arac cubugunun sol ust kosesi kavisli mi (bkz. CornerPiece)
+    hoverChanged = Signal()                 # fare baska bir sekmenin / dugmenin ustune gecti
 
     def __init__(self, logo_path, parent=None):
         super().__init__(parent)
@@ -51,6 +91,11 @@ class TabStrip(QWidget):
         self._press = None                  # (sekme, basilan x)
         self._drag = None                   # {"i": sekme, "grab": sekme icinde tutulan x, "x": sol kenar}
         self._logo = QPixmap(logo_path)
+        self._logo_cache = LogoCache(self._logo, 19)
+        self.home_w = HOME_W                # logo (baslangic) dugmesinin genisligi; genisse yaninda marka adi
+        self.logo_external = False          # True: logoyu LogoPiece cizer (serit yalniz tiklamayi alir)
+        self.logo_x = 20                    # o durumda logonun sol kenari (tiklama alani icin)
+        self.logo_w = 19                    # ... ve genisligi (yaninda marka adi varsa o dahil)
         self.setMouseTracking(True)
         self.setFixedHeight(BAR_H)
         self._relayout()
@@ -77,7 +122,14 @@ class TabStrip(QWidget):
     def set_current(self, i):
         if i != self.current:
             self.current = i
-            self.update()
+            self._relayout()
+            if self.parentWidget() is not None:
+                self.parentWidget().update()        # (serit zemini acilis ekraninda farkli)
+
+    def home_mode(self):
+        """ACILIS EKRANI: sekmeler ve "+" gorunmez (acilis ayri bir ekran; kullanici: "ust
+        sekmeleri niye goruyorum"). Acik belge varsa solda "Geri" dugmesi."""
+        return self.current == -1
 
     def count(self):
         return len(self.tabs)
@@ -85,6 +137,12 @@ class TabStrip(QWidget):
     def set_colors(self, colors):
         self.colors = {**_DEFAULT, **colors}
         self.update()
+
+    def set_home_width(self, w):
+        """Marka alani (logo + ad): sol menuyle ayni genislikte tutulur, sekmeler onun saginda baslar."""
+        if w != self.home_w:
+            self.home_w = int(w)
+            self._relayout()
 
     def set_available(self, width):
         if width != self._avail:
@@ -96,30 +154,39 @@ class TabStrip(QWidget):
         n = len(self.tabs)
         if not n:
             return 0
-        return int(max(TAB_MIN, min(TAB_MAX, (self._avail - HOME_W - PLUS_W) / n)))
+        return int(max(TAB_MIN, min(TAB_MAX, (self._avail - self.home_w - PLUS_W) / n)))
 
     def _relayout(self):
-        self.setFixedWidth(HOME_W + len(self.tabs) * self.tab_w() + PLUS_W)
+        if self.home_mode():
+            self.setFixedWidth(BACK_W + 16 if self.tabs else 1)
+        else:
+            self.setFixedWidth(self.home_w + TAB_LEAD + len(self.tabs) * self.tab_w() + PLUS_W)
         self.update()
 
     def home_rect(self):
-        return QRect(6, (BAR_H - 30) // 2 + 2, 34, 30)
+        if self.home_mode():                 # "Geri" dugmesi
+            return QRect(8, (BAR_H - 30) // 2 + 1, BACK_W, 30)
+        if self.logo_external:               # logo ayri parca (LogoPiece): tiklama alani onun cevresi
+            return QRect(max(0, self.logo_x - 7), 8, self.logo_w + 14, BAR_H - 8)
+        return QRect(max(2, min(11, (self.home_w - 36) // 2)), (BAR_H - 30) // 2 + 1, 36, 30)
 
     def tab_rect(self, i):
-        return QRect(HOME_W + i * self.tab_w(), BAR_H - TAB_H, self.tab_w(), TAB_H)
+        return QRect(self.home_w + TAB_LEAD + i * self.tab_w(), BAR_H - TAB_H, self.tab_w(), TAB_H)
 
     def close_rect(self, i):
         r = self.tab_rect(i)
-        return QRect(r.right() - 25, r.center().y() - 9, 18, 18)
+        return QRect(r.right() - 33, r.center().y() - 9, 18, 18)
 
     def plus_rect(self):
-        return QRect(HOME_W + len(self.tabs) * self.tab_w() + 5, (BAR_H - 26) // 2 + 3, 26, 26)
+        return QRect(self.home_w + TAB_LEAD + len(self.tabs) * self.tab_w() + 9, (BAR_H - 26) // 2 + 3, 26, 26)
 
     def _has_close(self, i):
         """Dar sekmede carpiya yer yok: yalnizca secili sekmede gosterilir."""
         return self.tab_w() >= 76 or i == self.current
 
     def hit(self, pos):
+        if self.home_mode():
+            return ("home",) if self.tabs and self.home_rect().contains(pos) else None
         if self.home_rect().adjusted(-4, -4, 4, 6).contains(pos):
             return ("home",)
         if self.plus_rect().adjusted(-3, -3, 3, 3).contains(pos):
@@ -138,7 +205,10 @@ class TabStrip(QWidget):
             return
         if e.button() == Qt.LeftButton:
             if h[0] == "home":
-                self.currentChanged.emit(-1)
+                if self.home_mode():
+                    self.backRequested.emit()
+                else:
+                    self.currentChanged.emit(-1)
             elif h[0] == "plus":
                 self.newRequested.emit()
             elif h[0] == "close":
@@ -164,11 +234,18 @@ class TabStrip(QWidget):
         if h != self._hover:
             self._hover = h
             self.update()
+            self.hoverChanged.emit()
+            if self.logo_external:           # (logonun cevresinde kutu yok: tiklanabildigini imlec soyler)
+                if h == ("home",) and not self.home_mode():
+                    self.setCursor(Qt.PointingHandCursor)
+                else:
+                    self.unsetCursor()
 
     def _drag_to(self, x):
         d, tw, n = self._drag, self.tab_w(), len(self.tabs)
-        d["x"] = max(HOME_W, min(x - d["grab"], HOME_W + (n - 1) * tw))
-        j = max(0, min(n - 1, int((d["x"] - HOME_W + tw / 2) // tw)))
+        x0 = self.home_w + TAB_LEAD
+        d["x"] = max(x0, min(x - d["grab"], x0 + (n - 1) * tw))
+        j = max(0, min(n - 1, int((d["x"] - x0 + tw / 2) // tw)))
         if j != d["i"]:
             i = d["i"]
             self.tabs.insert(j, self.tabs.pop(i))
@@ -203,13 +280,14 @@ class TabStrip(QWidget):
         if self._hover is not None:
             self._hover = None
             self.update()
+            self.hoverChanged.emit()
 
     def event(self, e):
         if e.type() == QEvent.ToolTip:
             h = self.hit(e.pos())
             tip = ""
             if h == ("home",):
-                tip = _t("Başlangıç")
+                tip = _t("Açık belgeye dön") if self.home_mode() else _t("Başlangıç")
             elif h == ("plus",):
                 tip = _t("PDF aç (Ctrl+O)")
             elif h is not None and h[0] == "close":
@@ -225,17 +303,38 @@ class TabStrip(QWidget):
 
     # ---------------------------------------------------------------- cizim
     @staticmethod
-    def _tab_path(r):
-        """Ust koseleri yuvarlak sekme bicimi."""
-        rad = 8.0
-        x0, y0, x1, y1 = r.left(), r.top(), r.right(), r.bottom()
-        p = QPainterPath(QPointF(x0, y1))
-        p.lineTo(x0, y0 + rad)
-        p.quadTo(x0, y0, x0 + rad, y0)
-        p.lineTo(x1 - rad, y0)
-        p.quadTo(x1, y0, x1, y0 + rad)
-        p.lineTo(x1, y1)
-        p.closeSubpath()
+    def _tab_path(r, flare=True, first=False, closed=True):
+        """Sekme bicimi: hafif TRAPEZ (kenarlar capraz iner), ust koseler yuvarlak; flare: alt
+        koseler disa dogru kavisle arac cubuguna akar (secili sekme). Her kose iki dogrunun
+        kesisiminden yuvarlatilir -> egri kiriksiz. first: EN BASTAKI sekmenin sol kenari DUZ
+        (sol menunun kenar cizgisinin devami), yalniz ust kosesi yuvarlak. closed=False: kontur
+        cizgisi icin acik yol (alt kenar yok)."""
+        d, rad = 6.0, 10.0
+        L, Rt, top, b = float(r.left()), float(r.right()), float(r.top()), float(r.bottom())
+        n = (d * d + (b - top) ** 2) ** 0.5
+        ux, uy = d / n, (top - b) / n                  # egik kenar boyunca birim vektor (yukari)
+        p = QPainterPath()
+        if first:
+            p.moveTo(L, b)
+            p.lineTo(L, top + rad)
+            p.quadTo(L, top, L + rad, top)
+        else:
+            if flare:
+                p.moveTo(L - rad, b)
+                p.quadTo(L, b, L + ux * rad, b + uy * rad)
+            else:
+                p.moveTo(L, b)
+            p.lineTo(L + d - ux * rad, top - uy * rad)
+            p.quadTo(L + d, top, L + d + rad, top)
+        p.lineTo(Rt - d - rad, top)
+        p.quadTo(Rt - d, top, Rt - d + ux * rad, top - uy * rad)
+        if flare:
+            p.lineTo(Rt - ux * rad, b + uy * rad)
+            p.quadTo(Rt, b, Rt + rad, b)
+        else:
+            p.lineTo(Rt, b)
+        if closed:
+            p.closeSubpath()
         return p
 
     def paintEvent(self, e):
@@ -244,25 +343,61 @@ class TabStrip(QWidget):
         p.setRenderHint(QPainter.Antialiasing, True)
         p.setRenderHint(QPainter.SmoothPixmapTransform, True)
         hover = self._hover or ()
+        H = float(self.height())
+        # ilk sekme secili (ve suruklenmiyor): sol kenari sol menunun cizgisine yapisik, kose kavisi yok
+        flush = self.current == 0 and not (self._drag and self._drag["i"] == 0)
+        corner = not self.home_mode() and not flush
+        if corner != getattr(self, "_corner_on", None):
+            self._corner_on = corner
+            QTimer.singleShot(0, lambda on=corner: self.cornerChanged.emit(on))
 
         # --- logo: baslangic ekrani
         hr = QRectF(self.home_rect())
-        if self.current == -1 or hover == ("home",):
+        if self.home_mode():                 # acilis ekrani: yalniz "Geri" (acik belge varsa)
+            if self.tabs:
+                if hover == ("home",):
+                    p.setPen(Qt.NoPen)
+                    p.setBrush(QColor(c["tool_hover"]))
+                    p.drawRoundedRect(hr, 8, 8)
+                col = QColor(c["text"] if hover == ("home",) else c["text2"])
+                p.setPen(QPen(col, 1.5, Qt.SolidLine, Qt.RoundCap, Qt.RoundJoin))
+                m = QPointF(hr.left() + 17, hr.center().y())
+                p.drawLine(QPointF(m.x() + 3, m.y() - 5), QPointF(m.x() - 2, m.y()))
+                p.drawLine(QPointF(m.x() - 2, m.y()), QPointF(m.x() + 3, m.y() + 5))
+                bf = QFont(self.font())
+                bf.setPointSizeF(9.5)
+                p.setFont(bf)
+                p.setPen(col)
+                p.drawText(QRectF(hr.left() + 30, hr.top(), hr.width() - 34, hr.height()),
+                           Qt.AlignVCenter | Qt.AlignLeft, _t("Geri"))
+            p.end()
+            return
+        wide = self.home_w >= 48             # (dar menude de kenar cizgisi yukari devam eder)
+        if hover == ("home",) and not self.logo_external:
             p.setPen(Qt.NoPen)
-            p.setBrush(QColor(c["surface"] if self.current == -1 else c["tool_hover"]))
+            p.setBrush(QColor(c["tool_hover"]))
             p.drawRoundedRect(hr, 8, 8)
-        if not self._logo.isNull():
-            s = 20
-            p.drawPixmap(QRectF(hr.center().x() - s / 2, hr.center().y() - s / 2, s, s),
-                         self._logo, QRectF(self._logo.rect()))
+        if not self._logo.isNull() and not self.logo_external:
+            s = self._logo_cache.size
+            self._logo_cache.draw(p, hr.center().x() - s / 2, hr.center().y() - s / 2, self.devicePixelRatioF())
+        # KONTUR: sol menunun kenar cizgisi tepeye CIKMAZ; seridin altindan saga gider, secili
+        # sekmenin cevresinden dolanir (ilk sekme seciliyse dogrudan onun duz sol kenarina baglanir)
+        p.setPen(QPen(QColor(c["border"]), 1))
+        p.drawLine(QPointF(self.home_w - 0.5 if flush else self.home_w + CORNER_R - 1, H - 0.5),
+                   QPointF(self.width(), H - 0.5))
 
         # --- sekmeler (suruklenen en ustte)
         f = QFont(self.font())
         f.setPointSizeF(9.0)
         p.setFont(f)
-        order = [i for i in range(len(self.tabs)) if not (self._drag and self._drag["i"] == i)]
+        # sira: once secili olmayanlar (uzerine gelinenin dolgusu secili sekmenin kavisini ortmesin),
+        # sonra secili sekme, en ustte suruklenen
+        drag_i = self._drag["i"] if self._drag else -1
+        order = [i for i in range(len(self.tabs)) if i != drag_i and i != self.current]
+        if 0 <= self.current < len(self.tabs) and self.current != drag_i:
+            order.append(self.current)
         if self._drag:
-            order.append(self._drag["i"])
+            order.append(drag_i)
         tw = self.tab_w()
         for i in order:
             title, _tip, dirty = self.tabs[i]
@@ -271,10 +406,28 @@ class TabStrip(QWidget):
                 r.moveLeft(self._drag["x"])
             sel = i == self.current
             hov = len(hover) == 2 and hover[1] == i
-            if sel or hov:
+            if sel:
+                first = i == 0 and flush
+                # (yarim piksele oturtulur: 1 px kontur keskin; alt kenar seridin alt cizgisinde)
+                s = QRectF(r.left() + (0.5 if first else 1.5), r.top() + 0.5,
+                           r.width() - (2.0 if first else 3.0), H - 1.0 - r.top())
                 p.setPen(Qt.NoPen)
-                p.setBrush(QColor(c["surface"] if sel else c["tool_hover"]))
-                p.drawPath(self._tab_path(r.adjusted(1, 0, -1, 1) if sel else r.adjusted(1, 3, -1, -3)))
+                p.setBrush(QColor(c["bar"]))
+                p.drawPath(self._tab_path(s, first=first))
+                x0 = s.left() + 0.5 if first else s.left() - 10.0       # sekmenin altinda cizgi yok
+                p.fillRect(QRectF(x0, H - 1.0, s.right() + 10.0 - x0, 1.0), QColor(c["bar"]))
+                p.setBrush(Qt.NoBrush)
+                p.setPen(QPen(QColor(c["border"]), 1))
+                p.drawPath(self._tab_path(s, first=first, closed=False))
+            elif hov:
+                # uzerine gelinen sekme: secili sekmeyle AYNI boy, alt cizgiye kadar dolu (altta bos
+                # serit kalmaz); en bastaki sekmenin sol kenari burada da duz
+                first = i == 0 and not (self._drag and self._drag["i"] == 0)
+                s = QRectF(r.left() + (0.5 if first else 1.5), r.top() + 0.5,
+                           r.width() - (2.0 if first else 3.0), H - 1.5 - r.top())
+                p.setPen(Qt.NoPen)
+                p.setBrush(QColor(c["tool_hover"]))
+                p.drawPath(self._tab_path(s, flare=False, first=first))
             elif i + 1 != self.current and i + 1 < len(self.tabs) and not (len(hover) == 2 and hover[1] == i + 1):
                 p.setPen(QPen(QColor(c["border"]), 1))          # komsu sekmeler arasi ince ayirac
                 p.drawLine(QPointF(r.right(), r.top() + 9), QPointF(r.right(), r.bottom() - 8))
@@ -282,11 +435,11 @@ class TabStrip(QWidget):
             show_dot = dirty and not (show_x and hover == ("close", i))
             pad_r = 30 if (show_x or dirty) and tw >= 60 else 10
             p.setPen(QColor(c["text"] if sel else c["muted"]))
-            tr = r.adjusted(12, 0, -pad_r, 0)
+            tr = r.adjusted(20, 0, -pad_r - 6, 0)
             if tr.width() > 14:
                 p.drawText(tr, Qt.AlignVCenter | Qt.AlignLeft,
                            p.fontMetrics().elidedText(title, Qt.ElideRight, int(tr.width())))
-            cr = QRectF(r.right() - 25, r.center().y() - 9, 18, 18)
+            cr = QRectF(r.right() - 33, r.center().y() - 9, 18, 18)
             if show_dot and (tw >= 60 or sel):
                 p.setPen(Qt.NoPen)
                 p.setBrush(QColor(c["text2"] if sel else c["muted"]))
@@ -420,13 +573,162 @@ class TitleBar(QWidget):
 
     def paintEvent(self, e):
         p = QPainter(self)
-        p.fillRect(self.rect(), QColor(self.colors["bg"]))
+        # acilis ekraninda serit o ekranin PARCASI (ayni zemin; pencere dugmeleri ona ait gorunur)
+        p.fillRect(self.rect(), QColor(self.colors["bg" if self.strip.home_mode() else "side"]))
+        if not self.strip.home_mode():       # kontur sekmelerin saginda da seridin altindan devam eder
+            p.setPen(QPen(QColor(self.colors["border"]), 1))
+            y = self.height() - 0.5
+            p.drawLine(QPointF(self.strip.geometry().right(), y), QPointF(self.width(), y))
+        p.end()
+
+
+class LogoPiece(QWidget):
+    """Sol ustteki logo. Ustteki boslugu soldaki bosluguna ESIT olsun diye baslik seridinin (40 px)
+    ortasinda degil, daha asagida durur ve seridin altina biraz tasar; o yuzden seridin icinde
+    cizilmez, ustte duran ayri bir parcadir. Fareyi engellemez (tiklama alttaki seride gecer).
+    Yeri: place(sol, ust) = gorselin DOLU kisminin (murekkebinin) sol ve ust kenari."""
+    S = 19
+
+    def __init__(self, parent, strip):
+        super().__init__(parent)
+        self._pm = strip._logo
+        self._cache = LogoCache(self._pm, self.S)      # (ekran olcegine gore hazir, yumusak kucultulmus)
+        self._strip = strip                  # (renkler: yazi rengi temadan)
+        self._name = ""                      # logonun yanindaki marka adi (dar menude bos)
+        self.setAttribute(Qt.WA_TransparentForMouseEvents, True)
+        self.setFixedSize(self.S + 3, self.S + 3)
+        self._fx = self._fy = 0.0
+        # gorselin kenarinda saydam pay olabilir: dolu kismin basladigi yer (S x S olceginde)
+        self._ink = (0, 0)
+        if not self._pm.isNull():
+            im = self._pm.toImage().scaled(self.S, self.S, Qt.IgnoreAspectRatio, Qt.SmoothTransformation)
+            xs = [x for x in range(im.width()) if any(im.pixelColor(x, y).alpha() > 110 for y in range(im.height()))]
+            ys = [y for y in range(im.height()) if any(im.pixelColor(x, y).alpha() > 110 for x in range(im.width()))]
+            if xs and ys:
+                self._ink = (xs[0], ys[0])
+        self.hide()
+
+    def _font(self):
+        f = QFont(self.font())
+        f.setPointSizeF(11.5)
+        f.setWeight(QFont.DemiBold)
+        return f
+
+    def set_name(self, text):
+        """Logonun yanina marka adi (genis menude "Revora"; dar menude bos = yalniz logo)."""
+        if text != self._name:
+            self._name = text
+            from PySide6.QtGui import QFontMetrics
+            extra = (10 + QFontMetrics(self._font()).horizontalAdvance(text) + 4) if text else 0
+            self.setFixedSize(self.S + 3 + extra, self.S + 3)
+            self.update()
+
+    def place(self, left, top):
+        x, y = left - self._ink[0], top - self._ink[1]
+        self.move(int(x), int(y))
+        self._fx, self._fy = x - int(x), y - int(y)
+        self.update()
+
+    def paintEvent(self, e):
+        if self._pm.isNull():
+            return
+        p = QPainter(self)
+        p.setRenderHint(QPainter.SmoothPixmapTransform, True)
+        self._cache.draw(p, self._fx, self._fy, self.devicePixelRatioF())
+        if self._name:
+            p.setFont(self._font())
+            p.setPen(QColor(self._strip.colors.get("text", "#ededed")))
+            p.drawText(QRectF(self._fx + self.S + 10, self._fy - 1, self.width(), self.S + 1),
+                       Qt.AlignVCenter | Qt.AlignLeft, self._name)
+        p.end()
+
+
+class CornerPiece(QWidget):
+    """Arac cubugunun SOL UST kosesindeki kavis. Ilk sekme secili degilken kontur, sol menunun
+    kenar cizgisinden yukari cikip burada saga doner (seridin altindan sekmelere dogru). Kavis
+    baslik seridinin son satiri ile sol menunun son sutununa tasar; o yuzden ayri, ustte duran
+    kucuk bir parca (fareyi engellemez). Yeri: arac cubugunun sol ust kosesinin 1 px sol ustu."""
+    SIZE = CORNER_R + 1
+
+    def __init__(self, parent, bar):
+        super().__init__(parent)
+        self._bar = bar                      # TitleBar: renkleri ondan okur
+        bar.strip.hoverChanged.connect(self.update)
+        self.setAttribute(Qt.WA_TransparentForMouseEvents, True)
+        self.setFixedSize(self.SIZE, self.SIZE)
+        self.hide()
+
+    def paintEvent(self, e):
+        c = self._bar.colors
+        r, n = float(CORNER_R), float(self.SIZE)
+        p = QPainter(self)
+        p.setRenderHint(QPainter.Antialiasing, True)
+        p.fillRect(self.rect(), QColor(c["side"]))
+        path = QPainterPath(QPointF(0.5, n))
+        path.lineTo(0.5, r + 0.5)
+        path.quadTo(0.5, 0.5, r + 0.5, 0.5)
+        path.lineTo(n, 0.5)
+        fill = QPainterPath(path)
+        fill.lineTo(n, n)
+        fill.closeSubpath()
+        # ilk sekmenin uzerine gelindiginde dolgusu kavisin DISINDAKI koseyi de doldurur (yoksa
+        # sekmenin sol altinda, yuvarlak kosenin ustunde koyu bir bosluk kaliyordu)
+        strip = self._bar.strip
+        h = strip._hover
+        if h is not None and h[0] in ("tab", "close") and h[1] == 0 and not strip._drag:
+            wedge = QPainterPath()
+            wedge.addRect(QRectF(0.5, 0.0, n - 0.5, n))
+            p.setPen(Qt.NoPen)
+            p.setBrush(QColor(c["tool_hover"]))
+            p.drawPath(wedge.subtracted(fill))
+        p.setPen(Qt.NoPen)
+        p.setBrush(QColor(c["bar"]))
+        p.drawPath(fill)
+        p.setBrush(Qt.NoBrush)
+        p.setPen(QPen(QColor(c["border"]), 1))
+        p.drawPath(path)
         p.end()
 
 
 # =====================================================================================
 # Iletisim kutulari (Ayarlar, soru kutulari, Birlestir ...): ayni duz baslik
 # =====================================================================================
+def run_modal(win, *args):
+    """Kipli pencereyi ya da sag tik menusunu calistirir (exec) ve kapaninca BELLEKTEN
+    KALDIRIR. Duz "pencere.exec" yazma: ana pencerenin cocugu olarak kurulan pencere kapaninca
+    yok olmaz, gorunmeden yasar; gorunum degisince Qt onu da yeniden bicimlendirir. (Ayarlar her
+    acilista 466 parcalik yeni bir kopya birakiyordu: bes ac-kapattan sonra gorunum degistirmek
+    0,2 sn yerine 1,5 sn suruyordu.)
+    Silme ertelenir (deleteLater): cagiran, exec dondukten sonra pencerenin secimlerini okuyabilir;
+    nesne ancak o islem bitip ana dongüye donulunce yok olur. Surekli yasayan menulerde KULLANMA."""
+    try:
+        return win.exec(*args)
+    finally:
+        win.deleteLater()
+
+
+class _ActionButtons(QDialogButtonBox):
+    def __init__(self, primary, cancel):
+        super().__init__()
+        self._primary = primary
+        self.addButton(primary, QDialogButtonBox.AcceptRole)
+        self.addButton(cancel, QDialogButtonBox.RejectRole)
+
+    def showEvent(self, ev):
+        super().showEvent(ev)
+        # Qt, pencerede baska bir dugme varsayilani once kaptiysa islem dugmesine vermez
+        # (PDF bol, Imza): Enter her pencerede ISLEM dugmesidir.
+        self._primary.setDefault(True)
+
+
+def action_buttons(primary, cancel):
+    """Pencerenin altindaki "islem + Vazgec" cifti, PLATFORMUN sirasiyla: Windows'ta islem solda,
+    Vazgec sagda; macOS'ta tersi. Sira elle verilmez -> butun pencereler ve soru kutulari ayni
+    sirayi izler (elle dizilen pencerelerde islem sagda, digerlerinde soldaydi). Dugmeleri
+    cagiran kurar (yazi, ikon, baglanti); islem dugmesi Enter'in varsayilani olur."""
+    return _ActionButtons(primary, cancel)
+
+
 DLG_H = 36          # kutu basliginin yuksekligi
 
 
@@ -450,12 +752,12 @@ class DialogTitle(QWidget):
     def paintEvent(self, e):
         c = self.colors
         p = QPainter(self)
-        p.fillRect(self.rect(), QColor(c["bg"]))
+        p.fillRect(self.rect(), QColor(c["side"]))
         f = QFont(self.font())
-        f.setPointSizeF(9.5)
+        f.setPointSizeF(10.0)
         f.setWeight(QFont.DemiBold)
         p.setFont(f)
-        p.setPen(QColor(c["text2"]))
+        p.setPen(QColor(c["text"]))
         r = self.rect().adjusted(16, 0, -self.btn_close.width() - 8, 0)
         p.drawText(r, Qt.AlignVCenter | Qt.AlignLeft,
                    p.fontMetrics().elidedText(QWidget.windowTitle(self._dlg), Qt.ElideRight, r.width()))
@@ -518,7 +820,8 @@ class DialogChrome(QObject):
                 if t == QEvent.WinIdChange:
                     self._attach(obj)
                 elif t == QEvent.WindowTitleChange:
-                    parts[0].update()
+                    if parts[0] is not None:
+                        parts[0].update()
                 else:
                     self._place(obj)
         return False
@@ -530,29 +833,100 @@ class DialogChrome(QObject):
             resized = W.testAttribute(dlg, Qt.WA_Resized)
             size = W.size(dlg)
             W.setWindowFlag(dlg, Qt.FramelessWindowHint, True)
-            title = DialogTitle(dlg, self.colors)
+            # Ilerleme penceresi (QProgressDialog) parcalarini KENDI yerlestirir, ic bosluklari
+            # dikkate almaz: baslik seridi yazisinin ustune biniyordu (yazi yarim gorunuyordu).
+            # Gecici bir kutu oldugu icin baslik seridi konmaz, yalniz ince cerceve.
+            from PySide6.QtWidgets import QProgressDialog
+            bare = isinstance(dlg, QProgressDialog)
+            title = None if bare else DialogTitle(dlg, self.colors)
             border = _DialogBorder(dlg, self.colors)
             dlg._rv_chrome = (title, border)
-            m = W.contentsMargins(dlg)
-            W.setContentsMargins(dlg, m.left() + 1, m.top() + DLG_H + 1, m.right() + 1, m.bottom() + 1)
-            # baslik artik kutunun ICINDE: elle verilmis boyutlar baslik kadar buyur
-            if W.minimumHeight(dlg) > 0:
-                W.setMinimumHeight(dlg, W.minimumHeight(dlg) + DLG_H)
-            if W.maximumHeight(dlg) < 16777215:
-                W.setMaximumHeight(dlg, W.maximumHeight(dlg) + DLG_H)
-            if resized and size.height() > 0:
-                W.resize(dlg, size.width(), size.height() + DLG_H)
+            if not bare:
+                m = W.contentsMargins(dlg)
+                W.setContentsMargins(dlg, m.left() + 1, m.top() + DLG_H + 1, m.right() + 1, m.bottom() + 1)
+                # baslik artik kutunun ICINDE: elle verilmis boyutlar baslik kadar buyur
+                if W.minimumHeight(dlg) > 0:
+                    W.setMinimumHeight(dlg, W.minimumHeight(dlg) + DLG_H)
+                if W.maximumHeight(dlg) < 16777215:
+                    W.setMaximumHeight(dlg, W.maximumHeight(dlg) + DLG_H)
+                if resized and size.height() > 0:
+                    W.resize(dlg, size.width(), size.height() + DLG_H)
             self._attach(dlg)
             self._place(dlg)
         except Exception:
             pass
+        try:                                   # ana dugme acik dolgulu (QSS: QPushButton#primary)
+            from PySide6.QtWidgets import QDialogButtonBox
+            for bb in QWidget.findChildren(dlg, QDialogButtonBox):
+                for b in bb.buttons():
+                    if bb.buttonRole(b) in (QDialogButtonBox.AcceptRole, QDialogButtonBox.YesRole,
+                                            QDialogButtonBox.ApplyRole) and not b.objectName():
+                        b.setObjectName("primary")
+                        b.style().unpolish(b)
+                        b.style().polish(b)
+        except Exception:
+            pass
+        try:
+            self._modernize(dlg)
+        except Exception:
+            pass
+
+    def _modernize(self, dlg):
+        """Soru / bilgi kutularinda Windows'un eski ikonlari yok (uyari ve hata: duz cizgi ikon);
+        ana dugmeyle ayni satirdaki dugmeler AYNI genislikte (biri uzun biri kisa durmasin)."""
+        from PySide6.QtWidgets import QMessageBox, QPushButton, QBoxLayout
+        if isinstance(dlg, QMessageBox):
+            kind = QMessageBox.icon(dlg)
+            if kind in (QMessageBox.Question, QMessageBox.Information):
+                QMessageBox.setIcon(dlg, QMessageBox.NoIcon)
+            elif kind in (QMessageBox.Warning, QMessageBox.Critical):
+                try:
+                    import qtawesome as qta
+                    col = self.colors.get("danger", "#f07171") if kind == QMessageBox.Critical else "#e0b25a"
+                    QMessageBox.setIconPixmap(dlg, qta.icon("ph.warning-circle", color=col).pixmap(QSize(30, 30)))
+                except Exception:
+                    pass
+            # (ikon degisince Qt yerlesimi YENIDEN kurar: bosluklar ondan sonra verilir)
+            lay = QWidget.layout(dlg)                  # ferah ic bosluk (yazi kenara yapisik durmasin)
+            if lay is not None:
+                lay.setContentsMargins(18, 10, 18, 16)
+                if hasattr(lay, "setVerticalSpacing"):
+                    lay.setVerticalSpacing(12)
+                    lay.setHorizontalSpacing(0 if QMessageBox.iconPixmap(dlg).isNull() else 12)
+
+        def row_of(layout, target):
+            if layout is None:
+                return None
+            for i in range(layout.count()):
+                it = layout.itemAt(i)
+                if it.widget() is target:
+                    return layout
+                if it.layout() is not None:
+                    r = row_of(it.layout(), target)
+                    if r is not None:
+                        return r
+            return None
+
+        for b in QWidget.findChildren(dlg, QPushButton):
+            if b.objectName() != "primary" or b.parentWidget() is None:
+                continue
+            row = row_of(QWidget.layout(b.parentWidget()), b)
+            if not isinstance(row, QBoxLayout) or row.direction() in (QBoxLayout.TopToBottom, QBoxLayout.BottomToTop):
+                continue
+            peers = [row.itemAt(i).widget() for i in range(row.count())]
+            peers = [x for x in peers if isinstance(x, QPushButton) and x.text().strip() and not x.isCheckable()
+                     and x.objectName() in ("", "primary", "danger")]
+            if peers:                          # (tek dugme de cok dar kalmasin)
+                w = max([96] + [x.sizeHint().width() for x in peers])
+                for x in peers:
+                    x.setMinimumWidth(w)
 
     def _attach(self, dlg):
         title = dlg._rv_chrome[0]
         ref = dlg
 
         def caption(pos, t=title):
-            return t.is_caption(t.mapFrom(t.parentWidget(), pos))
+            return t is not None and t.is_caption(t.mapFrom(t.parentWidget(), pos))
 
         def resizable(d=ref):
             return (QWidget.minimumWidth(d) < QWidget.maximumWidth(d)
@@ -564,7 +938,8 @@ class DialogChrome(QObject):
     def _place(dlg):
         title, border = dlg._rv_chrome
         w, h = QWidget.width(dlg), QWidget.height(dlg)
-        title.setGeometry(1, 1, max(0, w - 2), DLG_H)
+        if title is not None:
+            title.setGeometry(1, 1, max(0, w - 2), DLG_H)
+            title.raise_()
         border.setGeometry(0, 0, w, h)
-        title.raise_()
         border.raise_()

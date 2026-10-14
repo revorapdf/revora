@@ -16,6 +16,7 @@ from PySide6.QtWidgets import (QDialog, QVBoxLayout, QHBoxLayout, QPushButton, Q
 from PySide6.QtGui import QPainter, QPen, QColor, QPainterPath, QImage, QPixmap
 from PySide6.QtCore import Qt, QPointF, QRectF, QBuffer, QIODevice, Signal
 from i18n import _t
+from title_bar import action_buttons
 
 MAX_SAVED = 8
 KEY = "signatures"
@@ -206,8 +207,7 @@ class SignatureDialog(QDialog):
         self.b_ok.setObjectName("primary")
         self.b_ok.setEnabled(False)
         self.b_ok.clicked.connect(self._accept)
-        row.addWidget(b_cancel)
-        row.addWidget(self.b_ok)
+        row.addWidget(action_buttons(self.b_ok, b_cancel))
         v.addLayout(row)
         self.pad.changed.connect(lambda: self.b_ok.setEnabled(bool(self.pad.strokes)))
 

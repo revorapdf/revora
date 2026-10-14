@@ -13,7 +13,7 @@ Renkler (0-1 arasi) liste/tuple olarak tasinir; ColorButton ile ayni arayuz:
 from PySide6.QtWidgets import (QToolButton, QFrame, QGridLayout, QVBoxLayout, QPushButton,
                                QColorDialog, QWidget, QHBoxLayout, QLabel, QLayout)
 from PySide6.QtGui import QColor, QPainter, QPen, QPixmap, QIcon, QBrush, QPolygonF, QPainterPath
-from PySide6.QtCore import Qt, Signal, QSize, QRectF, QPoint, QPointF, QObject, QEvent
+from PySide6.QtCore import Qt, Signal, QSize, QRectF, QPoint, QPointF, QObject, QEvent, QTimer
 from i18n import _t
 
 try:
@@ -28,7 +28,71 @@ PALETTE = [
 ]
 PALETTE_NAMES = [_t("Kırmızı"), _t("Turuncu"), _t("Sarı"), _t("Yeşil"), _t("Turkuaz"), _t("Mavi"), _t("Mor"), _t("Pembe"),
                  _t("Siyah"), _t("Koyu gri"), _t("Gri"), _t("Beyaz")]
-ICON_COLOR = {"light": "#3d424a", "dark": "#c4c8d0"}
+ICON_COLOR = {"light": "#3d424a", "dark": "#b4b4b4"}
+ICON_ON = "#ffffff"          # secili (acik) dugmenin ikonu; temaya gore main.set_theme degistirir
+
+# IKON AILESI: Phosphor (qtawesome ile gelir; "ph."). Kod eski adlari (mdi6 / fa5s) kullanmaya
+# devam eder, burada Phosphor karsiligina cevrilir. Karsiligi olmayan ad oldugu gibi kalir.
+# (qtawesome'daki Phosphor eski bir surum: imza, damga, tarama, ayirma ikonlari yok -> en yakini.)
+PH = {
+    "fa5s.arrow-down": "arrow-down", "fa5s.arrow-up": "arrow-up", "fa5s.check": "check", "fa5s.clipboard": "clipboard",
+    "fa5s.columns": "columns", "fa5s.copy": "copy", "fa5s.cut": "scissors", "fa5s.eraser": "eraser",
+    "fa5s.exchange-alt": "arrows-left-right", "fa5s.file": "file", "fa5s.file-image": "image",
+    "fa5s.file-import": "file-arrow-down", "fa5s.file-pdf": "file-pdf", "fa5s.folder-open": "folder-open",
+    "fa5s.image": "image", "fa5s.images": "image-square", "fa5s.info-circle": "info", "fa5s.keyboard": "keyboard",
+    "fa5s.language": "translate", "fa5s.object-group": "selection-all", "fa5s.plus": "plus",
+    "fa5s.redo": "arrow-clockwise", "fa5s.trash": "trash", "fa5s.trash-alt": "trash",
+    "fa5s.undo": "arrow-counter-clockwise",
+    "mdi6.arrow-collapse-horizontal": "arrows-in-line-horizontal", "mdi6.arrow-collapse-vertical": "arrows-in-line-vertical",
+    "mdi6.arrow-expand-horizontal": "arrows-out-line-horizontal", "mdi6.arrow-top-right": "arrow-up-right",
+    "mdi6.blur": "drop-half", "mdi6.box-shadow": "copy-simple", "mdi6.call-merge": "git-merge",
+    "mdi6.call-split": "columns", "mdi6.checkbox-blank-outline": "square", "mdi6.chevron-down": "caret-down",
+    "mdi6.chevron-left": "caret-left", "mdi6.chevron-right": "caret-right", "mdi6.chevron-up": "caret-up",
+    "mdi6.circle-outline": "circle", "mdi6.clipboard-outline": "clipboard", "mdi6.close": "x",
+    "mdi6.cog-outline": "gear-six", "mdi6.content-copy": "copy", "mdi6.content-save-edit-outline": "floppy-disk-back",
+    "mdi6.content-save-outline": "floppy-disk", "mdi6.cursor-default-outline": "cursor", "mdi6.delete-outline": "trash",
+    "mdi6.eraser": "eraser", "mdi6.file-outline": "files", "mdi6.file-pdf-box": "file-pdf",
+    "mdi6.fit-to-page-outline": "frame-corners", "mdi6.folder-open-outline": "folder-open",
+    "mdi6.form-textbox": "check-square-offset", "mdi6.format-align-center": "text-align-center",
+    "mdi6.format-align-left": "text-align-left", "mdi6.format-align-right": "text-align-right",
+    "mdi6.format-bold": "text-bolder", "mdi6.format-color-fill": "paint-bucket", "mdi6.format-italic": "text-italic",
+    "mdi6.format-text": "text-t", "mdi6.format-text-variant-outline": "text-aa",
+    "mdi6.image-multiple-outline": "image-square", "mdi6.image-outline": "image", "mdi6.image-plus-outline": "image",
+    "mdi6.lock-open-variant-outline": "lock-simple-open", "mdi6.lock-outline": "lock-simple",
+    "mdi6.magnify": "magnifying-glass", "mdi6.magnify-minus-outline": "magnifying-glass-minus",
+    "mdi6.magnify-plus-outline": "magnifying-glass-plus", "mdi6.marker": "highlighter-circle",
+    "mdi6.message-text-outline": "chat-text", "mdi6.minus": "line-segment",
+    "mdi6.numeric-1-circle-outline": "number-circle-one", "mdi6.pencil-outline": "pencil-simple", "mdi6.plus": "plus",
+    "mdi6.printer-outline": "printer", "mdi6.rectangle-outline": "rectangle", "mdi6.rotate-left": "arrow-counter-clockwise",
+    "mdi6.rotate-right": "arrow-clockwise", "mdi6.signature-freehand": "pen-nib", "mdi6.square-edit-outline": "note-pencil",
+    "mdi6.stamper": "stack-simple", "mdi6.table-arrow-right": "table", "mdi6.text-box-edit-outline": "note-pencil",
+    "mdi6.text-box-plus-outline": "text-t", "mdi6.text-recognition": "text-aa", "mdi6.tray-arrow-down": "download-simple",
+    "mdi6.watermark": "drop",
+    "rv.magnet": "magnet-straight", "rv.undo": "arrow-u-up-left", "rv.redo": "arrow-u-up-right",
+}
+_PH_OK = {}
+
+
+def ph_name(name):
+    """Eski ikon adi -> ("ph.xxx", "ph.xxx-fill" | None). Phosphor'da yoksa (None, None)."""
+    if name in _PH_OK:
+        return _PH_OK[name]
+    out = (None, None)
+    key = name[3:] if name.startswith("ph.") else PH.get(name)
+    if key and qta is not None:
+        try:
+            qta.icon("ph." + key)
+            fill = None
+            try:
+                qta.icon("ph." + key + "-fill")
+                fill = "ph." + key + "-fill"
+            except Exception:
+                pass
+            out = ("ph." + key, fill)
+        except Exception:
+            pass
+    _PH_OK[name] = out
+    return out
 
 
 def _magnet_pixmap(px, color):
@@ -93,7 +157,56 @@ def _undo_pixmap(px, color, redo=False):
 
 
 # kendi cizdigimiz ikonlar: ad -> cizen islev(px, renk)
+def _sidebar_pixmap(px, color):
+    """Kenar menusunu ac / kapat: kose yuvarlak cerceve + solda dikey bolme cizgisi."""
+    pm = QPixmap(px, px)
+    pm.fill(Qt.transparent)
+    p = QPainter(pm)
+    p.setRenderHint(QPainter.Antialiasing, True)
+    p.scale(px / 24, px / 24)
+    pen = QPen(QColor(color), 1.55)
+    pen.setCapStyle(Qt.RoundCap)
+    pen.setJoinStyle(Qt.RoundJoin)
+    p.setPen(pen)
+    p.setBrush(Qt.NoBrush)
+    p.drawRoundedRect(QRectF(3.5, 4.5, 17, 15), 3.2, 3.2)
+    p.drawLine(QPointF(9.5, 4.5), QPointF(9.5, 19.5))
+    p.end()
+    return pm
+
+
+def _bold_pixmap(px, color):
+    """Kalin "B": hazir ikon ailesindeki B (kalin hali bile) 18 px'te ince duruyor, "kalin"
+    dugmesi oldugu anlasilmiyordu. Agir bir yazi tipinin B harfi vektor olarak cizilir."""
+    from PySide6.QtGui import QFont
+    pm = QPixmap(px, px)
+    pm.fill(Qt.transparent)
+    f = QFont()
+    f.setFamilies(["Arial Black", "Segoe UI Black", "Arial"])
+    f.setWeight(QFont.Black)
+    f.setPixelSize(100)
+    path = QPainterPath()
+    path.addText(0, 0, f, "B")
+    r = path.boundingRect()
+    if r.height() <= 0:
+        return pm
+    k = px * 0.70 / r.height()                     # harf, kutunun %70'i kadar yuksek
+    p = QPainter(pm)
+    p.setRenderHint(QPainter.Antialiasing, True)
+    p.translate(px / 2, px / 2)
+    p.scale(k, k)
+    p.translate(-r.center())
+    p.fillPath(path, QColor(color))
+    p.end()
+    return pm
+
+
+# hazir ikon yerine kendi cizimimizi kullanan eski adlar
+_ALIAS = {"mdi6.format-bold": "rv.bold"}
+
 _CUSTOM = {
+    "rv.bold": _bold_pixmap,
+    "rv.sidebar": _sidebar_pixmap,
     "rv.magnet": _magnet_pixmap,
     "rv.undo": lambda px, color: _undo_pixmap(px, color, False),
     "rv.redo": lambda px, color: _undo_pixmap(px, color, True),
@@ -121,25 +234,44 @@ def custom_icon(name, color, color_on=None, color_disabled=None):
 def icon(name, dark=False, on_white=True):
     """Tema rengine uygun ikon; secili (checked) halde beyaz."""
     col = ICON_COLOR["dark" if dark else "light"]
+    name = _ALIAS.get(name, name)
+    ph, fill = (None, None) if name.startswith("rv.") else ph_name(name)
+    if ph is not None:                             # Phosphor: secili halde DOLU bicim + vurgu rengi
+        try:
+            if on_white:
+                return qta.icon(ph, color=col, color_disabled="#5a5a5a", on=fill or ph, color_on=ICON_ON,
+                                active=ph, color_active=col, on_active=fill or ph, color_on_active=ICON_ON)
+            return qta.icon(ph, color=col, color_disabled="#5a5a5a")
+        except Exception:
+            pass
     if name.startswith("rv."):                     # kendi cizdigimiz ikon (qtawesome'da yok)
-        return custom_icon(name, col, "#ffffff" if on_white else None) or QIcon()
+        return custom_icon(name, col, ICON_ON if on_white else None) or QIcon()
     if qta is None:
         return QIcon()
     try:
         if on_white:
-            return qta.icon(name, color=col, color_on="#ffffff", color_on_active="#ffffff")
+            return qta.icon(name, color=col, color_on=ICON_ON, color_active=col, color_on_active=ICON_ON)
         return qta.icon(name, color=col)
     except Exception:
         return QIcon()
 
 
 class Popover(QFrame):
-    """Dugmenin altinda acilan kucuk ayar kutusu (Qt.Popup: disari tiklayinca kapanir)."""
+    """Dugmenin altinda acilan kucuk ayar kutusu (Qt.Popup: disari tiklayinca kapanir).
+    Her acilista YENI kurulan kutu kapaninca kendini siler (keep=False): yoksa kapali kutular
+    sahibinin cocugu olarak birikir (on ac-kapat = on kapali kutu + on surgu) ve her gorunum
+    degisiminde yeniden bicimlendirilir. Bir kez kurulup yeniden gosterilen kutu: keep=True."""
 
-    def __init__(self, parent=None):
+    def __init__(self, parent=None, keep=False):
         super().__init__(parent, Qt.Popup | Qt.FramelessWindowHint)
         self.setObjectName("mkPopover")
         self.setAttribute(Qt.WA_StyledBackground, True)
+        self._keep = keep
+
+    def hideEvent(self, ev):
+        super().hideEvent(ev)
+        if not self._keep:
+            self.deleteLater()
 
     def show_under(self, w):
         self.adjustSize()
@@ -268,10 +400,73 @@ class _DropPlacer(QObject):
         return False
 
 
-def attach_slider(spin, lo, hi, scale=1.0, dark=False):
+class _SliderFeed(QObject):
+    """Acilir surgu -> sayi kutusu koprusu.
+
+    Surgunun degeri kutuya HEMEN yazilmaz; "son deger" olarak tutulur ve olay dongusunun bir
+    sonraki turunda bir kez uygulanir. Neden: kutunun degeri degisince calisan is agirdir (PDF
+    nesnesi yeniden kurulur, sayfa cizilir). Windows'ta fare hareketleri arka arkaya gelirken
+    Qt bekleyen cizimleri yapamaz (yerel iletiler bitmeden kendi olaylarina sira gelmez): is her
+    fare hareketinde dogrudan yapilinca surgunun noktasi surukleme boyunca hic cizilmiyor, fareyi
+    izlemiyordu. Fare hareketinin kendi isi artik bostur -> nokta her harekette cizilir; agir is
+    aradaki bosluklarda, her seferinde yalniz SON degerle yapilir.
+
+    Bekleyen deger kaybolmaz: fare birakilinca ve kutu kapaninca (disari tiklama, Esc, baska
+    pencere) hemen uygulanir. begin / end: bir ayarlama oturumunun basi ve sonu (bir surukleme =
+    bir geri-al adimi; kucuk resim gibi ertelenen isler sonda yapilir)."""
+
+    def __init__(self, pop, slider, spin, scale, begin, end):
+        super().__init__(pop)
+        self.pop, self.s, self.spin, self.scale = pop, slider, spin, scale
+        self.begin, self.end = begin, end
+        self._pending = None
+        self._open = False
+        self._timer = QTimer(self)
+        self._timer.setSingleShot(True)
+        self._timer.setInterval(0)
+        self._timer.timeout.connect(self.flush)
+        slider.valueChanged.connect(self._moved)
+        slider.sliderReleased.connect(self.finish)
+        pop.installEventFilter(self)
+
+    def _moved(self, v):
+        self._pending = v
+        if not self._timer.isActive():
+            self._timer.start()
+
+    def flush(self):
+        self._timer.stop()
+        if self._pending is None:
+            return
+        v, self._pending = self._pending, None
+        if not self._open:
+            self._open = True
+            if self.begin is not None:
+                self.begin()
+        self.spin.setValue(v / self.scale)
+        # Kutunun isleyicisi ust seridi gizleyip gosterirse Qt, acik kutunun BEKLEYEN cizimini de
+        # siler (gizlenen parcanin cocuklari arasinda bu pencere de var). O zaman yalniz sonraki
+        # kucuk guncelleme (noktanin yeni yeri) cizilir, eski nokta ekranda kalirdi: cift nokta.
+        self.pop.update()
+
+    def finish(self):
+        self.flush()
+        if self._open:
+            self._open = False
+            if self.end is not None:
+                self.end()
+
+    def eventFilter(self, obj, ev):
+        if obj is self.pop and ev.type() == QEvent.Hide:
+            self.finish()
+        return False
+
+
+def attach_slider(spin, lo, hi, scale=1.0, dark=False, begin=None, end=None):
     """Ust seritteki sayi kutusu: kucuk yukari/asagi oklar yerine sagda ▾; tiklayinca
     kaydirmali surgu acilir. Deger yine yazilabilir, fare tekerlegiyle degisir.
     scale: surgunun tam sayi adimi = 1/scale (ör. 4 -> 0,25'lik adim).
+    begin / end: surguyle ayarlama oturumunun basinda / sonunda cagrilir (bkz. _SliderFeed).
     Dondurur: ▾ dugmesi (tema degisince ikonu yeniden renklensin diye)."""
     from PySide6.QtWidgets import QAbstractSpinBox, QSlider
     spin.setButtonSymbols(QAbstractSpinBox.NoButtons)
@@ -295,7 +490,7 @@ def attach_slider(spin, lo, hi, scale=1.0, dark=False):
         s.setFixedSize(200, 22)          # yuvarlak tutamac ust/altta kesilmesin
         s.setRange(int(round(lo * scale)), int(round(hi * scale)))
         s.setValue(int(round(min(max(spin.value(), lo), hi) * scale)))
-        s.valueChanged.connect(lambda v: spin.setValue(v / scale))
+        pop.feed = _SliderFeed(pop, s, spin, scale, begin, end)
         lay.addWidget(s)
         pop.show_under(spin)
         s.setFocus()
@@ -338,6 +533,23 @@ def dash_combo(dark=False, tip=_t("Kesikli çizgi deseni")):
         cb.addItem(dash_icon(key, dark), "", key)
         cb.setItemData(i, name, Qt.ToolTipRole)
     return cb
+
+
+def fit_combo(cb, widen=0, only=None):
+    """Acilan liste en uzun satirina gore genisler (ceviriler Turkceden uzun olabiliyor).
+    widen > 0: sabit genislikli kutunun kendisi de, yazisi sigmiyorsa en cok widen px genisler;
+    only: kutu genisligi icin bakilacak satirlar (verilmezse hepsi)."""
+    cb.ensurePolished()
+    fm = cb.fontMetrics()
+    width = lambda rows: max((fm.horizontalAdvance(cb.itemText(i)) for i in rows), default=0) + 30
+    need = width(range(cb.count()))
+    if need > cb.view().minimumWidth():
+        cb.view().setMinimumWidth(need)
+    fixed = cb.maximumWidth()
+    if widen and cb.minimumWidth() == fixed:
+        need = width(only if only is not None else range(cb.count()))
+        if need > fixed:
+            cb.setFixedWidth(min(need, fixed + widen))
 
 
 def recolor_dash_combo(cb, dark):

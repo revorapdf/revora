@@ -79,6 +79,27 @@ def frame(kind, P):
     return r, fitz.Point((r.x0 + r.x1) / 2, (r.y0 + r.y1) / 2)
 
 
+def note_keep_start(P_old, P_new):
+    """Notun gorunumu / yazisi degisince YAZININ BASLADIGI YER (yazi alaninin sol-ust kosesi,
+    sayfada) eskisiyle ayni kalsin; kutu yazinin cevresinde buyur / kuculur. P_new'in
+    konumunu (pos) buna gore duzeltir, P_new'i yerinde degistirir ve dondurur.
+    Iki durumu cozer:
+    - donuk not kutusunun MERKEZI etrafinda doner; yazi uzayinca kutu genisler, merkez kayar ->
+      yazdikca not yuruyordu;
+    - arka plan / kenarlik acilinca ic bosluk buyur (kutu sol-ustten sabitti) -> yazi sag-asagi
+      oteleniyordu (kullanici, 2026-10-12: "yaziyi sabit tut, arka plan cevresine gelsin")."""
+    a = angle_of(P_old)
+    box0, inner0 = note_geometry(P_old)[:2]
+    c0 = fitz.Point((box0.x0 + box0.x1) / 2, (box0.y0 + box0.y1) / 2)
+    start = rot_pt(inner0.tl, c0, a)                   # yazinin basladigi kose (sayfada)
+    box1, inner1 = note_geometry(P_new)[:2]
+    hw, hh = box1.width / 2, box1.height / 2
+    d = inner1.tl - box1.tl                            # kutunun sol-ustunden yazi alanina (ic bosluk)
+    v = rot_pt(fitz.Point(d.x - hw, d.y - hh), fitz.Point(0, 0), a)   # yeni merkezden yazi kosesine (donmus)
+    P_new["pos"] = [start.x - v.x - hw, start.y - v.y - hh]
+    return P_new
+
+
 def frame_corners(kind, P):
     r, c = frame(kind, P)
     a = angle_of(P)
@@ -333,14 +354,98 @@ def smooth_points(pts, radius=1.0):
     return res
 
 
-def smooth_segments(pts):
+class StrokeSmoother:
+    """smooth_points'in ARTIMLI hali: noktalar geldikce beslenir (add), points() her an
+    smooth_points(o ana kadarki butun noktalar, radius) ile AYNI listeyi verir.
+
+    Neden: cizerken onizleme her karede butun noktalari bastan yumusatiyordu; 1000 noktada kare
+    basina ~110 ms, 3000 noktada ~330 ms (uzun kesintisiz cizimde kalem giderek geride kaliyordu).
+    Yumusatmada bir nokta yalniz +-8 komsusuna bakar: sona yeni nokta eklenince bastaki noktalar
+    DEGISMEZ. Kesinlesen kisim saklanir (stable() adet nokta), her seferinde yalniz kuyruk
+    hesaplanir. Islemler smooth_points ile ayni sirada yapilir: sonuc birebir aynidir (kabul testi
+    rastgele cizimlerde karsilastirir)."""
+    K = 4                                       # (smooth_points ile ayni: +-4 adim = +-radius)
+
+    def __init__(self, radius):
+        self.radius = radius
+        self.step = radius / 4.0
+        self.raw = 0                            # beslenen ham nokta sayisi
+        self.head = []                          # ilk iki ham nokta (3'ten az nokta: yumusatma yok)
+        self.last = None
+        self.res = []                           # esit aralikli yeniden ornekleme (yalniz sona eklenir)
+        self.carry = 0.0
+        self.p1 = []                            # 1. gecisin kesinlesen bas kismi
+        self.p2 = []                            # 2. gecisin (sonucun) kesinlesen bas kismi
+
+    def add(self, pts):
+        for q in pts:
+            b_ = _P(q)
+            if self.raw == 0:
+                self.res.append(b_)
+            else:
+                a_ = self.last
+                L = abs(b_ - a_)
+                t = self.step - self.carry
+                while t <= L:
+                    self.res.append(a_ + (b_ - a_) * (t / L))
+                    t += self.step
+                self.carry = L - (t - self.step) if L > 0 else self.carry + L
+            if self.raw < 2:
+                self.head.append(b_)
+            self.last = b_
+            self.raw += 1
+        if self.radius <= 0:
+            return
+        res, K = self.res, self.K
+        m = len(res)
+        while len(self.p1) <= m - 5:            # (i + 4 gercek bir ornek: sondaki eklenen uc nokta degil)
+            i = len(self.p1)
+            self.p1.append(res[0] if i == 0 else self._mean(res, i, min(K, i)))
+        p1 = self.p1
+        while len(self.p2) <= m - 9:
+            i = len(self.p2)
+            self.p2.append(p1[0] if i == 0 else self._mean(p1, i, min(K, i)))
+
+    @staticmethod
+    def _mean(src, i, k):
+        sx = sum(src[j].x for j in range(i - k, i + k + 1))
+        sy = sum(src[j].y for j in range(i - k, i + k + 1))
+        return fitz.Point(sx / (2 * k + 1), sy / (2 * k + 1))
+
+    def stable(self):
+        """points()'in basindan kac nokta kesinlesti (sonraki eklemelerde degismez)."""
+        return len(self.p2) if self.raw >= 3 else 0
+
+    def points(self):
+        if self.raw < 3 or self.radius <= 0:
+            return list(self.head) if self.raw < 3 else None
+        res = self.res
+        full = res if abs(res[-1] - self.last) <= 1e-6 else res + [self.last]
+        n = len(full)
+        if n < 5:
+            return list(full)
+        K = self.K
+        o1 = list(self.p1) if self.p1 else [full[0]]
+        for i in range(len(o1), n - 1):
+            o1.append(self._mean(full, i, min(K, i, n - 1 - i)))
+        o1.append(full[-1])
+        o2 = list(self.p2) if self.p2 else [o1[0]]
+        for i in range(len(o2), n - 1):
+            o2.append(self._mean(o1, i, min(K, i, n - 1 - i)))
+        o2.append(o1[-1])
+        return o2
+
+
+def smooth_segments(pts, start=0, stop=None):
     """Noktalardan gecen yumusak egri: MERKEZCIL Catmull-Rom -> kubik Bezier
     parcalari [(p0, c1, c2, p1), ...]. Merkezcil tur, noktalar arasi mesafe
     degistiginde (hizli/yavas cizim) duz Catmull-Rom'un yaptigi tasmalari ve
-    kucuk dugumleri yapmaz."""
+    kucuk dugumleri yapmaz.
+    start / stop: yalniz [start, stop) aralarindaki parcalar (parca i: pts[i] -> pts[i+1],
+    komsulari pts[i-1] ve pts[i+2] ile). Uzun cizimde degismeyen bas kismi yeniden uretmemek icin."""
     n = len(pts)
     out = []
-    for i in range(n - 1):
+    for i in range(start, n - 1 if stop is None else min(stop, n - 1)):
         p0 = pts[i - 1] if i > 0 else pts[i]
         p1, p2 = pts[i], pts[i + 1]
         p3 = pts[i + 2] if i + 2 < n else p2
@@ -1009,6 +1114,25 @@ def _blur_image(doc, pno, P):
     finally:
         if rot:
             page.set_rotation(rot)
+
+
+def preview(kind, P, scale):
+    """Nesnenin tek basina, saydam zeminli goruntusu - sayfaya KURULACAK olanla ayni cizim
+    (_render): notu yazarken canli onizleme. Dondurur (pixmap, x, y): x, y = goruntunun
+    sol-ustunun sayfa goruntusundeki yeri (aygit pikseli, TAM sayi: kenarlar sayfadaki
+    cizimle ayni piksele oturur, duzenlemeye girince not kaymaz)."""
+    ext = _extent(kind, P)
+    x0 = math.floor(ext.x0 * scale) / scale
+    y0 = math.floor(ext.y0 * scale) / scale
+    ext2 = fitz.Rect(x0, y0, max(ext.x1, x0 + 1.0), max(ext.y1, y0 + 1.0))
+    tmp = fitz.open()
+    try:
+        page = tmp.new_page(width=ext2.width, height=ext2.height)
+        _render(page, kind, P, ext2)
+        pix = page.get_pixmap(matrix=fitz.Matrix(scale, scale), alpha=True)
+    finally:
+        tmp.close()
+    return pix, int(round(x0 * scale)), int(round(y0 * scale))
 
 
 def _tmp_form(doc, kind, P, ext, W, H, img=None):

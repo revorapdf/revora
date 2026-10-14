@@ -44,6 +44,7 @@ REM alir; hepsini toplamak paketi yuzlerce MB buyutup acilisi yavaslatir.
     --name "Revora" ^
     --icon "assets\revora.ico" ^
     --add-data "assets\revora.png;assets" ^
+    --add-data "assets\revora_mark.png;assets" ^
     --add-data "locales;locales" ^
     --add-data "VERSION;." ^
     --collect-all pymupdf ^

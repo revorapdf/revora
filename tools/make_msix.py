@@ -115,6 +115,13 @@ MANIFEST = """<?xml version="1.0" encoding="utf-8"?>
   <Resources>
     <Resource Language="en-us" />
     <Resource Language="tr-tr" />
+    <Resource Language="de-de" />
+    <Resource Language="fr-fr" />
+    <Resource Language="es-es" />
+    <Resource Language="it-it" />
+    <Resource Language="pt-br" />
+    <Resource Language="pl-pl" />
+    <Resource Language="nl-nl" />
   </Resources>
 
   <Applications>

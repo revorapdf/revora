@@ -13,8 +13,10 @@ operatorunu (Tj/TJ/'/") KONUMUNDAN bulup sadece onun operandini bosaltmak.
 Boylece altindaki/ustundeki hicbir yaziya dokunmadan yalnizca o metin gider.
 """
 import hashlib
+import re
 
 WS = b" \t\r\n\f\0"
+_WS_SET = frozenset(WS)
 DELIM = b"()<>[]{}/%"
 IDENT = (1, 0, 0, 1, 0, 0)
 
@@ -27,9 +29,122 @@ def _matmul(m1, m2):
             e1*a2 + f1*c2 + e2, e1*b2 + f1*d2 + f2)
 
 
+_RE_WS = re.compile(rb"[ \t\r\n\f\0]+")
+_RE_WORD = re.compile(rb"[^ \t\r\n\f\0()<>\[\]{}/%]+")
+_RE_EOL = re.compile(rb"[\r\n]")
+_RE_STR = re.compile(rb"[\\()]")
+_RE_ARR = re.compile(rb"[(\[\]]")
+_RE_NUM = re.compile(rb"[+-]?(?:[0-9]+\.?[0-9]*|\.[0-9]+)\Z")
+
+
+def _skip_string(data, i, n):
+    """"(" den SONRAKI konumdan baslar; dengeli kapanisin ardini dondurur (kacis: \\ + 1 bayt).
+    Kapanmiyorsa _tokenize_ref ile ayni yerde durur (n, ya da son bayt \\ ise n + 1)."""
+    depth = 1
+    while i < n and depth > 0:
+        m = _RE_STR.search(data, i)
+        if m is None:
+            return n
+        k = m.start()
+        ch = data[k]
+        if ch == 0x5C:
+            i = k + 2
+            continue
+        depth += 1 if ch == 0x28 else -1
+        i = k + 1
+    return i
+
+
 def _tokenize(data: bytes):
     """Icerik akisini token'lara ayirir. Her token: {kind, start, end, val}.
-    kind: number/string/hexstring/name/array/op."""
+    kind: number/string/hexstring/name/array/op.
+
+    _tokenize_ref ile BIREBIR ayni listeyi uretir (kabul testi ikisini karsilastirir); fark hiz:
+    o bayt bayt ilerler (61 KB'lik akis ~60 ms), bu arama islerini duzenli ifadelere birakir.
+    Her duzenlemede akis en az bir kez ayristirildigi icin tasima / duzenleme suresinin
+    yarisindan fazlasi burada geciyordu."""
+    i, n = 0, len(data)
+    toks = []
+    add = toks.append
+    ws, word, num = _RE_WS.match, _RE_WORD.match, _RE_NUM.match
+    while i < n:
+        c = data[i]
+        if c in _WS_SET:
+            i = ws(data, i).end()
+            continue
+        if c == 0x25:  # % yorum satiri
+            m = _RE_EOL.search(data, i)
+            i = n if m is None else m.start()
+            continue
+        if c == 0x28:  # ( literal string
+            j = i
+            i = _skip_string(data, i + 1, n)
+            add({"kind": "string", "start": j, "end": i, "val": data[j:i]})
+            continue
+        if c == 0x3C:  # <
+            if data[i+1:i+2] == b"<":
+                add({"kind": "op", "start": i, "end": i+2, "val": b"<<"})
+                i += 2
+                continue
+            j = i
+            k = data.find(b">", i)
+            i = (n if k == -1 else k) + 1
+            add({"kind": "hexstring", "start": j, "end": i, "val": data[j:i]})
+            continue
+        if c == 0x3E and data[i+1:i+2] == b">":
+            add({"kind": "op", "start": i, "end": i+2, "val": b">>"})
+            i += 2
+            continue
+        if c == 0x5B:  # [ dizi (TJ operandi) - tumunu ham al
+            j = i
+            i += 1
+            depth = 1
+            while i < n and depth > 0:
+                m = _RE_ARR.search(data, i)
+                if m is None:
+                    i = n
+                    break
+                k = m.start()
+                ch = data[k]
+                if ch == 0x28:
+                    i = _skip_string(data, k + 1, n)
+                    continue
+                depth += 1 if ch == 0x5B else -1
+                i = k + 1
+            add({"kind": "array", "start": j, "end": i, "val": data[j:i]})
+            continue
+        if c == 0x2F:  # / isim
+            j = i
+            m = word(data, i + 1)
+            i = i + 1 if m is None else m.end()
+            add({"kind": "name", "start": j, "end": i, "val": data[j:i]})
+            continue
+        m = word(data, i)      # sayi ya da operator
+        if m is None:          # (tek basina ayrac: ) > ] { })
+            i += 1
+            continue
+        j, i = i, m.end()
+        raw = m.group()
+        if num(raw) is not None:
+            add({"kind": "number", "start": j, "end": i, "val": raw})
+            continue
+        try:
+            float(raw)
+            add({"kind": "number", "start": j, "end": i, "val": raw})
+        except ValueError:
+            add({"kind": "op", "start": j, "end": i, "val": raw})
+            if raw == b"ID":
+                # satir ici resim: ikili veriyi token'lamaya calisma, EI'ya atla
+                k = data.find(b"EI", i + 1)
+                while k != -1 and not (data[k-1:k] in WS and
+                                       (k + 2 >= n or data[k+2:k+3] in WS)):
+                    k = data.find(b"EI", k + 1)
+                i = n if k == -1 else k + 2
+    return toks
+
+
+def _tokenize_ref(data: bytes):
+    """_tokenize'in ilk, bayt bayt ilerleyen hali: yalniz KARSILASTIRMA icin (testler)."""
     i, n = 0, len(data)
     toks = []
     while i < n:
@@ -129,6 +244,71 @@ def _tokenize(data: bytes):
     return toks
 
 
+_SHOW_OPS = (b"Tj", b"TJ", b"'", b'"')
+# harf / kelime araligi gibi, yazinin YERINI degistirmeyen ayarlar: iki gosterme operatoru arasinda
+# bunlar varsa ikincisi yine "araya komut girmeden cizilmis" sayilir
+_SPACING_OPS = (b"Tc", b"Tw", b"Tz", b"TL", b"Ts")
+
+
+def _run(ops, first, origin, tol=2.0):
+    """origin'deki yaziyi cizen operatorlerin TAMAMI (akis sirasiyla).
+
+    first: origin'e en yakin operator (yazinin basi). Bir yazi tek operatorle cizilmek zorunda
+    degil: wkhtmltopdf her HARFI ayri Tj ile, aralarinda TD ile cizer; Google Dokumanlar her
+    KELIMEYI ayri BT ... ET icinde. MuPDF bunlari tek yazi (span) olarak verir; yalniz ilk
+    operatoru bosaltinca yazinin geri kalani sayfada kaliyordu (kullanici: "basligi tasiyorum,
+    eski yerinde yalniz N gidiyor").
+
+    origin 4'lu ise (x, y, bitis_x, bitis_y) = yazinin taban cizgisi. Ilk operatorden sonra,
+    AKISTA ARDISIK gelenlerden su ikisinden birini saglayanlar ayni yazinin devami sayilir:
+      * araya hic komut girmeden cizilmis (ayni konumdan devam eder: yeri hesaplanamaz ama
+        yazi tipi / renk degismedigi icin ayni yazidir), YA DA
+      * yazi tipi, boyutu ve rengi AYNI, yeri de (yeniden konumlandigi icin kesin bilinir)
+        taban cizgisinin ustunde ve yazinin boyunun icinde. Satir icinde yazi tipi / renk
+        degisince MuPDF'in ayirdigi SONRAKI yazi bu yazinin kutusuna biraz tasabilir (bosluk
+        payi): gorunumu farkli oldugu icin alinmaz.
+    Ilk uymayan operatorde durulur: baska yerdeki, ust uste binen yaziya (filigran vb.)
+    dokunulmaz. origin 2'li ise eskisi gibi yalniz ilk operator."""
+    out = [first]
+    if len(origin) < 4 or "i" not in first:
+        return out
+    ox, oy, ex, ey = origin[:4]
+    dx, dy = ex - ox, ey - oy
+    length = (dx * dx + dy * dy) ** 0.5
+    if length < 1e-6:
+        return out
+    ux, uy = dx / length, dy / length
+    for k in range(first["i"] + 1, len(ops)):
+        op = ops[k]
+        if not op["direct"]:
+            px, py = op["origin"][0] - ox, op["origin"][1] - oy
+            along, across = px * ux + py * uy, abs(py * ux - px * uy)
+            if op.get("look") != first.get("look") or across > tol or not (0.5 < along < length - 0.25):
+                break
+        out.append(op)
+    return out
+
+
+def _blank_all(doc, xref, data, ops):
+    """Operatorlerin operandlarini bosalt (sondan basa: onceki konumlar kaymaz)."""
+    key0 = _key(data)
+    seen = set()
+    for op in sorted(ops, key=lambda o: o["operand"]["start"], reverse=True):
+        st, en = op["operand"]["start"], op["operand"]["end"]
+        if st in seen:
+            continue
+        seen.add(st)
+        data = data[:st] + (b"[]" if op["op"] == "TJ" else b"()") + data[en:]
+    if seen:
+        # Yalniz operandlar bosaldi: q / Q yapisi AYNI. Bir sonraki adim (yeni yaziyi yazmadan once
+        # ensure_wrapped) bu akisi yeniden ayristirmasin diye sarma bilgisi yeni icerige aktarilir.
+        info = _WRAP_CACHE.get(key0)
+        if info is not None:
+            _remember_wrap(_key(data), info)
+        doc.update_stream(xref, data)
+    return data
+
+
 def find_show_ops(data: bytes, base):
     """Her metin gosterme operatorunun sayfa (sol-ust) origin'ini ve
     operand byte araligini dondurur:
@@ -142,12 +322,61 @@ def find_show_ops(data: bytes, base):
     return _scan_cached(data, base)[0]
 
 
-def _scan(data: bytes, base, ctm0=IDENT):
+_TOK_CACHE = {}       # akisin ozeti -> token listesi (SALT OKUNUR: cagiranlar degistirmez)
+_WRAP_CACHE = {}      # akisin ozeti -> (acik q sayisi, eslesmeyen Q sayisi, q disinda komut var mi)
+
+
+def _key(data):
+    return hashlib.md5(data).digest()
+
+
+def tokens(data, key=None):
+    """_tokenize(data), akisin icerigine gore hatirlanarak. Ayni akis bir islem icinde birkac yerde
+    gerekir (metin operatorleri, cizimler, resimler, sarma denetimi): hepsi ayni listeyi paylasir.
+    Donen liste ve icindeki sozlukler DEGISTIRILMEZ."""
+    key = key or _key(data)
+    hit = _TOK_CACHE.get(key)
+    if hit is None:
+        hit = _tokenize(data)
+        if len(_TOK_CACHE) >= 3:
+            _TOK_CACHE.pop(next(iter(_TOK_CACHE)))
+        _TOK_CACHE[key] = hit
+    return hit
+
+
+def _wrap_info(toks):
+    """ensure_wrapped'in karari icin: (kapanmamis q, eslesmeyen Q, q / Q disinda komut var mi)."""
+    depth = under = 0
+    dirty = False
+    for t in toks:
+        if t["kind"] != "op":
+            continue
+        v = t["val"]
+        if v == b"q":
+            depth += 1
+        elif v == b"Q":
+            if depth > 0:
+                depth -= 1
+            else:
+                under += 1      # eslesmeyen Q: bizim q'yu yutmasin diye fazladan q
+        elif depth == 0:
+            dirty = True
+    return depth, under, dirty
+
+
+def _remember_wrap(key, info):
+    if len(_WRAP_CACHE) >= 16:
+        _WRAP_CACHE.pop(next(iter(_WRAP_CACHE)))
+    _WRAP_CACHE[key] = info
+
+
+def _scan(data: bytes, base, ctm0=IDENT, toks=None):
     """find_show_ops'un genel hali: (metin_operatorleri, Do_cagrilari).
     ctm0: akisin baslangic donusumu (form nesnesi icin: formun /Matrix'i x
     cagrildigi yerdeki CTM). Do cagrilari: [{name, tok:(start,end), ctm}]."""
     ba, bb, bc, bd, be, bf = tuple(base)
-    toks = _tokenize(data)
+    if toks is None:
+        toks = _tokenize(data)
     ctm = ctm0
     ctm_stack = []
     gs = ()                  # etkin grafik durumlari (ExtGState adlari, sirayla): ayarlar
@@ -160,6 +389,9 @@ def _scan(data: bytes, base, ctm0=IDENT):
     last_str = None
     last_arr = None
     out = []
+    since = 0                # son gosterme operatorunden beri gorulen komut sayisi (bkz. _run)
+    look = (None, None)      # gecerli (yazi tipi + boyut, dolgu rengi): q / Q ile saklanir, geri gelir
+    look_stack = []
     for idx, t in enumerate(toks):
         k = t["kind"]
         if k == "number":
@@ -177,14 +409,27 @@ def _scan(data: bytes, base, ctm0=IDENT):
             nums = []
             continue
         op = t["val"]
+        if op not in _SHOW_OPS and op not in _SPACING_OPS:
+            since += 1
         if op == b"q":
             ctm_stack.append(ctm)
             gs_stack.append(gs)
+            look_stack.append(look)
         elif op == b"Q":
             if ctm_stack:
                 ctm = ctm_stack.pop()
             if gs_stack:
                 gs = gs_stack.pop()
+            if look_stack:
+                look = look_stack.pop()
+        elif op == b"Tf" and nums:
+            name = next((toks[j]["val"] for j in range(idx - 1, max(idx - 4, -1), -1)
+                         if toks[j]["kind"] == "name"), None)
+            look = ((name, nums[-1]), look[1])
+        elif op in (b"rg", b"g", b"k", b"sc", b"scn"):
+            look = (look[0], (op, tuple(nums)))
+        elif op == b"cs" and idx > 0 and toks[idx - 1]["kind"] == "name":
+            look = (look[0], (op, toks[idx - 1]["val"]))
         elif op == b"gs" and idx > 0 and toks[idx - 1]["kind"] == "name":
             gs = gs + (toks[idx - 1]["val"][1:].decode("latin-1"),)
         elif op == b"cm" and len(nums) >= 6:
@@ -217,14 +462,39 @@ def _scan(data: bytes, base, ctm0=IDENT):
             operand = last_arr if op == b"TJ" else last_str
             if operand is not None:
                 out.append({"origin": origin, "op": op.decode(), "gs": gs,     # zincir
+                            "i": len(out), "direct": since == 0 and bool(out), "look": look,
                             "operand": {"start": operand["start"],
                                         "end": operand["end"]}})
+            since = 0
         elif op == b"Do" and idx > 0 and toks[idx - 1]["kind"] == "name":
             nt = toks[idx - 1]
             dos.append({"name": nt["val"][1:].decode("latin-1"),
                         "tok": (nt["start"], nt["end"]), "ctm": ctm})
         nums = []
     return out, dos
+
+
+_CLEANED = set()      # clean_contents'in URETTIGI akislarin ozetleri (bkz. clean_page)
+
+
+def clean_page(doc, page):
+    """page.clean_contents() + icerik akislarinin listesi; az once temizlenmis ve o zamandan beri
+    DEGISMEMIS tek akisi yeniden temizlemez.
+
+    Neden: bir duzenlemede once yazinin karisim modu sorulur, sonra yazi silinir. Ikisi de ayni
+    (temizlenmis) akisa bakarsa akis bir kez taranir. Temizligi iki kez calistirmak ise bazi
+    belgelerde (wkhtmltopdf) ikinci seferde FARKLI baytlar uretir: tarama onbellegi iskalanir,
+    akis yeniden ayristirilirdi."""
+    xrefs = page.get_contents()
+    if len(xrefs) == 1 and _key(doc.xref_stream(xrefs[0])) in _CLEANED:
+        return xrefs
+    page.clean_contents()
+    xrefs = page.get_contents()
+    if xrefs:
+        if len(_CLEANED) >= 32:
+            _CLEANED.clear()
+        _CLEANED.add(_key(doc.xref_stream(xrefs[0])))
+    return xrefs
 
 
 def single_stream(doc, page):
@@ -251,24 +521,16 @@ def ensure_wrapped(doc, page):
     if xref is None:
         return
     data = doc.xref_stream(xref)
-    depth = under = 0
-    dirty = False
-    for t in _tokenize(data):
-        if t["kind"] != "op":
-            continue
-        v = t["val"]
-        if v == b"q":
-            depth += 1
-        elif v == b"Q":
-            if depth > 0:
-                depth -= 1
-            else:
-                under += 1      # eslesmeyen Q: bizim q'yu yutmasin diye fazladan q
-        elif depth == 0:
-            dirty = True
+    key = _key(data)
+    info = _WRAP_CACHE.get(key)          # (az once taranan / operandi bosaltilan akis: yeniden ayristirma yok)
+    if info is None:
+        info = _wrap_info(tokens(data, key))
+        _remember_wrap(key, info)
+    depth, under, dirty = info
     if dirty or depth or under:
         data = b"q\n" * (under + 1) + data + b"\nQ" * depth + b"\nQ\n"
         doc.update_stream(xref, data)
+        _remember_wrap(_key(data), (0, 0, False))      # (sarilmis hali dengeli: bir daha sarilmaz)
 
 
 def remove_text_at(doc, page, origin, tol=2.0):
@@ -278,8 +540,7 @@ def remove_text_at(doc, page, origin, tol=2.0):
 
     Once tum icerik akislarini tek akista birlestirir (clean_contents)
     ki cok-akisli sayfalarda da tek yerde duzenleyelim."""
-    page.clean_contents()
-    xrefs = page.get_contents()
+    xrefs = clean_page(doc, page)
     if not xrefs:
         return False
     xref = xrefs[0]
@@ -289,7 +550,7 @@ def remove_text_at(doc, page, origin, tol=2.0):
 
     best, bd = _nearest(ops, origin)
     if best is not None and bd <= tol:
-        _blank(doc, xref, data, best)
+        _blank_all(doc, xref, data, _run(ops, best, origin, tol))
         return True
 
     # Sayfanin kendi akisinda yok: metin bir Form XObject icinde olabilir
@@ -300,7 +561,7 @@ def remove_text_at(doc, page, origin, tol=2.0):
         return False
     if found is None:
         return False
-    chain, op = found
+    chain, run = found
     try:
         target = _privatize_chain(doc, page, chain)
     except Exception:
@@ -308,7 +569,7 @@ def remove_text_at(doc, page, origin, tol=2.0):
         # (_copy_form sirasi: once kopya, sonra kaynak adi, en son akistaki ad;
         # yarida kalirsa en fazla sahipsiz bir kopya kalir, kayitta temizlenir.)
         return False
-    _blank(doc, target, doc.xref_stream(target), op)
+    _blank_all(doc, target, doc.xref_stream(target), run)
     return True
 
 
@@ -323,29 +584,68 @@ _SCAN_CACHE = {}
 def _scan_cached(data, base):
     """_scan (Python'da yavas) sonucunu akisin icerigine gore hatirlar: ayni akis
     ikinci kez taranmaz (surukleme onizlemesi + asil tasima ayni akisi tarar)."""
-    key = (hashlib.md5(data).digest(), tuple(base))
+    dk = _key(data)
+    key = (dk, tuple(base))
     hit = _SCAN_CACHE.get(key)
     if hit is None:
-        hit = _scan(data, base)
+        toks = tokens(data, dk)
+        hit = _scan(data, base, toks=toks)
+        if dk not in _WRAP_CACHE:                  # (ayni gecisten: ensure_wrapped tekrar ayristirmasin)
+            _remember_wrap(dk, _wrap_info(toks))
         if len(_SCAN_CACHE) >= 6:
             _SCAN_CACHE.pop(next(iter(_SCAN_CACHE)))
         _SCAN_CACHE[key] = hit
     return hit
 
 
+_CLEAN_OF = {}        # ham (canli) akisin ozeti -> ayni sayfanin TEMIZLENMIS akisinin ozeti (bkz. warm_scan)
+
+
+def _ops_for_query(page):
+    """Yalniz SORGU icin metin operatorleri (belgeye dokunmadan). On tarama bu sayfanin temiz
+    kopyasini taradiysa o sonuc kullanilir: operatorler ve "gs" adlari aynidir, ham akisi ayrica
+    ayristirmak gerekmez. Yoksa canli akis taranir (eski davranis)."""
+    raw = page.read_contents()
+    base = page.transformation_matrix
+    ck = _CLEAN_OF.get(_key(raw))
+    if ck is not None:
+        hit = _SCAN_CACHE.get((ck, tuple(base)))
+        if hit is not None:
+            return hit[0]
+    return find_show_ops(raw, base)
+
+
 def warm_scan(doc, pno):
     """Sayfanin (birlestirilmis) akisini onceden tara. Asil belgeye dokunmaz:
-    birlestirme belgenin kopyasinda yapilir (sonuc ayni bytelar)."""
+    birlestirme belgenin kopyasinda yapilir (sonuc ayni bytelar).
+
+    Tek tarama: bir islem (tasi / duzenle / sil) once sayfayi temizler, karisim modunu da silmeyi de
+    o temiz akistan yapar; surukleme onizlemesinin sorgusu da ayni sonucu kullanir (_ops_for_query).
+    Eskiden ham akis ayrica taraniyordu: her secimde iki ayristirma. Ayni icerik icin ikinci kez
+    cagrilirsa hicbir sey yapmaz (kopya da cikarilmaz)."""
     try:
-        live = doc[pno]                        # karisim modu sorgusu (text_blend_at) canli akisi tarar
-        _scan_cached(live.read_contents(), live.transformation_matrix)
+        live = doc[pno]
+        base = tuple(live.transformation_matrix)
+        raw = live.read_contents()
+        rk = _key(raw)
+        ck = _CLEAN_OF.get(rk)
+        if ck is not None and (ck, base) in _SCAN_CACHE:
+            return
+        if rk in _CLEANED and len(live.get_contents()) == 1:      # zaten temiz tek akis: kopya gereksiz
+            _scan_cached(raw, base)
+            _CLEAN_OF[rk] = rk
+            return
         tmp = type(doc)("pdf", doc.tobytes())
         try:
             page = tmp[pno]
             page.clean_contents()
             xrefs = page.get_contents()
             if xrefs:
-                _scan_cached(tmp.xref_stream(xrefs[0]), page.transformation_matrix)
+                data = tmp.xref_stream(xrefs[0])
+                _scan_cached(data, page.transformation_matrix)
+                if len(_CLEAN_OF) >= 16:
+                    _CLEAN_OF.clear()
+                _CLEAN_OF[rk] = _key(data)
         finally:
             tmp.close()
     except Exception:
@@ -355,8 +655,7 @@ def warm_scan(doc, pno):
 def remove_texts_at(doc, page, origins, tol=2.0):
     """Birden cok metin (paragrafin satirlari) tek taramada: hepsi sayfanin kendi
     akisindaysa operandlari sondan basa bosaltilir. Degilse tek tek remove_text_at."""
-    page.clean_contents()
-    xrefs = page.get_contents()
+    xrefs = clean_page(doc, page)
     if not xrefs:
         return False
     xref = xrefs[0]
@@ -367,15 +666,8 @@ def remove_texts_at(doc, page, origins, tol=2.0):
         best, bd = _nearest(ops, o)
         if best is None or bd > tol:
             return all(remove_text_at(doc, page, q, tol) for q in origins)
-        found.append(best)
-    seen = set()
-    for op in sorted(found, key=lambda op: op["operand"]["start"], reverse=True):
-        st, en = op["operand"]["start"], op["operand"]["end"]
-        if st in seen:
-            continue
-        seen.add(st)
-        data = data[:st] + (b"[]" if op["op"] == "TJ" else b"()") + data[en:]
-    doc.update_stream(xref, data)
+        found.extend(_run(ops, best, o, tol))
+    _blank_all(doc, xref, data, found)
     return True
 
 
@@ -385,8 +677,7 @@ def remove_texts_each(doc, page, origins, tol=2.0):
     okunur, bir kez yazilir). Orada bulunamayanlar (form nesnesi icindeki yazi) tek tek
     remove_text_at ile denenir. Toplu tasima / silme icin: yazi basina ayri tarama, 80
     yazilik bir tabloda 10+ saniye suruyordu."""
-    page.clean_contents()
-    xrefs = page.get_contents()
+    xrefs = clean_page(doc, page)
     if not xrefs:
         return [False] * len(origins)
     xref = xrefs[0]
@@ -396,20 +687,12 @@ def remove_texts_each(doc, page, origins, tol=2.0):
     for o in origins:
         best, bd = _nearest(ops, o)
         hits.append(best if (best is not None and bd <= tol) else None)
-    seen = set()
-    for op in sorted((h for h in hits if h is not None), key=lambda op: op["operand"]["start"], reverse=True):
-        st, en = op["operand"]["start"], op["operand"]["end"]
-        if st in seen:
-            continue
-        seen.add(st)
-        data = data[:st] + (b"[]" if op["op"] == "TJ" else b"()") + data[en:]
-    if seen:
-        doc.update_stream(xref, data)
+    _blank_all(doc, xref, data, [op for o, h in zip(origins, hits) if h is not None for op in _run(ops, h, o, tol)])
     return [True if h is not None else bool(remove_text_at(doc, page, o, tol)) for o, h in zip(origins, hits)]
 
 
 def _nearest(ops, origin):
-    ox, oy = origin
+    ox, oy = origin[0], origin[1]            # (origin 4'lu de olabilir: bkz. _run)
     best, bd = None, 1e9
     for o in ops:
         dd = ((o["origin"][0] - ox) ** 2 + (o["origin"][1] - oy) ** 2) ** 0.5
@@ -454,7 +737,7 @@ def _search_forms(doc, page, base, dos, origin, tol, depth=4):
             link = chain + [(container, do["tok"], fx)]
             best, bd = _nearest(ops, origin)
             if best is not None and bd <= tol:
-                return link, best
+                return link, _run(ops, best, origin, tol)
             if level > 1:
                 r = walk(fx, sub, link, level - 1)
                 if r:
@@ -551,12 +834,19 @@ def extgstate_blend(doc, page, name):
         return None
 
 
-def text_blend_at(doc, page, origin, tol=2.0, _cache=None):
+def text_blend_at(doc, page, origin, tol=2.0, _cache=None, clean=False):
     """origin'deki metin operatorunun karisim modu (sayfanin kendi akisinda).
     _cache: ad -> karisim modu (ayni sayfada art arda sorgularda paylasilir). Operatorun
     "gs" listesi o ana kadarki TUM gs adlarini tasir (yuzlerce, cogu ayni ad): her biri
-    icin belgeye sormak tek yazida ~50 ms, 130 yazilik toplu tasimada 7 sn tutuyordu."""
-    ops = find_show_ops(page.read_contents(), page.transformation_matrix)
+    icin belgeye sormak tek yazida ~50 ms, 130 yazilik toplu tasimada 7 sn tutuyordu.
+    clean: cagiran HEMEN ARDINDAN bu yaziyi silecekse True verir -> sayfa simdi temizlenir ve
+    sorgu, silmenin de kullanacagi akisi tarar (tek tarama; yoksa ham ve temiz akis ayri ayri
+    ayristirilirdi). Yalniz sorgu icin (surukleme onizlemesi) False: belgeye dokunulmaz."""
+    if clean:
+        xrefs = clean_page(doc, page)
+        ops = find_show_ops(doc.xref_stream(xrefs[0]) if xrefs else b"", page.transformation_matrix)
+    else:
+        ops = _ops_for_query(page)
     op, d = _nearest(ops, origin)
     if op is None or d > tol:
         return None
@@ -570,10 +860,11 @@ def text_blend_at(doc, page, origin, tol=2.0, _cache=None):
     return None
 
 
-def text_blends_at(doc, page, origins, tol=2.0):
-    """Birden cok metnin karisim modu (akis ve kaynak sozlugu bir kez okunur)."""
+def text_blends_at(doc, page, origins, tol=2.0, clean=False):
+    """Birden cok metnin karisim modu (akis ve kaynak sozlugu bir kez okunur). clean: bkz.
+    text_blend_at."""
     cache = {}
-    return [text_blend_at(doc, page, o, tol, cache) for o in origins]
+    return [text_blend_at(doc, page, o, tol, cache, clean) for o in origins]
 
 
 def _copy_form(doc, page, container, tok, fx):

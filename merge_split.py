@@ -19,6 +19,8 @@ from PySide6.QtCore import Qt, QSize, QRectF, QPointF, Signal
 import fitz
 from reorder_view import ReorderView
 from i18n import _t
+import safe_write
+from title_bar import action_buttons, run_modal
 
 try:
     import qtawesome as qta
@@ -157,7 +159,7 @@ def done_box(parent, title, text, reveal_path):
     box.setText(text)
     show = box.addButton(_t("Klasörde göster"), QMessageBox.ActionRole)
     box.addButton(_t("Tamam"), QMessageBox.AcceptRole)
-    box.exec()
+    run_modal(box)
     if box.clickedButton() is show:
         reveal(reveal_path)
 
@@ -190,7 +192,7 @@ class DropZone(QFrame):
         s = _muted_label(subtitle)
         s.setAlignment(Qt.AlignCenter)
         v.addWidget(s)
-        b = _btn(button_text, _icon("fa5s.folder-open", "#ffffff"), "primary")
+        b = _btn(button_text, _icon("fa5s.folder-open", _color(QPalette.BrightText)), "primary")
         b.clicked.connect(self.clicked)
         row = QHBoxLayout()
         row.addStretch()
@@ -352,10 +354,9 @@ class MergeDialog(QDialog):
         ft.addStretch()
         cancel = _btn(_t("Vazgeç"))
         cancel.clicked.connect(self.reject)
-        self.btn_merge = _btn(_t("Birleştir ve kaydet"), _icon("fa5s.object-group", "#ffffff"), "primary")
+        self.btn_merge = _btn(_t("Birleştir ve kaydet"), _icon("fa5s.object-group", _color(QPalette.BrightText)), "primary")
         self.btn_merge.clicked.connect(self.do_merge)
-        ft.addWidget(cancel)
-        ft.addWidget(self.btn_merge)
+        ft.addWidget(action_buttons(self.btn_merge, cancel))
         v.addLayout(ft)
 
         if initial and os.path.isfile(initial):
@@ -439,18 +440,21 @@ class MergeDialog(QDialog):
         start = os.path.join(os.path.dirname(self._path(0)), "birlesik.pdf")
         out_path, _ = QFileDialog.getSaveFileName(self, _t("Birleştirilmiş PDF'i Kaydet"), start,
                                                   _t("PDF Dosyaları (*.pdf)"))
-        if not out_path:
+        if not out_path or safe_write.blocked(self, out_path):     # (hedef bir sekmede acik: yazilmaz)
             return
         QApplication.setOverrideCursor(Qt.WaitCursor)
         try:
             merged = fitz.open()
-            for i in range(count):
-                src = fitz.open(self._path(i))
-                merged.insert_pdf(src)
-                src.close()
-            merged.save(out_path, garbage=3, deflate=True)
-            total = len(merged)
-            merged.close()
+            try:
+                for i in range(count):
+                    src = fitz.open(self._path(i))
+                    merged.insert_pdf(src)
+                    src.close()
+                with safe_write.Writer() as w:     # gecici dosyaya; basarili olunca hedefin yerine
+                    merged.save(w.path(out_path), garbage=3, deflate=True)
+                total = len(merged)
+            finally:
+                merged.close()
         except Exception as e:
             QApplication.restoreOverrideCursor()
             QMessageBox.critical(self, _t("Hata"), _t("Birleştirme sırasında hata oluştu:\n{e}", e=e))
@@ -564,7 +568,7 @@ class SplitDialog(QDialog):
 
     def __init__(self, parent=None, initial=None):
         super().__init__(parent)
-        self.setWindowTitle(_t("PDF Ayır"))
+        self.setWindowTitle(_t("PDF Böl"))
         self.resize(900, 560)
         self.src_path = None
         self.page_count = 0
@@ -575,7 +579,7 @@ class SplitDialog(QDialog):
         v = QVBoxLayout(self)
         v.setContentsMargins(22, 20, 22, 18)
         v.setSpacing(14)
-        v.addWidget(_header(_t("PDF Ayır"),
+        v.addWidget(_header(_t("PDF Böl"),
                             _t("Sayfaların arasındaki makasa tıklayarak nereden bölüneceğini seçin. "
                             "Her parça ayrı bir PDF dosyası olur.")))
 
@@ -595,10 +599,9 @@ class SplitDialog(QDialog):
         ft.addStretch()
         cancel = _btn(_t("Vazgeç"))
         cancel.clicked.connect(self.reject)
-        self.btn_split = _btn(_t("Böl ve kaydet"), _icon("fa5s.cut", "#ffffff"), "primary")
+        self.btn_split = _btn(_t("Böl ve kaydet"), _icon("fa5s.cut", _color(QPalette.BrightText)), "primary")
         self.btn_split.clicked.connect(self.do_split)
-        ft.addWidget(cancel)
-        ft.addWidget(self.btn_split)
+        ft.addWidget(action_buttons(self.btn_split, cancel))
         v.addLayout(ft)
 
         self.setAcceptDrops(True)
@@ -693,7 +696,7 @@ class SplitDialog(QDialog):
                 QMessageBox.warning(self, _t("Parola korumalı"), _t("Bu PDF parola korumalı; önce parolayı kaldırın."))
                 return
             if len(doc) < 2:
-                QMessageBox.warning(self, _t("Uyarı"), _t("Bu PDF sadece 1 sayfa, ayrılamaz."))
+                QMessageBox.warning(self, _t("Uyarı"), _t("Bu PDF sadece 1 sayfa, bölünemez."))
                 return
             self.src_path = path
             self.page_count = len(doc)
@@ -784,6 +787,8 @@ class SplitDialog(QDialog):
             return
         base = os.path.splitext(os.path.basename(self.src_path))[0]
         targets = [os.path.join(out_dir, f"{base}_{i}.pdf") for i in range(1, len(segs) + 1)]
+        if safe_write.blocked(self, targets):  # (parcalardan biri bir sekmede acik: hicbiri yazilmaz)
+            return
         existing = [t for t in targets if os.path.exists(t)]
         if existing:
             r = QMessageBox.question(
@@ -796,18 +801,23 @@ class SplitDialog(QDialog):
         QApplication.setOverrideCursor(Qt.WaitCursor)
         try:
             src = fitz.open(self.src_path)
-            for (a, b), out_path in zip(segs, targets):
-                part = fitz.open()
-                part.insert_pdf(src, from_page=a, to_page=b)
-                part.save(out_path, garbage=3, deflate=True)
-                part.close()
-            src.close()
+            try:
+                with safe_write.Writer() as w:     # ya butun parcalar yerine konur ya hicbiri
+                    for (a, b), out_path in zip(segs, targets):
+                        part = fitz.open()
+                        try:
+                            part.insert_pdf(src, from_page=a, to_page=b)
+                            part.save(w.path(out_path), garbage=3, deflate=True)
+                        finally:
+                            part.close()
+            finally:
+                src.close()
         except Exception as e:
             QApplication.restoreOverrideCursor()
-            QMessageBox.critical(self, _t("Hata"), _t("Ayırma sırasında hata oluştu:\n{e}", e=e))
+            QMessageBox.critical(self, _t("Hata"), _t("Bölme sırasında hata oluştu:\n{e}", e=e))
             return
         QApplication.restoreOverrideCursor()
-        done_box(self, _t("Ayrıldı"),
+        done_box(self, _t("Bölündü"),
                  _t("{n} dosya kaydedildi:\n\n", n=len(targets)) + "\n".join(os.path.basename(t) for t in targets)
                  + _t("\n\nKlasör: {path}", path=out_dir), out_dir)
         self.accept()

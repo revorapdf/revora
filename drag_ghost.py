@@ -25,7 +25,16 @@ def _qimage(pix):
     return QImage(pix.samples, pix.width, pix.height, pix.stride, fmt).copy()
 
 
-def render_without(doc, pno, scale, remove, rect, isolate=False):
+def clip_rect(rect, scale):
+    """Goruntu pikseli bolgesi (QRect) -> get_pixmap icin sayfa bolgesi. Kenarlar cok az iceri
+    cekilir: MuPDF bolgeyi disa dogru tam piksele yuvarlar; kayan nokta hatasi (100.0000001)
+    bir piksel fazla cizdirmesin, cikan goruntu TAM olarak istenen pikseller olsun."""
+    e = 0.01
+    return fitz.Rect(rect.x() + e, rect.y() + e, rect.x() + rect.width() - e,
+                     rect.y() + rect.height() - e) * (1 / scale)
+
+
+def render_without(doc, pno, scale, remove, rect, isolate=False, base=None):
     """Sayfanin, remove(doc, page) ile nesnesi cikarilmis halini ayni olcekte,
     SADECE rect bolgesinde (goruntu pikseli, QRect) cizer -> (QImage, QRect, nesne).
     Bolge cizimi tam sayfa ciziminin ayni pikselleridir ama cok daha hizlidir.
@@ -33,7 +42,9 @@ def render_without(doc, pno, scale, remove, rect, isolate=False):
     boylece cizim/metin konumlari birebir gecerlidir. remove False donerse ya
     da hata olursa None.
     isolate: cikarilan YAZININ tek basina, saydam zeminli goruntusu de uretilir
-    (nesne; olmazsa None) - bkz. text_only."""
+    (nesne; olmazsa None) - bkz. text_only.
+    base: ekrandaki sayfa goruntusu sayfanin TAMAMI degil de bir bolgesiyse o bolge (QRect,
+    goruntu pikseli) - bkz. main.render_current_page (yuksek yakinlikta bolge cizimi)."""
     tmp = None
     try:
         tmp = fitz.open("pdf", doc.tobytes())
@@ -45,9 +56,15 @@ def render_without(doc, pno, scale, remove, rect, isolate=False):
             # resimler bolgesel cizimde FARKLI orneklenir (MuPDF resmin sadece gereken
             # kismini, baska olcekte cozer) -> resmin parcasi "degismis" sanilip nesneyle
             # birlikte tasiniyordu. Resim varsa tam sayfa cizilir (birebir ayni pikseller).
-            img = _qimage(page.get_pixmap(matrix=fitz.Matrix(scale, scale), alpha=False))
-            r = rect.intersected(img.rect())
-            part = img.copy(r)
+            # (Ekrandaki goruntu bir BOLGE ise ayni bolge cizilir: ayni kirpma = ayni pikseller.)
+            if base is None:
+                img = _qimage(page.get_pixmap(matrix=fitz.Matrix(scale, scale), alpha=False))
+                r = rect.intersected(img.rect())
+                part = img.copy(r)
+            else:
+                pix = page.get_pixmap(matrix=fitz.Matrix(scale, scale), clip=clip_rect(base, scale), alpha=False)
+                r = rect.intersected(QRect(pix.x, pix.y, pix.width, pix.height))
+                part = _qimage(pix).copy(r.translated(-pix.x, -pix.y))
         else:
             pix = page.get_pixmap(matrix=fitz.Matrix(scale, scale), clip=clip, alpha=False)
             part, r = _qimage(pix), QRect(pix.x, pix.y, pix.width, pix.height)

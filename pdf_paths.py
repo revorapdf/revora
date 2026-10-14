@@ -17,8 +17,9 @@ Koordinat zinciri:  icerik uzayi --CTM--> PDF kullanici uzayi
                     --page.transformation_matrix--> sayfa (fitz, sol-ust) uzayi
 """
 import math
+import re
 import fitz
-from pdf_content import _tokenize, _matmul, IDENT, single_stream
+from pdf_content import tokens, _matmul, IDENT, single_stream
 from curve_math import cubic_from_bend, bend_from_cubic, dash_array, dash_string, nearest_dash
 
 _OPERANDS = {b"m": 2, b"l": 2, b"c": 6, b"v": 4, b"y": 4, b"re": 4, b"h": 0}
@@ -179,7 +180,7 @@ def parse_paths(doc, page):
     nums, starts = [], []
     cur = None
     items = []
-    for t in _tokenize(data):
+    for t in tokens(data):                 # (ayni akis icin paylasilan liste: bkz. pdf_content.tokens)
         k = t["kind"]
         if k == "number":
             nums.append(float(t["val"]))
@@ -392,6 +393,30 @@ def _scale(M):
     return math.sqrt(abs(M.a * M.d - M.b * M.c)) or 1.0
 
 
+_NUM = rb"[-+]?(?:\d+\.?\d*|\.\d+)"
+_STYLE_OP = (rb"(?:" + _NUM + rb"\s+w|" + _NUM + rb"\s+" + _NUM + rb"\s+" + _NUM + rb"\s+(?:RG|rg)|"
+             rb"\[[^\]]*\]\s*" + _NUM + rb"\s+d)")
+_WRAP_HEAD = re.compile(rb"(?<![^\s])q((?:\s+" + _STYLE_OP + rb")+)\s+$")
+_WRAP_OP = re.compile(_STYLE_OP)
+_WRAP_TAIL = re.compile(rb"\s*Q(?![^\s])")
+_STYLE_ORDER = (b"w", b"RG", b"d", b"rg")
+
+
+def _own_wrapper(data, it):
+    """Yol daha once restyle_items ile sarilmis mi: 'q <yalniz stil ayarlari> YOL Q'.
+    -> (sarmalin basi, sonu, {operator: ayar metni}) ya da None."""
+    lo = max(0, it.start - 400)
+    head = _WRAP_HEAD.search(data, lo, it.start)
+    tail = _WRAP_TAIL.match(data, it.paint_end)
+    if head is None or tail is None:
+        return None
+    ops = {}
+    for m in _WRAP_OP.finditer(head.group(1)):
+        text = m.group(0)
+        ops[text.split()[-1]] = text
+    return head.start(), tail.end(), ops
+
+
 def restyle_items(doc, page, items, width=None, stroke=None, fill=None, dashed=None,
                   color=None):
     """Kalinlik / renk / kesikli cizgi degistirir: yolu 'q <ayarlar> ... Q'
@@ -400,8 +425,19 @@ def restyle_items(doc, page, items, width=None, stroke=None, fill=None, dashed=N
     color: yolun GORUNEN rengi - konturluysa kontur (RG), sadece dolguluysa
     dolgu (rg). Eskiden hep kontur rengi degisiyordu; dolgulu cizgilerde
     (Word/Excel tablolari) renk degisikligi hicbir sey yapmiyordu.
-    Kalinlik ve kesikli stil yalnizca konturlu yollara uygulanir."""
+    Kalinlik ve kesikli stil yalnizca konturlu yollara uygulanir.
+
+    TEKRARLANABILIR: yol daha once bu islevle sarilmissa yeni bir kat eklenmez, var olan
+    sarmalin ayarlari guncellenir (verilmeyen ayar oldugu gibi kalir). Eskiden her cagri bir kat
+    daha sariyordu ('q .. q .. q .. YOL Q Q Q'): kalinlik surguyle ayarlanirken her ara deger
+    uygulandigi icin icerik sisip ic ice 'q' sayisi okuyucularin sinirini (28) asardi.
+
+    Dondurur: yapilan degisiklikler [(eski bas, eski son, yeni uzunluk, yol, yolun yeni
+    sarmaldaki konumu)] - shift_offsets ile eldeki yol listesi yeniden ayristirilmadan
+    guncellenebilir."""
     repl = []
+    edits = []
+    data = None
     for it in items:
         pre = []
         sc = _scale(it.to_page)
@@ -419,12 +455,49 @@ def restyle_items(doc, page, items, width=None, stroke=None, fill=None, dashed=N
             pre.append("{} {} {} rg".format(*[_fmt(c) for c in fl_col]))
         if not pre:
             continue
-        data = doc.xref_stream(single_stream(doc, page))
+        if data is None:
+            data = doc.xref_stream(single_stream(doc, page))
         body = data[it.start:it.paint_end]
-        repl.append((it.start, it.paint_end,
-                     b"q " + " ".join(pre).encode() + b" " + body + b" Q"))
+        start, end = it.start, it.paint_end
+        ops = {}
+        own = _own_wrapper(data, it)
+        if own is not None:
+            start, end, ops = own
+        for text in pre:
+            b_ = text.encode()
+            ops[b_.split()[-1]] = b_
+        head = b"q " + b" ".join(ops[k] for k in _STYLE_ORDER if k in ops) + b" "
+        new = head + body + b" Q"
+        repl.append((start, end, new))
+        edits.append((start, end, len(new), it, len(head)))
     if repl:
         _apply_replacements(doc, page, repl)
+    return edits
+
+
+def shift_offsets(items, edits):
+    """restyle_items'tan sonra: yol listesindeki bayt konumlarini YENIDEN AYRISTIRMADAN gunceller.
+    Stil sarmali yalniz 'q <ayarlar>' ve 'Q' ekler: yollarin sirasi, geometrisi ve donusumleri
+    ayni kalir, yalniz akistaki yerleri kayar. (Sayfayi bastan ayristirmak 600 cizimli sayfada
+    ~55 ms: kalinlik surgusunun her adiminda yapilinca canli ayar akici olmuyordu.)
+    items: sayfanin BUTUN yollari (akis sirasinda); edits: restyle_items'in dondurdugu liste."""
+    edits = sorted(edits, key=lambda e: e[0])
+    own = {id(e[3]): e for e in edits}
+    k, delta = 0, 0                     # delta: bu noktaya kadar biten degisikliklerin toplam kaymasi
+    for it in items:
+        e = own.get(id(it))
+        if e is not None:               # degisen yolun kendisi: sarmalin icindeki yeni yeri
+            before = sum(x[2] - (x[1] - x[0]) for x in edits if x[1] <= e[0])
+            d = e[0] + before + e[4] - it.start
+        else:
+            while k < len(edits) and edits[k][1] <= it.start:
+                delta += edits[k][2] - (edits[k][1] - edits[k][0])
+                k += 1
+            d = delta
+        if d:
+            it.start += d
+            it.end += d
+            it.paint_end += d
 
 
 def style_of(page, item):
