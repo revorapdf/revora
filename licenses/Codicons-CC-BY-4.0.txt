@@ -1,0 +1,7 @@
+Codicons 0.0.36 - icon font bundled with Revora PDF through QtAwesome.
+Copyright (c) Microsoft Corporation. Source: https://github.com/microsoft/vscode-codicons
+
+Licensed under the Creative Commons Attribution 4.0 International Public License (CC BY 4.0):
+https://creativecommons.org/licenses/by/4.0/legalcode
+
+The font is included unmodified. It is provided "as is", without warranties of any kind.

@@ -38,6 +38,7 @@ REM --onedir     : tek dosya (onefile) gibi her acilista gecici klasore acilmaz,
 REM --icon       : exe dosyasinin Windows'ta gorunen ikonu
 REM --add-data   : pencere/gorev cubugu ikonu icin logo (main.py resource_path ile bulur)
 REM                ve dil dosyalari: locales klasoru (i18n.locales_dir)
+REM                ve lisans metinleri: licenses klasoru + LICENSE (Hakkinda > Ucuncu taraf lisanslari)
 REM PySide6 icin --collect-all KULLANILMIYOR: PyInstaller'in kendi kancasi gerekenleri
 REM alir; hepsini toplamak paketi yuzlerce MB buyutup acilisi yavaslatir.
 %PY% -m PyInstaller --noconfirm --clean --onedir --windowed ^
@@ -47,10 +48,21 @@ REM alir; hepsini toplamak paketi yuzlerce MB buyutup acilisi yavaslatir.
     --add-data "assets\revora_mark.png;assets" ^
     --add-data "locales;locales" ^
     --add-data "VERSION;." ^
+    --add-data "licenses;licenses" ^
+    --add-data "LICENSE;licenses" ^
     --collect-all pymupdf ^
     --collect-data qtawesome ^
+    --exclude-module PySide6.QtDataVisualization ^
+    --exclude-module qtpy.QtDataVisualization ^
     "main.py"
 if errorlevel 1 goto :error
+
+REM Kullanilmayan, yalniz GPL lisansli iki Qt modulu pakete girmesin (lisans denetimi, 2026-10-15):
+REM Data Visualization'i qtawesome'in bagimliligi qtpy getiriyordu (yukarida dislandi); Virtual
+REM Keyboard dokunmatik ekran klavyesi eklentisi, PyInstaller standart giris eklentileriyle aliyor.
+set VKB=dist\Revora\_internal\PySide6
+if exist "%VKB%\plugins\platforminputcontexts\qtvirtualkeyboardplugin.dll" del /q "%VKB%\plugins\platforminputcontexts\qtvirtualkeyboardplugin.dll"
+if exist "%VKB%\Qt6VirtualKeyboard.dll" del /q "%VKB%\Qt6VirtualKeyboard.dll"
 
 REM build_store.bat "store" ile cagirir: Inno kurulumu yerine Microsoft Store paketi (MSIX)
 if /i "%~1"=="store" goto :store

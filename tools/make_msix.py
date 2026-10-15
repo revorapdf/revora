@@ -158,6 +158,42 @@ def run(cmd):
     return r.stdout
 
 
+# Pakete GIRMEMESI gereken, yalniz GPL lisansli ve kullanilmayan Qt parcalari (bkz. build_exe.bat)
+UNWANTED = ("Qt6DataVisualization.dll", "QtDataVisualization.pyd", "Qt6VirtualKeyboard.dll",
+            "qtvirtualkeyboardplugin.dll")
+
+
+def audit(path, ver):
+    """Paket denetimi (lisans duzeni, 2026-10-15): her paketten sonra paketin ICINE bakar.
+    Sorunlarin listesini dondurur (bos = temiz)."""
+    import zipfile
+    z = zipfile.ZipFile(path)
+    names = z.namelist()
+    base = {n.rsplit("/", 1)[-1] for n in names}
+    bad = []
+    try:
+        if z.read("_internal/VERSION").decode("utf-8").strip() + ".0" != ver:
+            bad.append("paketteki VERSION surum numarasiyla ayni degil")
+    except KeyError:
+        bad.append("pakette VERSION yok")
+    if "LICENSE.txt" not in names:
+        bad.append("pakette LICENSE.txt (AGPL) yok")
+    lic = [n for n in names if n.startswith("_internal/licenses/")]
+    if not any(n.endswith("/LICENSE") for n in lic) or not any(n.endswith("/README.txt") for n in lic):
+        bad.append("pakette licenses/ klasoru (LICENSE + README.txt) eksik")
+    bad += [f"kullanilmayan GPL'li Qt parcasi pakette: {u}" for u in UNWANTED if u in base]
+    readme = z.read("_internal/licenses/README.txt").decode("utf-8") if "_internal/licenses/README.txt" in names else ""
+    known = {"codicon": "Codicons", "elusiveicons": "Elusive", "fontawesome5": "Font Awesome Free 5",
+             "fontawesome6": "Font Awesome Free 5 and 6", "materialdesignicons": "Material Design Icons",
+             "phosphor": "Phosphor", "remixicon": "Remix Icon"}
+    for n in (names if readme else []):                      # (README yoksa yukarida zaten bildirildi)
+        if "/qtawesome/fonts/" in n and n.endswith(".ttf"):
+            f = n.rsplit("/", 1)[-1]
+            if not any(f.startswith(k) and v in readme for k, v in known.items()):
+                bad.append(f"ikon yazi tipinin lisansi licenses/README.txt'te yok: {f}")
+    return bad
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--register", action="store_true")
@@ -193,6 +229,13 @@ def main():
     print("MSIX paketleniyor...")
     run([sdk_tool("makeappx.exe"), "pack", "/d", STAGE, "/p", out, "/o"])
     print(f"Hazir: {out}  ({os.path.getsize(out) / 1e6:.1f} MB, surum {ver})")
+    bad = audit(out, ver)
+    if bad:
+        print("PAKET DENETIMI: SORUN VAR - Store'a yuklemeden once duzeltin:")
+        for b in bad:
+            print("  -", b)
+    else:
+        print("Paket denetimi: temiz (surum, AGPL + ucuncu taraf lisanslari, Qt parcalari, ikon lisanslari).")
 
     if a.register:
         print("Bu bilgisayara gelistirici olarak kaydediliyor...")

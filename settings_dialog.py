@@ -670,8 +670,22 @@ class SettingsDialog(QDialog):
         v.addWidget(lab)
         comp = QLabel(_t("PyMuPDF / MuPDF — AGPL-3.0\n"
                       "Qt for Python (PySide6) — LGPL-3.0\n"
-                      "QtAwesome ve Font Awesome / Material Design ikonları — MIT / OFL"))
+                      "Python — PSF lisansı\n"
+                      "QtAwesome — MIT; ikonlar: Font Awesome (OFL 1.1), Material Design Icons (Apache 2.0), Phosphor (MIT)"))
         comp.setObjectName("fieldLabel")
+        comp.setWordWrap(True)
         v.addWidget(comp)
+        # lisans metinleri programin icinde (paketle gelen licenses/ klasoru; bkz. dialogs.LicensesDialog)
+        lic_link = QLabel(f'<a href="#">{_t("Üçüncü taraf lisansları")}</a>')
+        lic_link.setTextInteractionFlags(Qt.TextBrowserInteraction)
+        lic_link.linkActivated.connect(lambda _h: self._show_licenses())
+        v.addWidget(lic_link)
         v.addStretch()
         return w
+
+    def _show_licenses(self):
+        import os
+        import title_bar
+        from dialogs import LicensesDialog
+        base = getattr(sys, "_MEIPASS", os.path.dirname(os.path.abspath(__file__)))
+        title_bar.run_modal(LicensesDialog(self, os.path.join(base, "licenses")))

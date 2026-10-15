@@ -8,9 +8,9 @@ from PySide6.QtWidgets import (
     QDialog, QVBoxLayout, QHBoxLayout, QFormLayout, QLabel, QPushButton, QTextEdit,
     QLineEdit, QDoubleSpinBox, QSpinBox, QCheckBox, QComboBox, QColorDialog,
     QRadioButton, QButtonGroup, QDialogButtonBox, QScrollArea, QWidget, QMessageBox,
-    QProgressDialog, QApplication, QFrame, QSizePolicy
+    QProgressDialog, QApplication, QFrame, QSizePolicy, QListWidget, QPlainTextEdit
 )
-from PySide6.QtGui import QColor, QCursor, QPainter, QPen
+from PySide6.QtGui import QColor, QCursor, QPainter, QPen, QFontDatabase
 from PySide6.QtCore import Qt, Signal, QCollator, QLocale, QSize, QEvent, QRectF
 
 from font_resolver import FONT_DISPLAY_NAMES
@@ -490,6 +490,59 @@ class PasswordDialog(QDialog):
 
 
 # ---------------------------------------------------------------- kucultme
+class LicensesDialog(QDialog):
+    """Ucuncu taraf lisanslari (Hakkinda > "Ucuncu taraf lisanslari"). Paketle gelen licenses/
+    klasorundeki metinler programin ICINDE gosterilir: Store paketinin klasoru korumali bir Windows
+    klasoru, Gezgin'de acmak calismayabilir. LGPL (Qt / PySide6) lisans metninin programla
+    birlikte verilmesini ister (2026-10-15)."""
+
+    def __init__(self, parent, folder):
+        import os
+        super().__init__(parent)
+        self.setWindowTitle(_t("Üçüncü taraf lisansları"))
+        self._paths = []
+        if os.path.isdir(folder):
+            names = sorted(f for f in os.listdir(folder) if f.lower().endswith(".txt") or f == "LICENSE")
+            names.sort(key=lambda f: (f != "README.txt", f != "LICENSE", f.lower()))
+            self._paths = [os.path.join(folder, f) for f in names]
+        own = os.path.join(os.path.dirname(folder), "LICENSE")      # (kaynaktan calisirken: projenin lisansi)
+        if os.path.isfile(own) and not any(os.path.basename(p) == "LICENSE" for p in self._paths):
+            self._paths.insert(1 if self._paths else 0, own)
+        v = QVBoxLayout(self)
+        v.setContentsMargins(20, 16, 20, 16)
+        v.setSpacing(10)
+        h = QHBoxLayout()
+        h.setSpacing(12)
+        self.list = QListWidget()
+        self.list.setFixedWidth(250)
+        for p in self._paths:
+            b = os.path.basename(p)
+            self.list.addItem("LICENSE (Revora PDF, AGPL-3.0)" if b == "LICENSE" else b)
+        self.text = QPlainTextEdit()
+        self.text.setReadOnly(True)
+        self.text.setLineWrapMode(QPlainTextEdit.NoWrap)        # (metinler zaten satirlara bolunmus)
+        self.text.setFont(QFontDatabase.systemFont(QFontDatabase.FixedFont))
+        h.addWidget(self.list)
+        h.addWidget(self.text, 1)
+        v.addLayout(h, 1)
+        bb = QDialogButtonBox(QDialogButtonBox.Close)
+        bb.button(QDialogButtonBox.Close).setText(_t("Kapat"))
+        bb.rejected.connect(self.reject)
+        v.addWidget(bb)
+        self.list.currentRowChanged.connect(self._show)
+        if self._paths:
+            self.list.setCurrentRow(0)
+        self.resize(900, 600)
+
+    def _show(self, row):
+        if 0 <= row < len(self._paths):
+            try:
+                with open(self._paths[row], encoding="utf-8", errors="replace") as f:
+                    self.text.setPlainText(f.read())
+            except OSError:
+                self.text.setPlainText("")
+
+
 class CompressDialog(QDialog):
     """Kucultme duzeyi sec. Sonuc: self.level ("light" / "medium" / "strong")."""
 
