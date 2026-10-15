@@ -1,0 +1,9 @@
+# Calistigi DOGRULANMIS surumler (2026-10-12; Python 3.14.5, Windows 10).
+# requirements.txt yalniz en dusuk surumleri verir; ayni paketi yeniden uretmek ya da
+# "dun calisiyordu" sorununu ayiklamak icin bu surumler kullanilir:
+#     pip install -r requirements-lock.txt
+# Surum yukseltince tests/kabul_testi.py calistirilip bu dosya guncellenir.
+PyMuPDF==1.28.0
+PySide6==6.11.1
+qtawesome==1.4.2
+pyinstaller==6.21.0
