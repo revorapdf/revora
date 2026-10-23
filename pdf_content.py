@@ -250,7 +250,46 @@ _SHOW_OPS = (b"Tj", b"TJ", b"'", b'"')
 _SPACING_OPS = (b"Tc", b"Tw", b"Tz", b"TL", b"Ts")
 
 
-def _run(ops, first, origin, tol=2.0):
+def font_alias(page):
+    """Yazi tipi kaynak adlari -> yazi tipinin ASIL adi (alt kume oneki atilmis, kucuk harf), KAP
+    basina: {0: sayfanin kendi adlari, form_xref: o formun adlari}. Ayni ad ayni kapta farkli yazi
+    tiplerine gidiyorsa None (belirsiz: sikiya bakilir). (GMC Inspire PDF'inde sayfadaki /F0 kalin
+    yazi tipi, formlardaki /F0 ince yazi tipi.)"""
+    out = {}
+    try:
+        fonts = page.get_fonts(full=True)
+    except Exception:
+        return out
+    for f in fonts:
+        base, name, owner = f[3] or "", f[4] or "", f[6] if len(f) > 6 else 0
+        if not name:
+            continue
+        base = (base.split("+", 1)[1] if len(base) > 7 and base[6] == "+" else base).lower()
+        key = b"/" + name.encode("latin-1", "replace")
+        m = out.setdefault(owner or 0, {})
+        if key in m and m[key] != base:
+            m[key] = None
+        else:
+            m[key] = base
+    return out
+
+
+def _same_look(a, b, alias):
+    """Iki operatorun gorunumu ayni mi: renk ve boyut ayni, yazi tipi ya ayni kaynak ya da AYNI ASIL
+    yazi tipine giden iki kaynak (GMC Inspire PDF'leri her Turkce harfi ayni yazi tipinin ikinci, CID
+    kodlu kopyasiyla yaziyor: "L" /F, "u" /F2, "tfen" /F - MuPDF hepsini tek yazi okur)."""
+    if a == b:
+        return True
+    if not alias or a is None or b is None or a[1] != b[1] or a[0] is None or b[0] is None:
+        return False
+    (na, sa), (nb, sb) = a[0], b[0]
+    if abs((sa or 0) - (sb or 0)) > 0.01:
+        return False
+    fa, fb = alias.get(na), alias.get(nb)
+    return fa is not None and fa == fb
+
+
+def _run(ops, first, origin, tol=2.0, alias=None):
     """origin'deki yaziyi cizen operatorlerin TAMAMI (akis sirasiyla).
 
     first: origin'e en yakin operator (yazinin basi). Bir yazi tek operatorle cizilmek zorunda
@@ -280,10 +319,18 @@ def _run(ops, first, origin, tol=2.0):
     ux, uy = dx / length, dy / length
     for k in range(first["i"] + 1, len(ops)):
         op = ops[k]
+        if op.get("follows") and _same_look(op.get("look"), first.get("look"), alias):
+            # Yeni konum verilmeden, onceki parcanin BITTIGI yerden devam ediyor (yeri hesaplanamaz:
+            # harf genislikleri bilinmiyor) ve gorunumu ayni: ayni yazinin devami. GMC Inspire PDF'i
+            # Turkce harfte yazi tipini degistirip konum vermeden devam ediyor ("b" /F, "o" /F2, "lumunu"
+            # /F ...); eskiden ilk Turkce harfte duruluyor, satirin kalani silinmiyordu (duzenlenen
+            # paragraf eskisinin ustune yaziliyordu).
+            out.append(op)
+            continue
         if not op["direct"]:
             px, py = op["origin"][0] - ox, op["origin"][1] - oy
             along, across = px * ux + py * uy, abs(py * ux - px * uy)
-            if op.get("look") != first.get("look") or across > tol or not (0.5 < along < length - 0.25):
+            if not _same_look(op.get("look"), first.get("look"), alias) or across > tol                     or not (0.5 < along < length - 0.25):
                 break
         out.append(op)
     return out
@@ -392,6 +439,7 @@ def _scan(data: bytes, base, ctm0=IDENT, toks=None):
     since = 0                # son gosterme operatorunden beri gorulen komut sayisi (bkz. _run)
     look = (None, None)      # gecerli (yazi tipi + boyut, dolgu rengi): q / Q ile saklanir, geri gelir
     look_stack = []
+    moved = True             # son gosterme operatorunden beri yazi konumu yeniden verildi mi (bkz. _run)
     for idx, t in enumerate(toks):
         k = t["kind"]
         if k == "number":
@@ -437,25 +485,31 @@ def _scan(data: bytes, base, ctm0=IDENT, toks=None):
         elif op == b"BT":
             Tm = IDENT
             Tlm = IDENT
+            moved = True
         elif op == b"Tm" and len(nums) >= 6:
             Tm = tuple(nums[-6:])
             Tlm = Tm
+            moved = True
         elif op == b"Td" and len(nums) >= 2:
             Tlm = _matmul((1, 0, 0, 1, nums[-2], nums[-1]), Tlm)
             Tm = Tlm
+            moved = True
         elif op == b"TD" and len(nums) >= 2:
             leading = -nums[-1]
             Tlm = _matmul((1, 0, 0, 1, nums[-2], nums[-1]), Tlm)
             Tm = Tlm
+            moved = True
         elif op == b"TL" and len(nums) >= 1:
             leading = nums[-1]
         elif op == b"T*":
             Tlm = _matmul((1, 0, 0, 1, 0, -leading), Tlm)
             Tm = Tlm
+            moved = True
         elif op in (b"Tj", b"'", b'"', b"TJ"):
             if op in (b"'", b'"'):
                 Tlm = _matmul((1, 0, 0, 1, 0, -leading), Tlm)
                 Tm = Tlm
+                moved = True
             full = _matmul(Tm, ctm)
             x, y = full[4], full[5]
             origin = (ba * x + bc * y + be, bb * x + bd * y + bf)
@@ -463,9 +517,11 @@ def _scan(data: bytes, base, ctm0=IDENT, toks=None):
             if operand is not None:
                 out.append({"origin": origin, "op": op.decode(), "gs": gs,     # zincir
                             "i": len(out), "direct": since == 0 and bool(out), "look": look,
+                            "follows": not moved and bool(out),
                             "operand": {"start": operand["start"],
                                         "end": operand["end"]}})
             since = 0
+            moved = False
         elif op == b"Do" and idx > 0 and toks[idx - 1]["kind"] == "name":
             nt = toks[idx - 1]
             dos.append({"name": nt["val"][1:].decode("latin-1"),
@@ -548,15 +604,16 @@ def remove_text_at(doc, page, origin, tol=2.0):
     base = page.transformation_matrix
     ops, dos = _scan_cached(data, base)
 
+    alias = font_alias(page)
     best, bd = _nearest(ops, origin)
     if best is not None and bd <= tol:
-        _blank_all(doc, xref, data, _run(ops, best, origin, tol))
+        _blank_all(doc, xref, data, _run(ops, best, origin, tol, alias.get(0)))
         return True
 
     # Sayfanin kendi akisinda yok: metin bir Form XObject icinde olabilir
     # (Adobe'nin "Filigran ekle"si filigrani boyle koyar). Onlara in.
     try:
-        found = _search_forms(doc, page, base, dos, origin, tol)
+        found = _search_forms(doc, page, base, dos, origin, tol, alias=alias)
     except Exception:
         return False
     if found is None:
@@ -661,12 +718,13 @@ def remove_texts_at(doc, page, origins, tol=2.0):
     xref = xrefs[0]
     data = doc.xref_stream(xref)
     ops, _ = _scan_cached(data, page.transformation_matrix)
+    alias = font_alias(page)
     found = []
     for o in origins:
         best, bd = _nearest(ops, o)
         if best is None or bd > tol:
             return all(remove_text_at(doc, page, q, tol) for q in origins)
-        found.extend(_run(ops, best, o, tol))
+        found.extend(_run(ops, best, o, tol, alias.get(0)))
     _blank_all(doc, xref, data, found)
     return True
 
@@ -683,11 +741,12 @@ def remove_texts_each(doc, page, origins, tol=2.0):
     xref = xrefs[0]
     data = doc.xref_stream(xref)
     ops, _ = _scan_cached(data, page.transformation_matrix)
+    alias = font_alias(page)
     hits = []
     for o in origins:
         best, bd = _nearest(ops, o)
         hits.append(best if (best is not None and bd <= tol) else None)
-    _blank_all(doc, xref, data, [op for o, h in zip(origins, hits) if h is not None for op in _run(ops, h, o, tol)])
+    _blank_all(doc, xref, data, [op for o, h in zip(origins, hits) if h is not None for op in _run(ops, h, o, tol, alias.get(0))])
     return [True if h is not None else bool(remove_text_at(doc, page, o, tol)) for o, h in zip(origins, hits)]
 
 
@@ -719,7 +778,7 @@ def _form_matrix(doc, fx):
         return IDENT
 
 
-def _search_forms(doc, page, base, dos, origin, tol, depth=4):
+def _search_forms(doc, page, base, dos, origin, tol, depth=4, alias=None):
     """Sayfanin cagirdigi Form XObject'lerde (ic ice dahil) origin'deki metni
     arar. Bulursa ([(kap, ad_token, form_xref), ...], operator) dondurur;
     kap 0 = sayfanin kendisi."""
@@ -737,7 +796,7 @@ def _search_forms(doc, page, base, dos, origin, tol, depth=4):
             link = chain + [(container, do["tok"], fx)]
             best, bd = _nearest(ops, origin)
             if best is not None and bd <= tol:
-                return link, _run(ops, best, origin, tol)
+                return link, _run(ops, best, origin, tol, (alias or {}).get(fx))
             if level > 1:
                 r = walk(fx, sub, link, level - 1)
                 if r:
@@ -801,6 +860,242 @@ def add_resource(doc, holder, cat, name, ref):
         doc.xref_set_key(container, prefix + cat + "/" + name, ref)
     else:
         doc.xref_set_key(container, prefix + cat, f"<</{name} {ref}>>")
+
+
+
+# ---------------------------------------------------------------- formu sayfaya acma ("zarfi ac")
+_RES_CATS = ("Font", "XObject", "ExtGState", "ColorSpace", "Pattern", "Shading", "Properties")
+_PAINT = {b"f", b"F", b"f*", b"S", b"s", b"B", b"B*", b"b", b"b*"}
+
+
+def _dict_keys(text):
+    """PDF sozluk metninin ('<< /A 1 0 R /B << ... >> >>') UST duzey anahtarlari (sirayla)."""
+    keys, i, n = [], 0, len(text)
+    i = text.find("<<")
+    if i < 0:
+        return keys
+    i += 2
+
+    def skip_ws(j):
+        while j < n and text[j] in " \t\r\n\f\x00":
+            j += 1
+        return j
+
+    def skip_value(j):
+        j = skip_ws(j)
+        if text.startswith("<<", j):
+            depth = 0
+            while j < n:
+                if text.startswith("<<", j):
+                    depth += 1
+                    j += 2
+                elif text.startswith(">>", j):
+                    depth -= 1
+                    j += 2
+                    if depth == 0:
+                        return j
+                elif text[j] == "(":
+                    j = skip_string(j)
+                else:
+                    j += 1
+            return j
+        if text[j:j + 1] == "[":
+            depth = 0
+            while j < n:
+                c = text[j]
+                if c == "[":
+                    depth += 1
+                elif c == "]":
+                    depth -= 1
+                    if depth == 0:
+                        return j + 1
+                elif c == "(":
+                    j = skip_string(j) - 1
+                j += 1
+            return j
+        if text[j:j + 1] == "(":
+            return skip_string(j)
+        m = re.match(r"\d+\s+\d+\s+R", text[j:])           # dolayli nesne: "12 0 R"
+        if m:
+            return j + m.end()
+        m = re.match(r"/?[^\s/<>\[\]()]+|/", text[j:])
+        return j + (m.end() if m else 1)
+
+    def skip_string(j):
+        depth = 0
+        while j < n:
+            c = text[j]
+            if c == "\\":
+                j += 2
+                continue
+            if c == "(":
+                depth += 1
+            elif c == ")":
+                depth -= 1
+                if depth == 0:
+                    return j + 1
+            j += 1
+        return j
+
+    while True:
+        i = skip_ws(i)
+        if i >= n or text.startswith(">>", i):
+            return keys
+        m = re.match(r"/([^\s/<>\[\]()]+)", text[i:])
+        if not m:
+            return keys
+        keys.append(m.group(1))
+        i = skip_value(i + m.end())
+
+
+def _res_entries(doc, xref, prefix):
+    """xref nesnesinin <prefix>Resources sozlugunden {kategori: {ad: deger metni}}; kaynak
+    sozlugu yoksa None (miras alir)."""
+    kind, val = doc.xref_get_key(xref, prefix + "Resources")
+    if kind == "null":
+        return None
+    if kind == "xref":
+        holder, pre = _ref_xref(val), ""
+    else:
+        holder, pre = xref, prefix + "Resources/"
+    out = {}
+    for cat in _RES_CATS:
+        kind, val = doc.xref_get_key(holder, pre + cat)
+        if kind == "xref":
+            h2, p2 = _ref_xref(val), ""
+            names = list(doc.xref_get_keys(h2))
+        elif kind == "dict":
+            h2, p2 = holder, pre + cat + "/"
+            names = _dict_keys(val)
+        else:
+            continue
+        ent = {}
+        for nm in names:
+            k2, v2 = doc.xref_get_key(h2, p2 + nm)
+            if k2 == "xref":
+                ent[nm] = v2
+            elif k2 in ("dict", "array", "name", "int", "float", "bool"):
+                ent[nm] = v2
+        if ent:
+            out[cat] = ent
+    return out
+
+
+def _has_paint(data):
+    return any(t["kind"] == "op" and t["val"] in _PAINT for t in tokens(data))
+
+
+def _form_paints(doc, fx, depth=4):
+    """Formda ya da ICINDEKI formlarda (ic ice zarf: PyMuPDF'in show_pdf_page'i, bazi araclar) cizim
+    (boyanan yol) var mi."""
+    body = doc.xref_stream(fx)
+    if body and _has_paint(body):
+        return True
+    if depth <= 1:
+        return False
+    for val in ((_res_entries(doc, fx, "") or {}).get("XObject") or {}).values():
+        try:
+            cx = _ref_xref(val)
+        except Exception:
+            continue
+        if doc.xref_get_key(cx, "Subtype") == ("name", "/Form") and _form_paints(doc, cx, depth - 1):
+            return True
+    return False
+
+
+def inline_forms(doc, page):
+    """ZARFI AC: sayfanin akisindan DOGRUDAN cagrilan ve icinde cizim (boyanan yol) olan Form
+    XObject'lerin icerigi sayfa akisina acilir: "/Ad Do" yerine "q <Matrix> cm <BBox> re W n <formun
+    akisi> Q". Formun kaynaklari sayfanin kaynaklarina eklenir; ayni ad baska nesneye gidiyorsa ad
+    degistirilir (formun akisinda da). Gorunum degismez. Neden: cizim duzenleme (pdf_paths) yalniz
+    sayfanin kendi akisini okur; HTML -> PDF araclari (HiQPdf: e-Arsiv faturasi) sayfanin TAMAMINI
+    bir formun icine koyuyor, cizgiler secilemiyordu. Formun kendisi silinmez (baska sayfa / yer
+    kullaniyor olabilir). -> acilan cagri sayisi (0: dokunulmadi)."""
+    xref = single_stream(doc, page)
+    if xref is None:
+        return 0
+    forms = {}
+    for fx, name, invoker, _bbox in page.get_xobjects():
+        if invoker == 0 and doc.xref_get_key(fx, "Subtype") == ("name", "/Form"):
+            forms[("/" + name).encode("latin-1", "replace")] = fx
+    if not forms:
+        return 0
+    data = doc.xref_stream(xref)
+    toks = tokens(data)
+    calls = [(toks[i - 1], t) for i, t in enumerate(toks)
+             if i > 0 and t["kind"] == "op" and t["val"] == b"Do" and toks[i - 1]["kind"] == "name"
+             and toks[i - 1]["val"] in forms]
+    if not calls:
+        return 0
+    contents = {}
+    for nt, _do in calls:
+        fx = forms[nt["val"]]
+        if fx not in contents:
+            body = doc.xref_stream(fx)
+            contents[fx] = body if body and _form_paints(doc, fx) else None
+    calls = [(nt, do) for nt, do in calls if contents[forms[nt["val"]]] is not None]
+    if not calls:
+        return 0
+    page_res = _res_entries(doc, page.xref, "")
+    if page_res is None:
+        raise _Skip()                                  # (kaynaklar miras: eklemek mirasi golgeler)
+    used = {nm for ent in page_res.values() for nm in ent}
+    # Sayfanin akisinda gecen her ad da DOLU: kaynaklarda tanimsiz bir ada (bozuk ama goruntuleyicilerin
+    # idare ettigi PDF) formun kaynagini eklemek sayfanin kendi yazisini o kaynaga baglardi.
+    used |= {t["val"][1:].decode("latin-1", "replace") for t in toks if t["kind"] == "name"}
+    new_body = {}
+    for fx in {forms[nt["val"]] for nt, _d in calls}:
+        body = contents[fx]
+        fres = _res_entries(doc, fx, "") or {}
+        rename = {}
+        for cat, ent in fres.items():
+            have = page_res.get(cat, {})
+            for nm, val in ent.items():
+                if have.get(nm) == val:
+                    continue                           # (ayni ad, ayni nesne: zaten var)
+                if nm in used or nm in rename:
+                    new = rename.get(nm)
+                    if new is None:
+                        k = 1
+                        while "%sf%d" % (nm, k) in used:
+                            k += 1
+                        new = rename[nm] = "%sf%d" % (nm, k)
+                        used.add(new)
+                    add_resource(doc, page.xref, cat, new, val)
+                    page_res.setdefault(cat, {})[new] = val
+                else:
+                    add_resource(doc, page.xref, cat, nm, val)
+                    page_res.setdefault(cat, {})[nm] = val
+                    used.add(nm)
+        if rename:                                     # formun akisinda ad degistir (sondan basa)
+            parts, last = [], 0
+            for t in tokens(body):
+                if t["kind"] == "name":
+                    nm = t["val"][1:].decode("latin-1", "replace")
+                    if nm in rename:
+                        parts.append(body[last:t["start"]])
+                        parts.append(b"/" + rename[nm].encode("latin-1"))
+                        last = t["end"]
+            parts.append(body[last:])
+            body = b"".join(parts)
+        M = _form_matrix(doc, fx)
+        kind, bb = doc.xref_get_key(fx, "BBox")
+        clip = b""
+        if kind == "array":
+            try:
+                x0, y0, x1, y1 = (float(v) for v in bb.strip("[]").split())
+                clip = b"%g %g %g %g re W n\n" % (min(x0, x1), min(y0, y1), abs(x1 - x0), abs(y1 - y0))
+            except ValueError:
+                clip = b""
+        new_body[fx] = (b"q\n%g %g %g %g %g %g cm\n" % tuple(M)) + clip + body + b"\nQ"
+    parts, last = [], 0
+    for nt, do in calls:
+        parts.append(data[last:nt["start"]])
+        parts.append(new_body[forms[nt["val"]]])
+        last = do["end"]
+    parts.append(data[last:])
+    doc.update_stream(xref, b"".join(parts))
+    return len(calls)
 
 
 def extgstate_blend(doc, page, name):

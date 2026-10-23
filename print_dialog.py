@@ -64,15 +64,37 @@ def plan(page_w, page_h, paper_w, paper_h, margins, orient, fit):
     return pw, ph, area, tgt, turn
 
 
-def render(page, w_px, h_px, gray, rotate=False):
-    """Sayfanin goruntusu (w_px x h_px, donmeden once). gray: siyah-beyaz."""
-    sx = w_px / page.rect.width
-    sy = h_px / page.rect.height
+MAX_PIXELS = 40_000_000      # tek sayfa goruntusu en cok bu kadar piksel (~120 MB RGB; asilirsa cozunurluk duser)
+
+
+def visible_part(tgt, area, page_rect):
+    """Hedefin (sayfanin kagit uzerindeki yeri) KAGITTA GORUNEN kismi -> (gorunen QRectF, sayfadaki
+    karsiligi fitz.Rect) | None. "Gercek boyut"ta kagittan buyuk sayfanin yalniz kagida dusen bolgesi
+    cizilir (Codex incelemesi 2026-10-22: 5 metrelik paftada kagit disi dahil ~10,8 GB goruntu isteniyordu)."""
+    vis = tgt.intersected(area)
+    if vis.isEmpty():
+        return None
+    kx = tgt.width() / max(1e-6, page_rect.width)
+    ky = tgt.height() / max(1e-6, page_rect.height)
+    clip = fitz.Rect(page_rect.x0 + (vis.left() - tgt.left()) / kx, page_rect.y0 + (vis.top() - tgt.top()) / ky,
+                     page_rect.x0 + (vis.right() - tgt.left()) / kx, page_rect.y0 + (vis.bottom() - tgt.top()) / ky)
+    return vis, clip
+
+
+def render(page, w_px, h_px, gray, rotate=False, clip=None):
+    """Sayfanin (ya da sayfadaki clip bolgesinin) goruntusu, w_px x h_px (donmeden once). gray: siyah-beyaz.
+    Piksel sayisi MAX_PIXELS'i asarsa cozunurluk orantili duser (olcek / yerlesim degismez)."""
+    clip = fitz.Rect(clip) if clip is not None else fitz.Rect(page.rect)
+    if w_px * h_px > MAX_PIXELS:
+        f = (MAX_PIXELS / float(w_px * h_px)) ** 0.5
+        w_px, h_px = max(1, int(w_px * f)), max(1, int(h_px * f))
+    sx = w_px / max(1e-6, clip.width)
+    sy = h_px / max(1e-6, clip.height)
     mat = fitz.Matrix(sx, sy)
     if rotate:
         mat = mat.prerotate(90)
     cs = fitz.csGRAY if gray else fitz.csRGB
-    pix = page.get_pixmap(matrix=mat, alpha=False, colorspace=cs)
+    pix = page.get_pixmap(matrix=mat, alpha=False, colorspace=cs, clip=clip)
     fmt = QImage.Format_Grayscale8 if gray else QImage.Format_RGB888
     return QImage(pix.samples, pix.width, pix.height, pix.stride, fmt).copy()
 
@@ -103,21 +125,20 @@ class _Sheet(QWidget):
         p.setBrush(QColor("#ffffff"))
         p.drawRect(sheet)
         dpr = self.devicePixelRatioF()
-        tw, th = max(1, round(tgt.width() * k * dpr)), max(1, round(tgt.height() * k * dpr))
-        key = (pno, tw, th, v.gray, v.gen)
-        if key != self._key:
-            try:
-                self._img = render(v.doc[pno], tw, th, v.gray)
-                self._img.setDevicePixelRatio(dpr)
-            except Exception:
-                self._img = None
-            self._key = key
-        clip = QRectF(1 + area.x() * k, 1 + area.y() * k, area.width() * k, area.height() * k)
-        if self._img is not None:
-            p.save()
-            p.setClipRect(clip)
-            p.drawImage(QRectF(1 + tgt.x() * k, 1 + tgt.y() * k, tgt.width() * k, tgt.height() * k), self._img)
-            p.restore()
+        part = visible_part(tgt, area, v.doc[pno].rect)       # (yalniz kagida dusen bolge cizilir)
+        if part is not None:
+            vis, pclip = part
+            tw, th = max(1, round(vis.width() * k * dpr)), max(1, round(vis.height() * k * dpr))
+            key = (pno, tw, th, round(vis.x(), 2), round(vis.y(), 2), v.gray, v.gen)
+            if key != self._key:
+                try:
+                    self._img = render(v.doc[pno], tw, th, v.gray, clip=pclip)
+                    self._img.setDevicePixelRatio(dpr)
+                except Exception:
+                    self._img = None
+                self._key = key
+            if self._img is not None:
+                p.drawImage(QRectF(1 + vis.x() * k, 1 + vis.y() * k, vis.width() * k, vis.height() * k), self._img)
         p.end()
 
 
@@ -605,21 +626,26 @@ def print_pages(doc, printer, pages, opts, progress=None):
             pw, ph, area, tgt, turn = plan(page.rect.width, page.rect.height, full.width(), full.height(),
                                            tuple(max(0.0, x) for x in m), o, fit)
             px_per_pt = vp.width() / max(1.0, paint.width())
+            part = visible_part(tgt, area, page.rect)  # yalniz KAGIDA DUSEN bolge cizilir
+            if part is None:
+                done += 1
+                continue
+            vis, pclip = part
             if turn:
                 # dik duzlemdeki hedef -> yazici duzlemi, saat yonunde 90 derece: alan icinde
                 # (x, y, gen, yuk) -> (alan_yuk - y - yuk, x, yuk, gen)  (alan_yuk: dik alanin yuksekligi)
-                x0 = (tgt.x() - area.x()) * px_per_pt
-                y0 = (tgt.y() - area.y()) * px_per_pt
-                w_, h_ = tgt.width() * px_per_pt, tgt.height() * px_per_pt
+                x0 = (vis.x() - area.x()) * px_per_pt
+                y0 = (vis.y() - area.y()) * px_per_pt
+                w_, h_ = vis.width() * px_per_pt, vis.height() * px_per_pt
                 ah = area.height() * px_per_pt
                 rect = QRectF(vp.x() + (ah - y0 - h_), vp.y() + x0, h_, w_)
                 img = render(page, max(1, round(w_ * dpi / printer.resolution())),
-                             max(1, round(h_ * dpi / printer.resolution())), gray, rotate=True)
+                             max(1, round(h_ * dpi / printer.resolution())), gray, rotate=True, clip=pclip)
             else:
-                rect = QRectF(vp.x() + (tgt.x() - area.x()) * px_per_pt, vp.y() + (tgt.y() - area.y()) * px_per_pt,
-                              tgt.width() * px_per_pt, tgt.height() * px_per_pt)
+                rect = QRectF(vp.x() + (vis.x() - area.x()) * px_per_pt, vp.y() + (vis.y() - area.y()) * px_per_pt,
+                              vis.width() * px_per_pt, vis.height() * px_per_pt)
                 img = render(page, max(1, round(rect.width() * dpi / printer.resolution())),
-                             max(1, round(rect.height() * dpi / printer.resolution())), gray)
+                             max(1, round(rect.height() * dpi / printer.resolution())), gray, clip=pclip)
             painter.save()
             painter.setClipRect(vp)
             painter.drawImage(rect, img)

@@ -40,6 +40,7 @@ class PathItem:
         self.segs = segs            # [(op, [sayilar]), ...] icerik uzayinda
         self.to_page = to_page      # fitz.Matrix: icerik -> sayfa
         self.polys = _page_polys(segs, to_page)
+        self.clip = None            # etkin kirpma alani (sayfa uzayi), parse_paths doldurur
         pts = [p for poly, _ in self.polys for p in poly]
         if pts:
             self.bbox = fitz.Rect(min(p.x for p in pts), min(p.y for p in pts),
@@ -176,6 +177,7 @@ def parse_paths(doc, page):
     data = doc.xref_stream(xref)
     base = page.transformation_matrix
     ctm = IDENT
+    clip = None                            # etkin kirpma alani (sayfa uzayi; None = yok), q / Q ile
     stack = []
     nums, starts = [], []
     cur = None
@@ -204,15 +206,22 @@ def parse_paths(doc, page):
                 cur["clip"] = True
         elif op in PAINT_OPS or op == b"n":
             if cur is not None and not cur["clip"] and op != b"n":
-                items.append(PathItem(len(items), cur["start"], cur["end"], t["end"],
-                                      op.decode(), cur["segs"],
-                                      fitz.Matrix(*cur["ctm"]) * base))
+                it = PathItem(len(items), cur["start"], cur["end"], t["end"],
+                              op.decode(), cur["segs"], fitz.Matrix(*cur["ctm"]) * base)
+                it.clip = clip                 # (cizimin gorundugu alan: disina tasininca kirpilir)
+                items.append(it)
+            if cur is not None and cur["clip"]:
+                pts = [q for poly, _ in _page_polys(cur["segs"], fitz.Matrix(*cur["ctm"]) * base) for q in poly]
+                if pts:
+                    r = fitz.Rect(min(q.x for q in pts), min(q.y for q in pts),
+                                  max(q.x for q in pts), max(q.y for q in pts))
+                    clip = r if clip is None else (fitz.Rect(clip) & r)
             cur = None
         elif op == b"q":
-            stack.append(ctm)
+            stack.append((ctm, clip))
         elif op == b"Q":
             if stack:
-                ctm = stack.pop()
+                ctm, clip = stack.pop()
         elif op == b"cm" and len(nums) >= 6:
             ctm = _matmul(tuple(nums[-6:]), ctm)
         nums, starts = [], []
@@ -320,6 +329,60 @@ def transform_each(doc, page, pairs):
         repl.append((it.start, it.end, _emit(_xform_segs(it.segs, T))))
     if repl:
         _apply_replacements(doc, page, repl)
+
+
+def drawing_of(page, item):
+    """Yolun PyMuPDF cizimi (get_drawings: sayfa uzayinda parcalar, renkler, kalinlik, kesik, uc / kose
+    bicimi, opaklik) - kutusu ayni olan cizim; bulunamazsa None. Konturlu cizimin kutusu cizgi
+    kalinliginin yarisi kadar genistir (2 pt cizgide her yanda 1 pt): ikisi de denenir."""
+    best, bd = None, 1.0
+    for d in page.get_drawings():
+        r = d["rect"]
+        h = (d.get("width") or 0.0) / 2 if "s" in (d.get("type") or "") else 0.0
+        for g in ((0.0, 0.0), (h, h)) if h else ((0.0, 0.0),):
+            dd = (abs(r.x0 + g[0] - item.bbox.x0) + abs(r.y0 + g[1] - item.bbox.y0)
+                  + abs(r.x1 - g[0] - item.bbox.x1) + abs(r.y1 - g[1] - item.bbox.y1))
+            if dd < bd:
+                best, bd = d, dd
+    return best
+
+
+def transform_and_drop(doc, page, keep, A, drop):
+    """keep yollarini A ile yerinde donustur, drop yollarini akistan cikar - tek seferde (byte konumlari
+    kaymasin)."""
+    repl = []
+    for it in keep:
+        T = it.to_page * A * ~it.to_page
+        repl.append((it.start, it.end, _emit(_xform_segs(it.segs, T))))
+    repl += [(it.start, it.paint_end, b" ") for it in drop]
+    if repl:
+        _apply_replacements(doc, page, repl)
+
+
+def redraw(page, d, A):
+    """get_drawings cizimini (d) A ile donusturup sayfanin SONUNA ayni gorunumle yeniden ciz."""
+    sh = page.new_shape()
+    for it in d["items"]:
+        k = it[0]
+        if k == "l":
+            sh.draw_line(it[1] * A, it[2] * A)
+        elif k == "c":
+            sh.draw_bezier(it[1] * A, it[2] * A, it[3] * A, it[4] * A)
+        elif k == "re":
+            q = fitz.Rect(it[1]).quad * A
+            sh.draw_quad(q)
+        elif k == "qu":
+            sh.draw_quad(fitz.Quad(it[1]) * A)
+    kind = d.get("type") or ""
+    stroke = d.get("color") if "s" in kind else None
+    fill = d.get("fill") if "f" in kind else None
+    sh.finish(color=stroke, fill=fill, width=d.get("width") or 0, dashes=d.get("dashes") or None,
+              lineCap=max(d.get("lineCap") or (0,)) if d.get("lineCap") else 0,
+              lineJoin=d.get("lineJoin") or 0, closePath=bool(d.get("closePath")),
+              even_odd=bool(d.get("even_odd")),
+              stroke_opacity=d.get("stroke_opacity") if d.get("stroke_opacity") is not None else 1,
+              fill_opacity=d.get("fill_opacity") if d.get("fill_opacity") is not None else 1)
+    sh.commit(overlay=True)
 
 
 def _axis_rect_poly(item):

@@ -117,6 +117,11 @@ def resolve_font_path(base_font_name: str, force_bold: bool = None,
     exact = matched_family is not None
     if matched_family is None:
         matched_family = FALLBACK_FAMILY
+        # Bulunamayan DAR yazi tipi (InterstateCondensed, ...Narrow, ...Compressed): Arial yerine Arial
+        # Narrow (Office ile gelir). Arial'la duzenlenen satir ozgununden ~%20 genis cikiyordu.
+        if re.search(r"condensed|narrow|compress", key) and os.path.exists(
+                os.path.join(WINDOWS_FONT_DIR, FONT_FAMILY_MAP["arialnarrow"][0])):
+            matched_family = "arialnarrow"
 
     regular, b, i, bi = FONT_FAMILY_MAP[matched_family]
     if bold and italic:

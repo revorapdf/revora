@@ -1203,6 +1203,8 @@ class _DocTab:
         self.engine = engine
         self.page = 0
         self.zoom = None              # None: ilk gosterimde genislige sigdirilir
+        self.fit = None               # sigdirma kipi ("page" / "width"): pencere boyuyla yeniden sigar
+        self.fit_vp = (0, 0)
         self.scroll = (0, 0)
         self.thumbs = None            # kucuk resimler: sekmeye donunce yeniden cizilmesin
         self.thumbs_ver = -1
@@ -1570,6 +1572,15 @@ class MainWindow(QMainWindow, MarkupMixin, FindMixin):
         self._bar_placer = _Resized(self._place_bar_overlay)
         center.installEventFilter(self._bar_placer)
         self.scroll.viewport().installEventFilter(self._bar_placer)
+        # "sigdir" kipinde (sayfaya / genislige) pencere buyuyup kuculunce sayfa yeniden sigdirilir
+        self._fit = None                       # None | "page" | "width"; elle yakinlastirinca None
+        self._fit_vp = (0, 0)                  # sigdirildigi andaki goruntu alani boyutu
+        self._refit_timer = QTimer(self)
+        self._refit_timer.setSingleShot(True)
+        self._refit_timer.setInterval(200)
+        self._refit_timer.timeout.connect(self._refit)
+        self._refit_watch = _Resized(self._refit_soon)
+        self.scroll.viewport().installEventFilter(self._refit_watch)
         self._seg_placer = _GeomWatch(self._place_mode_seg)     # modlar tuvalin ortasina hizali
         center.installEventFilter(self._seg_placer)
         self.topbar.installEventFilter(self._seg_placer)
@@ -1864,6 +1875,10 @@ class MainWindow(QMainWindow, MarkupMixin, FindMixin):
                                  _t("Tabloları, yazıları ve resimleri Excel dosyasına aktar"), self.export_excel),
                  self._side_item("mdi6.image-outline", _t("Resim olarak kaydet"),
                                  _t("Sayfaları PNG / JPG olarak kaydet"), lambda: self.export_pages_dialog()),
+                 # (kaydet menusunde de var; kullanici solda bulamadi: "sikistiri bulamadim")
+                 self._side_item("mdi6.arrow-collapse-vertical", _t("PDF sıkıştır"),
+                                 _t("Dosya boyutunu küçült; küçük kopya ayrı dosya olarak kaydedilir"),
+                                 self.save_compressed),
                  self._side_item("mdi6.printer-outline", _t("Yazdır"), _t("Yazdır (Ctrl+P)"), self.print_pdf)]
         for b in items:
             mv.addWidget(b)
@@ -2475,26 +2490,29 @@ class MainWindow(QMainWindow, MarkupMixin, FindMixin):
         self._slider(self.spin_opacity, 1, 100, 1)
         self._slider(self.spin_spacing, 0.8, 4.0, 10)
         # hizalama: sola / ortaya / saga (mevcut yazi degisince hangi ucu sabit kalsin;
-        # yeni metinde tiklanan nokta yazinin basi / ortasi / sonu)
+        # yeni metinde tiklanan nokta yazinin basi / ortasi / sonu) / iki yana (paragrafin kutusunda
+        # kelime aralari acilir; tek satirda ve yeni metinde sola gibi)
         self.align_btns = {}
         ag = QButtonGroup(self)
         ag.setExclusive(True)
         for key, icon_name, tip in (("left", "mdi6.format-align-left", _t("Sola dayalı")),
                                     ("center", "mdi6.format-align-center", _t("Ortalı")),
-                                    ("right", "mdi6.format-align-right", _t("Sağa dayalı"))):
+                                    ("right", "mdi6.format-align-right", _t("Sağa dayalı")),
+                                    ("justify", "mdi6.format-align-justify", _t("İki yana yasla"))):
             b = self._bar_btn(icon_name, tip)
             ag.addButton(b)
             b.clicked.connect(lambda _=False, k=key: self._set_text_align(k))
             self.align_btns[key] = b
         self.text_align = self._settings.value("text_align", "left", type=str)
-        if self.text_align not in self.align_btns:
-            self.text_align = "left"
+        if self.text_align not in self.align_btns or self.text_align == "justify":
+            self.text_align = "left"                   # (iki yana yasla kalici degil: bkz. _set_text_align)
         self.align_btns[self.text_align].setChecked(True)
         # gruplar (kalin ayirici): yazi gorunumu || paragraf (satir araligi, hiza, sigdir)
         # || aci || duzenle/sil. Dondurme oklari yok: aci kutusu (▾ surgu) yeterli.
         for w in (self.combo_font, self.spin_size, self.chk_bold, self.btn_color, self.spin_opacity,
                   markup_bar.vsep(True), self.spin_spacing, self.align_btns["left"],
-                  self.align_btns["center"], self.align_btns["right"], self.chk_autofit):
+                  self.align_btns["center"], self.align_btns["right"], self.align_btns["justify"],
+                  self.chk_autofit):
             lt.addWidget(w)
         self.tx_rot_box, lr = markup_bar.group()
         lr.addWidget(markup_bar.vsep(True))
@@ -2583,10 +2601,26 @@ class MainWindow(QMainWindow, MarkupMixin, FindMixin):
         self._bar_full_h = (m.top() + m.bottom() + self.mk_bar_host.layout().spacing()
                             + sum(rc.height() for rc in self._bar_row_widgets))
 
+    def _size_val(self):
+        """Punto kutusunun degeri; kutu secili yazinin degerini gosteriyor ve kullanici DEGISTIRMEDIYSE
+        ozgun (yuvarlanmamis) punto. Kutu bir basamaga yuvarlar (7,5557 -> 7,6): duzenlenen yazi bu
+        yuvarlanmis puntoyla yazilinca %0,6 buyuyor, satirlari kayiyordu (kullanici, e-Arsiv faturasi)."""
+        v = self.spin_size.value()
+        ex = getattr(self, "_size_exact", None)
+        return ex[0] if ex is not None and abs(v - ex[1]) < 1e-9 else v
+
+    def _spacing_val(self):
+        """Satir araligi kutusu: _size_val gibi (1,1818 -> 1,18)."""
+        v = self.spin_spacing.value()
+        ex = getattr(self, "_spacing_exact", None)
+        return ex[0] if ex is not None and abs(v - ex[1]) < 1e-9 else v
+
     def _set_text_align(self, key):
         self.text_align = key
         try:
-            self._settings.setValue("text_align", key)
+            # IKI YANA YASLA HATIRLANMAZ: secili kalip fark edilmeden sonraki her paragrafi (sola yaslilari
+            # da) yasliyordu (kullanici, 2026-10-23). Sola / orta / saga eskisi gibi hatirlanir.
+            self._settings.setValue("text_align", key if key != "justify" else "left")
         except Exception:
             pass
         self._apply_editor_align()
@@ -2596,7 +2630,7 @@ class MainWindow(QMainWindow, MarkupMixin, FindMixin):
     def _apply_editor_align(self):
         opt = self.txt_new.document().defaultTextOption()
         opt.setAlignment({"left": Qt.AlignLeft, "center": Qt.AlignHCenter,
-                          "right": Qt.AlignRight}[self.text_align])
+                          "right": Qt.AlignRight, "justify": Qt.AlignLeft}[self.text_align])   # (bkz. _tx_params)
         self.txt_new.document().setDefaultTextOption(opt)
 
     # ---------------- ust serit: aninda uygula ----------------
@@ -2863,7 +2897,7 @@ class MainWindow(QMainWindow, MarkupMixin, FindMixin):
         """Satir araligi: kutudaki deger; ama kullanici degistirmediyse paragrafin GERCEK
         araligi. Kutu iki ondaliga yuvarlar (1,2083 -> 1,21): yuvarlanmis degerle yazilinca
         alt satirlar her duzenlemede azicik kayiyordu."""
-        v = self.spin_spacing.value()
+        v = self._spacing_val()
         sp = self.current_span if self.mode == "text" else None
         real = getattr(sp, "line_spacing", None)
         if real and abs(round(real, 2) - v) < 0.005:
@@ -2887,13 +2921,18 @@ class MainWindow(QMainWindow, MarkupMixin, FindMixin):
             if lk not in cache:
                 cache[lk] = eng.edit_look(sp, choice, bold)
             k, track, stretch = cache[lk]
-            size = (self.spin_size.value() or sp.size) * k
+            size = (self._size_val() or sp.size) * k
             if self.chk_autofit.isChecked() and text.strip():
                 size = eng._fit_size(fo, text, sp.bbox, size, sp, track * stretch)
             q = sp.quad()
             align = self.text_align
             if hasattr(sp, "lines") and align == "left":
                 align = sp.align
+            if align == "justify":
+                # Yazarken IKI YANA YASLANMAZ (dogal aralik), uygulayinca yaslanir: imleci yoneten yazi kutusu
+                # (QTextEdit) elle bolunmus satirlari yaslamiyor; onizleme yaslarsa imlec bir yerde, silinen
+                # harf baska yerde kaliyordu (kullanici: "duzenleme cizgisi 5'in uzerinde, TL'nin L'si siliniyor").
+                align = "left"
             return {"font": fo, "key": key, "size": size, "color": self.selected_color or sp.color_rgb(),
                     "align": align, "ref": abs(q[1] - q[0]) if align != "left" else None,
                     "origin": fitz.Point(sp.origin), "angle": eng.span_angle(sp) if sp.rotated else 0.0,
@@ -2903,7 +2942,7 @@ class MainWindow(QMainWindow, MarkupMixin, FindMixin):
             if key not in cache:
                 cache[key] = eng._font_from_hint(choice or "Arial", bold)[0]
             _, x, y = self.pending_insert
-            return {"font": cache[key], "key": key, "size": self.spin_size.value(),
+            return {"font": cache[key], "key": key, "size": self._size_val(),
                     "color": self.selected_color or (0, 0, 0), "align": self.text_align, "ref": None,
                     "origin": fitz.Point(x, y), "angle": 0.0, "track": 1.0, "stretch": 1.0}
         return None
@@ -3002,15 +3041,15 @@ class MainWindow(QMainWindow, MarkupMixin, FindMixin):
         """Donuk yazinin ayri yazma kutusunda yazi boyutu (ekran px): gercek boyuta yakin ama
         hep okunakli."""
         sp = self.current_span
-        size = (self.spin_size.value() or (sp.size if sp is not None else 11))
+        size = (self._size_val() or (sp.size if sp is not None else 11))
         return max(14.0, min(24.0, size * self.canvas.zoom))
 
     def _tx_line_px(self):
         """Yazma kutusunda bir satirin yuksekligi (ekran px) = boyut x satir araligi x zoom."""
         if self.mode == "text" and self.current_span is not None:
-            size = self.spin_size.value() or self.current_span.size
+            size = self._size_val() or self.current_span.size
         else:
-            size = self.spin_size.value()
+            size = self._size_val()
         if getattr(self, "_tx_box", False):        # donuk yazi: ayri kutu, okunakli sabit boyut
             return self._tx_box_px() * 1.3
         if getattr(self, "_tx_live", False):       # canli: gercek boyut (otomatik sigdirma dahil)
@@ -3034,7 +3073,7 @@ class MainWindow(QMainWindow, MarkupMixin, FindMixin):
         if self.mode == "text" and self.current_span is not None:
             sp = self.current_span
             q = sp.quad()
-            size = self.spin_size.value() or sp.size
+            size = self._size_val() or sp.size
             fam = self.combo_font.currentText() if self.combo_font.currentData() else self._preview_family(sp.font)
             rotated = sp.rotated
             o = cv.to_px(fitz.Point(sp.origin))
@@ -3044,7 +3083,7 @@ class MainWindow(QMainWindow, MarkupMixin, FindMixin):
                                          max(p.x for p in q), max(p.y for p in q)))
         elif self.mode == "insert" and self.pending_insert is not None:
             _, x, y = self.pending_insert
-            size = self.spin_size.value()
+            size = self._size_val()
             fam = self.combo_font.currentText() if self.combo_font.currentData() else "Arial"
             o = cv.to_px((x, y))
             length = 0.0
@@ -3549,6 +3588,7 @@ class MainWindow(QMainWindow, MarkupMixin, FindMixin):
         t = self.tabs[self.tab_idx]
         t.page = self.current_page
         t.zoom = self.canvas.zoom
+        t.fit, t.fit_vp = self._fit, self._fit_vp
         t.scroll = (self.scroll.horizontalScrollBar().value(), self.scroll.verticalScrollBar().value())
         t.thumbs = [self.thumbs.item(i) for i in range(self.thumbs.count())]
         t.thumbs_ver = t.engine.version
@@ -3588,9 +3628,13 @@ class MainWindow(QMainWindow, MarkupMixin, FindMixin):
             self._thumb_fill()                 # (sekmeden cikilirken yarim kalmis olabilir)
         else:
             self._populate_thumbnails()
+        vp = self._fit_area()
         if t.zoom is None:
             self.fit_to_page()
+        elif t.fit and (abs(vp.width() - t.fit_vp[0]) > 2 or abs(vp.height() - t.fit_vp[1]) > 2):
+            (self.fit_to_page if t.fit == "page" else self.fit_to_width)()   # (pencere o arada buyudu)
         else:
+            self._fit, self._fit_vp = t.fit, t.fit_vp
             self.canvas.zoom = t.zoom
             self.render_current_page()
             hs, vs = t.scroll
@@ -4364,8 +4408,62 @@ class MainWindow(QMainWindow, MarkupMixin, FindMixin):
     def set_zoom(self, value):
         if not self.engine.doc:
             return
+        self._fit = None
         self.canvas.zoom = max(MIN_ZOOM, min(value, MAX_ZOOM))
         self.render_current_page()
+
+    def _refit_soon(self):
+        """Goruntu alani boyut degistirdi (pencere buyutuldu / kucultuldu, panel acildi): sigdirma
+        kipindeyse sayfa HEMEN yeni boya oturur - eldeki goruntu gerilerek (tekerlekle yakinlastirmadaki
+        gibi, yeniden cizmeden; hafif). Keskin hali boyutlandirma bitince BIR KEZ cizilir (_refit).
+        Eskiden surukleme sirasinda sayfa her seferinde bastan ciziliyordu: Windows'un boyutlandirma
+        dongusu kesiliyor, pencere her hamlede ancak biraz kuculuyordu; sonra yalniz birakinca
+        sigdiriliyordu, kullanici: "realtime hizalanmasi gerekmez mi"."""
+        if self._fit is None or not self.engine.doc or not self.home.isHidden() or self.canvas._pix is None:
+            return
+        a = self._fit_area()
+        if abs(a.width() - self._fit_vp[0]) <= 2 and abs(a.height() - self._fit_vp[1]) <= 2:
+            return
+        self._fit_vp = (a.width(), a.height())
+        z = self._fit_zoom(self._fit)
+        if abs(z - self.canvas.zoom) > 1e-4:
+            self.canvas.preview_zoom(z)
+            self.lbl_zoom.setText(_t("%{z}", z=int(z * 100)))
+            self._fit_editors()
+        if self._fit == "page":
+            self._fit_scroll_top()
+        self._refit_timer.start()
+
+    @staticmethod
+    def _mouse_held():
+        """Sol fare tusu basili mi (pencere kenarindan surukleme suruyor mu). Windows'un boyutlandirma
+        dongusunde Qt'nin fare durumu guncellenmez; tusun GERCEK durumu sorulur."""
+        if sys.platform == "win32":
+            try:
+                import ctypes
+                return bool(ctypes.windll.user32.GetAsyncKeyState(0x01) & 0x8000)
+            except Exception:
+                pass
+        return bool(QApplication.mouseButtons() & Qt.LeftButton)
+
+    def _fit_editors(self):
+        if self.mk_text.isVisible():           # (acik yazi kutulari sayfayla birlikte)
+            self._mk_position_editor()
+        if self.txt_new.isVisible():
+            self._tx_editor_color()
+            self._position_text_editor()
+
+    def _refit(self):
+        """Boyutlandirma durdu: gerilmis goruntunun keskin halini ciz. Surukleme suruyorsa (fare tusu
+        basili) beklenir - agir cizim Windows'un boyutlandirmasini kesmesin."""
+        if self._fit is None or not self.engine.doc or not self.home.isHidden():
+            return
+        if self._mouse_held():
+            self._refit_timer.start()
+            return
+        if abs(self.canvas.stretch() - 1.0) > 1e-6 or abs(self.canvas.zoom - self._fit_zoom(self._fit)) > 1e-4:
+            (self.fit_to_page if self._fit == "page" else self.fit_to_width)()
+            self._fit_editors()
 
     def on_wheel_zoom(self, delta_y, canvas_pos):
         if not self.engine.doc:
@@ -4387,6 +4485,7 @@ class MainWindow(QMainWindow, MarkupMixin, FindMixin):
         BIR KEZ cizilir (_zoom_settle). canvas_pos: sabit kalacak nokta (tuval koordinati)."""
         old_zoom = self.canvas.zoom
         new_zoom = max(MIN_ZOOM, min(zoom, MAX_ZOOM))
+        self._fit = None                       # (elle yakinlastirildi: pencere boyuyla degismez)
         if new_zoom == old_zoom:
             return
         hbar = self.scroll.horizontalScrollBar()
@@ -4433,38 +4532,50 @@ class MainWindow(QMainWindow, MarkupMixin, FindMixin):
         self.scroll.horizontalScrollBar().setValue(int(self._pan_start_scroll[0] - dx))
         self.scroll.verticalScrollBar().setValue(int(self._pan_start_scroll[1] - dy))
 
+    def _fit_zoom(self, kind):
+        """Sigdirma yakinligi: "width" -> genislige, "page" -> sayfanin tamami gorunsun."""
+        r = self.engine.doc[self.current_page].rect
+        vp = self._fit_area()
+        if kind == "width":
+            z = (vp.width() - 30) / r.width
+        else:
+            m = self.canvas.pad_bottom
+            z = min((vp.width() - 30) / r.width, (vp.height() - 2 * m) / r.height)
+        return max(MIN_ZOOM, min(z, MAX_ZOOM))
+
+    def _fit_area(self):
+        """Sigdirmanin olctugu alan: kaydirma cubuklari YOKMUS gibi goruntu alani (cubuk cikip
+        kaybolunca sigdirma degismesin; yoksa pencere boyutlanirken sayfa iki boy arasinda gidip
+        gelebiliyordu). 30 px kenar payi dikey cubugu karsilar."""
+        return self.scroll.maximumViewportSize()
+
+    def _fit_scroll_top(self):
+        """Sayfaya sigdirinca: sayfanin ustu gorunen alanin ustunden FIT_MARGIN asagida."""
+        self.scroll.verticalScrollBar().setValue(max(0, self.canvas.pad_top - self.canvas.pad_bottom))
+
     def fit_to_width(self):
         if not self.engine.doc:
             return
-        page = self.engine.doc[self.current_page]
-        avail_width = self.scroll.viewport().width() - 30
-        self.canvas.zoom = max(MIN_ZOOM, min(avail_width / page.rect.width, MAX_ZOOM))
+        vp = self._fit_area()
+        self.canvas.zoom = self._fit_zoom("width")
+        self._fit, self._fit_vp = "width", (vp.width(), vp.height())
         self.render_current_page()
 
     def fit_to_page(self):
         """Sayfanin TAMAMI gorunsun (genislik ve yukseklikten kucuk olan olcek)."""
         if not self.engine.doc:
             return
-        page = self.engine.doc[self.current_page]
-        vp = self.scroll.viewport()
+        vp = self._fit_area()
         # Sayfa gorunen alanin TAMAMINI kullanir (ust ve altta FIT_MARGIN kadar bosluk); yuzen
         # arac seritleri sayfanin ust kenarinin ustunde durur. Eskiden sayfa iki serit
         # satirinin ALTINDAN baslatiliyordu: ustte kocaman bos bant kaliyor, sayfa kuculuyordu
         # (kullanici: "cok cirkin duruyor"). Seritlerin altinda kalan yeri gormek icin yukari
         # kaydirilabilir (tuvalin ustundeki serit payi duruyor).
-        m = self.canvas.pad_bottom
-        avail_w = vp.width() - 30
-        avail_h = vp.height() - 2 * m
-        r = page.rect
-        z = min(avail_w / r.width, avail_h / r.height)
-        self.canvas.zoom = max(MIN_ZOOM, min(z, MAX_ZOOM))
+        self.canvas.zoom = self._fit_zoom("page")
+        self._fit, self._fit_vp = "page", (vp.width(), vp.height())
         self.render_current_page()
-        want = max(0, self.canvas.pad_top - m)
-
-        def settle():                          # kaydirma araligi yerlesimden sonra kesinlesir
-            self.scroll.verticalScrollBar().setValue(want)
-        settle()
-        QTimer.singleShot(0, settle)
+        self._fit_scroll_top()
+        QTimer.singleShot(0, self._fit_scroll_top)   # (kaydirma araligi yerlesimden sonra kesinlesir)
 
     # ------------------------------------------- yuksek yakinlik: yalniz gorunen bolge cizilir
     def _visible_px(self):
@@ -4724,6 +4835,7 @@ class MainWindow(QMainWindow, MarkupMixin, FindMixin):
             idx = self.combo_font.findData("Arial")
             self.combo_font.setCurrentIndex(idx if idx >= 0 else 0)
             self.spin_size.setValue(self._insert_size)
+            self._size_exact = self._spacing_exact = None     # (yeni metin: kutudaki deger gecerli)
             self.spin_opacity.setValue(100)
             self.chk_bold.setChecked(False)
             self.selected_color = None
@@ -5494,6 +5606,7 @@ class MainWindow(QMainWindow, MarkupMixin, FindMixin):
         pr = self.engine.doc[self.current_page].rect
         everything = fitz.Rect(-1e5, -1e5, pr.width + 1e5, pr.height + 1e5)
         spans = self.engine.spans_in_rect(self.current_page, everything)
+        self.engine.open_forms(self.current_page)      # (cizimler formun icindeyse: bkz. open_forms)
         paths = [it.index for it in self.engine.get_paths(self.current_page)
                  if abs(it.bbox.width * it.bbox.height) < 0.8 * abs(pr.width * pr.height)]
         images = [it.index for it in self.engine.images_in_rect(self.current_page, everything)]
@@ -5576,7 +5689,8 @@ class MainWindow(QMainWindow, MarkupMixin, FindMixin):
         moved = []
         with self.engine.undo_batch(group):
             if paths:                                  # once cizimler (sira numaralari tazeyken)
-                self.engine.move_paths(self.current_page, paths, dx, dy)
+                # (kirpma alaninin disina cikan cizim sayfanin sonuna gecer: sira numarasi degisir)
+                self.sel_paths = self.engine.move_paths(self.current_page, paths, dx, dy) or paths
             if images:
                 self.engine.move_images(self.current_page, images, dx, dy)
             moved = self.engine.move_spans(spans, dx, dy)      # tek geciste (yazi basina degil)
@@ -5634,8 +5748,8 @@ class MainWindow(QMainWindow, MarkupMixin, FindMixin):
         m = fitz.Matrix(1, 0, 0, 1, -c.x, -c.y) * fitz.Matrix(delta) * fitz.Matrix(1, 0, 0, 1, c.x, c.y)
         new = []
         with self.engine.undo_batch(group):
-            if paths:                                  # (sira numaralari degismez)
-                self.engine.transform_paths(self.current_page, paths, m)
+            if paths:                                  # (kirpma disina cikan cizimin sirasi degisir)
+                self.sel_paths = self.engine.transform_paths(self.current_page, paths, m) or paths
             if images:
                 self.engine.transform_images(self.current_page, images, m)
             if spans:
@@ -5877,9 +5991,13 @@ class MainWindow(QMainWindow, MarkupMixin, FindMixin):
             self.txt_new.setPlainText(span.text.replace("\xa0", " "))
             self.txt_new.blockSignals(False)
             self.spin_size.setValue(round(span.size, 1))
+            # (kutu yuvarlanmis gosterir; kullanici DEGISTIRMEDIKCE ozgun deger kullanilir: bkz. _size_val)
+            self._size_exact = (span.size, self._size_val())
             self.spin_opacity.setValue(max(1, round(span.opacity * 100)))
+            self._spacing_exact = None
             if getattr(span, "line_spacing", None):          # paragraf: gercek satir araligi
                 self.spin_spacing.setValue(round(span.line_spacing, 2))
+                self._spacing_exact = (span.line_spacing, self._spacing_val())
             self.combo_font.setCurrentIndex(0)
             self.chk_bold.setChecked(span.is_bold)
             self.selected_color = None
@@ -6086,12 +6204,12 @@ class MainWindow(QMainWindow, MarkupMixin, FindMixin):
                 vp = self.scroll.viewport()
                 c = self.canvas.mapFrom(vp, QPoint(vp.width() // 2, vp.height() // 2))
                 at = self.canvas.to_pdf(c)
-            size = self.spin_size.value() or 11
+            size = self._size_val() or 11
             self.engine.insert_text_new(
                 self.current_page, at.x, at.y, text.replace("\r\n", "\n").rstrip("\n"),
                 fontsize=size, color_rgb=self.selected_color or (0, 0, 0),
                 font_hint=self.combo_font.currentData() or "Arial", bold=self.chk_bold.isChecked(),
-                opacity=self.spin_opacity.value() / 100, line_spacing=self.spin_spacing.value())
+                opacity=self.spin_opacity.value() / 100, line_spacing=self._spacing_val())
             new = None
         else:
             return
@@ -6176,7 +6294,7 @@ class MainWindow(QMainWindow, MarkupMixin, FindMixin):
             return False
         _, x, y = self.pending_insert
         m = self.canvas.to_px((x, y))
-        h = self.spin_size.value() * self.canvas.zoom
+        h = self._size_val() * self.canvas.zoom
         return abs(pos.x() - m.x()) <= 8 and -h - 4 <= pos.y() - m.y() <= 6
 
     def _insert_press(self, pt, pos):
@@ -6346,6 +6464,7 @@ class MainWindow(QMainWindow, MarkupMixin, FindMixin):
         Tablo cizerken yeni cizgilerin mevcut izgaraya tam oturmasini saglar."""
         tol = self._tol(SNAP_PX)
         best, bd = None, tol
+        self.engine.open_forms(self.current_page)      # (formdaki tablo cizgilerine de yapissin)
         items = [it for it in self.engine.get_paths(self.current_page) if it.index not in exclude]
         for it in items:
             for poly, closed in it.polys:
@@ -6552,7 +6671,7 @@ class MainWindow(QMainWindow, MarkupMixin, FindMixin):
         if k == "move":
             dx, dy = d["cur"].x - d["start"].x, d["cur"].y - d["start"].y
             if abs(dx) > 0.01 or abs(dy) > 0.01:
-                self.engine.move_paths(pno, self.sel_paths, dx, dy)
+                self.sel_paths = self.engine.move_paths(pno, self.sel_paths, dx, dy) or self.sel_paths
                 self.after_edit()
                 self._on_path_selection()
                 self.status(_t("Taşındı."))
@@ -6567,7 +6686,7 @@ class MainWindow(QMainWindow, MarkupMixin, FindMixin):
                     else _t("Çizgi düzleştirildi.")
             else:
                 nb = self._handle_bbox(d["handle"], d["bbox"], d["cur"], d.get("keep"), d.get("center"))
-                self.engine.scale_paths(pno, self.sel_paths, d["bbox"], nb)
+                self.sel_paths = self.engine.scale_paths(pno, self.sel_paths, d["bbox"], nb) or self.sel_paths
             self.after_edit()
             self._on_path_selection()
             self.status(msg)
@@ -6629,6 +6748,7 @@ class MainWindow(QMainWindow, MarkupMixin, FindMixin):
         self._on_path_selection()
 
     def _select_all_paths(self):
+        self.engine.open_forms(self.current_page)
         self.sel_paths = [it.index for it in self.engine.get_paths(self.current_page)
                           if abs(it.bbox.width * it.bbox.height)
                           < 0.8 * abs(self.engine.doc[self.current_page].rect.width
@@ -6657,7 +6777,7 @@ class MainWindow(QMainWindow, MarkupMixin, FindMixin):
                 new.x1 = new.x0 + old.width
             if old.height <= 0.5:
                 new.y1 = new.y0 + old.height
-            self.engine.scale_paths(pno, self.sel_paths, old, new)
+            self.sel_paths = self.engine.scale_paths(pno, self.sel_paths, old, new) or self.sel_paths
         self.after_edit()
         self._on_path_selection()
         self.status(_t("Konum güncellendi."))
@@ -7280,7 +7400,7 @@ class MainWindow(QMainWindow, MarkupMixin, FindMixin):
         if self.drag and self.drag.get("kind") == "marker":
             self._paint_guides(p, cv, self.drag.get("guides"))
         _, x, y = self.pending_insert
-        size = self.spin_size.value()
+        size = self._size_val()
         q = cv.to_px((x, y))
         p.save()
         p.translate(q)
@@ -7301,7 +7421,7 @@ class MainWindow(QMainWindow, MarkupMixin, FindMixin):
             col = QColor.fromRgbF(*(self.selected_color or (0, 0, 0)))
             p.setOpacity(self.spin_opacity.value() / 100)
             p.setPen(col)
-            lh = size * self.spin_spacing.value() * cv.zoom
+            lh = size * self._spacing_val() * cv.zoom
             fm = p.fontMetrics()
             for k, line in enumerate(text.split("\n")):
                 lw = fm.horizontalAdvance(line)
@@ -7412,7 +7532,8 @@ class MainWindow(QMainWindow, MarkupMixin, FindMixin):
             self.after_edit()
             self._select_text_span(self._find_span_near(new) or new)
         elif self.mode == "shape" and self.sel_paths:
-            self.engine.move_paths(self.current_page, self.sel_paths, dx, dy, group=group)
+            self.sel_paths = self.engine.move_paths(self.current_page, self.sel_paths, dx, dy,
+                                                    group=group) or self.sel_paths
             self.after_edit()
             self._on_path_selection()
         elif self.mode == "markup" and self.sel_markup is not None:
@@ -7436,7 +7557,7 @@ class MainWindow(QMainWindow, MarkupMixin, FindMixin):
             page_num, x, y = self.pending_insert
             exact = self.engine.insert_text_new(
                 page_num, x, y, new_text,
-                fontsize=self.spin_size.value(),
+                fontsize=self._size_val(),
                 color_rgb=self.selected_color or (0, 0, 0),
                 font_hint=font_choice or "Arial",
                 bold=self.chk_bold.isChecked(),
@@ -7458,7 +7579,7 @@ class MainWindow(QMainWindow, MarkupMixin, FindMixin):
         new_text = self.txt_new.toPlainText()
         exact = self.engine.apply_edit(
             span, new_text,
-            new_size=self.spin_size.value(),
+            new_size=self._size_val(),
             color_rgb=self.selected_color,
             force_bold=self.chk_bold.isChecked(),
             autofit=self.chk_autofit.isChecked(),

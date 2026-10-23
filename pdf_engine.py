@@ -14,6 +14,7 @@ import math
 import tempfile
 import time
 import fitz  # PyMuPDF
+import pdf_content
 from font_resolver import resolve_font_path, font_file_exists, detect_style
 from pdf_content import (remove_text_at, remove_texts_each, ensure_wrapped, text_blend_at,
                          text_blends_at, add_resource)
@@ -916,6 +917,14 @@ class PDFEditor:
         if len(lines) < 2:
             return None
         lines.sort(key=yv)
+        if mode == "left" and len(lines) >= 3:
+            # IKI YANA YASLI: sag uclar da hizali (son satir ve paragraf sonlari haric): satirlarin en az
+            # %60'i (en az 2) sag kenarda bitiyorsa. Sola yasli metinde satirlar bu kadar esit bitmez.
+            right = max(ext(l)[1] for l in lines)
+            body = lines[:-1]
+            full = [l for l in body if right - ext(l)[1] <= 1.5]
+            if len(full) >= 2 and len(full) >= 0.6 * len(body):
+                mode = "justify"
         return Block(lines, mode)
 
     @staticmethod
@@ -1057,6 +1066,56 @@ class PDFEditor:
         if blend:
             self._apply_blend(page, blend, overlay)
 
+    JUSTIFY_GAP = 0.55      # iki yana yaslamada kelime arasina eklenebilecek en cok bosluk (x yazi boyu)
+
+    @staticmethod
+    def justified_rows(lines, widths, ref_width, max_gap=None):
+        """Iki yana yaslanacak satirlar (indis kumesi). Yaslanmaz: son satir, paragraf sonu (sonraki
+        satir bos), tek kelimelik satir, KISA satir (dogal genisligi kutunun %80'inden az: ozgunde de
+        paragraf sonuydu), kutuya zaten sigmayan satir ve kelime araliklari max_gap'ten FAZLA acilacak
+        satir. MuPDF iki kelime arasindaki FAZLA bosluk yazi boyunun 0,6 katini gecince satiri boluyor
+        (yazi tipinden bagimsiz, olculdu); bolunen paragraf dagiliyor, sonraki duzenlemede tek kelime
+        secilip ayni yazi komutundaki komsulari da siliniyordu (kullanici, e-Arsiv faturasi 2026-10-23).
+        Cagiranlar max_gap = 0,55 x yazi boyu verir. widths / ref_width / max_gap ayni birimde."""
+        if not ref_width:
+            return set()
+        out = set()
+        for i, (ln, w) in enumerate(zip(lines, widths)):
+            if i + 1 >= len(lines) or not lines[i + 1].strip() or " " not in ln.strip():
+                continue
+            if not 0.8 * ref_width <= w < ref_width:
+                continue
+            if max_gap and (ref_width - w) / max(1, ln.strip().count(" ")) > max_gap:
+                continue
+            out.add(i)
+        return out
+
+    @staticmethod
+    def _justify_line(tw, x, y, line, w, ref_width, font_obj, size, track, stretch):
+        """Satiri kutunun iki kenarina yasla: kelime aralari esit acilir (artan pay yatay olcekten
+        ONCE: yazi origin cevresinde stretch kadar olceklenir)."""
+        body = line.strip()
+        lead = line[:len(line) - len(line.lstrip())]
+        gap = (ref_width - w) / stretch / max(1, body.count(" "))
+        x += font_obj.text_length(lead, fontsize=size) * track
+        tracked = abs(track - 1.0) > 1e-3
+        words = body.split(" ")
+        for j, part in enumerate(words):
+            # Kelime GERCEK bosluk karakteriyle birlikte yazilir, yalniz FAZLA aralik konumla verilir.
+            # Bosluk yazilmayinca PDF okuyucusu araliga kendisi bosluk uyduruyor ve her birini ayri parca
+            # sayiyordu: satir kelimelere bolunuyor, paragraf dagiliyordu.
+            piece = part + (" " if j + 1 < len(words) else "")
+            if piece:
+                if tracked:
+                    for ch in piece:
+                        tw.append((x, y), ch, font=font_obj, fontsize=size)
+                        x += font_obj.text_length(ch, fontsize=size) * track
+                else:
+                    tw.append((x, y), piece, font=font_obj, fontsize=size)
+                    x += font_obj.text_length(piece, fontsize=size)
+            if j + 1 < len(words):
+                x += gap
+
     @staticmethod
     def _append_lines(tw, origin, text, font_obj, size, line_spacing=1.2, align="left", ref_width=None,
                       track=1.0, stretch=1.0):
@@ -1068,9 +1127,17 @@ class PDFEditor:
         lh = size * line_spacing
         any_ = False
         tracked = abs(track - 1.0) > 1e-3
-        for k, line in enumerate(text.split("\n")):
+        rows = text.split("\n")
+        just = PDFEditor.justified_rows(
+            rows, [font_obj.text_length(r, fontsize=size) * track * stretch for r in rows], ref_width,
+            PDFEditor.JUSTIFY_GAP * size * min(1.0, stretch)) if align == "justify" else set()
+        for k, line in enumerate(rows):
             if line.strip():
                 w = font_obj.text_length(line, fontsize=size) * track * stretch
+                if k in just:
+                    PDFEditor._justify_line(tw, ox, oy + k * lh, line, w, ref_width, font_obj, size, track, stretch)
+                    any_ = True
+                    continue
                 if align == "center":
                     off = ((ref_width - w) / 2) if ref_width is not None else -w / 2
                 elif align == "right":
@@ -1106,6 +1173,11 @@ class PDFEditor:
             return None
         lh = size * line_spacing
         widths = [font_obj.text_length(l, fontsize=size) * track * stretch if l.strip() else 0.0 for l in lines]
+        just = PDFEditor.justified_rows(lines, widths, ref_width, PDFEditor.JUSTIFY_GAP * size
+                                        * min(1.0, stretch)) if align == "justify" else set()
+        nat = list(widths)
+        for i in just:
+            widths[i] = ref_width
         offs = []
         for w in widths:
             if align == "center":
@@ -1144,6 +1216,9 @@ class PDFEditor:
             tw = fitz.TextWriter(pg.rect)
             tracked = abs(track - 1.0) > 1e-3
             for k, (l, off) in enumerate(zip(lines, offs)):
+                if k in just:
+                    PDFEditor._justify_line(tw, ox, oy + k * lh, l, nat[k], ref_width, font_obj, size, track, stretch)
+                    continue
                 if l.strip():
                     x = ox + off / stretch
                     if tracked:                            # (_append_lines ile ayni kural)
@@ -1292,7 +1367,10 @@ class PDFEditor:
         return exact
 
     # ---------- yaziyi GORUNUMUNU BOZMADAN yeniden yazma (tasima / cogaltma) ----------
-    KEEP_TOL = 0.025     # dogal genislik gercekten bu orandan fazla sapiyorsa harf harf yazilir
+    # Dogal genislik bu orandan fazla sapiyorsa ozgun harf araligi / yatay olcek korunur. 0,025'ti: tarayici
+    # (HiQPdf) ciktisinda yazi Tahoma'nin dogal araligindan %2,2 sikti, esigin altinda kalip duzenlenince
+    # %2,2 genis yaziliyordu (kullanici, 2026-10-23). Olcum hatasi ~%1: 0,015 hala ustunde.
+    KEEP_TOL = 0.015
 
     def _span_chars(self, span):
         """Yazinin harfleri ve her birinin sayfadaki taban noktasi: [(harf, x, y)]; bulunamazsa None.
@@ -1485,6 +1563,11 @@ class PDFEditor:
             k, how = self._look(max(lines, key=lambda ln: len(ln.text.strip())), font_obj)
             if how is None:
                 return 1.0, 1.0, 1.0
+            if abs(k - 1.0) < 0.02:
+                # (boy olcumu murekkepten, ~1 piksel cozunurlukte: %2'nin altindaki fark gurultu - k = 1, genislik
+                #  harf araligiyla tutturulur. Yoksa duzenlenen yazinin kayitli puntosu degisip kutuda 7,6 -> 7,7
+                #  gorunuyordu, harfler ayni boyda kaldigi halde - e-Arsiv faturasi 2026-10-23)
+                k = 1.0
             if how == "chars":
                 ln = lines[0] if len(lines) == 1 else None
                 f = self._track_of(font_obj, ln.text, ln.size, real, nat, k) if ln is not None else real / (nat * k)
@@ -2049,7 +2132,52 @@ class PDFEditor:
             self._path_cache[page_num] = pdf_paths.parse_paths(self.doc, page)
         return self._path_cache[page_num]
 
+    def open_forms(self, page_num):
+        """ZARFI AC (bkz. pdf_content.inline_forms): sayfanin cizimleri bir formun icindeyse (HTML -> PDF
+        araclari: HiQPdf e-Arsiv faturasi) icerik sayfa akisina acilir ki cizgiler secilip
+        duzenlenebilsin. Yalniz cizim araclari bir cizime dokununca cagrilir (tikla / kutu / tumunu
+        sec / yapisma). Gorunum DEGISMEZ: once / sonra dusuk cozunurlukte karsilastirilir, en kucuk
+        fark cikarsa geri alinir. Geri al adimi ve "kaydedilmedi" isareti olusturmaz (gorunur bir
+        degisiklik yok; sonraki duzenleme kendi adimini alir). Sayfa ve belge surumu basina bir kez
+        denenir. -> acildi mi"""
+        seen = self.__dict__.setdefault("_forms_seen", {})
+        ver = getattr(self, "version", 0)
+        if not self.doc or seen.get(page_num) == ver:
+            return False
+        seen[page_num] = ver
+        page = self.doc[page_num]
+        try:
+            if not any(inv == 0 for _x, _n, inv, _b in page.get_xobjects()):
+                return False
+            xref = pdf_content.single_stream(self.doc, page)
+            if xref is None:
+                return False
+            old = self.doc.xref_stream(xref)
+            m = fitz.Matrix(0.4, 0.4)
+            before = page.get_pixmap(matrix=m, alpha=False).samples
+            n = 0
+            for _ in range(4):                         # (ic ice zarf: her turda bir kat acilir)
+                k = pdf_content.inline_forms(self.doc, self.doc[page_num])
+                if not k:
+                    break
+                n += k
+        except Exception:
+            return False
+        if not n:
+            return False
+        try:
+            after = self.doc[page_num].get_pixmap(matrix=m, alpha=False).samples
+        except Exception:
+            after = None
+        if after != before:                            # (gorunum degisti: geri al, dokunma)
+            self.doc.update_stream(xref, old)
+            return False
+        self._invalidate()
+        seen[page_num] = self.version
+        return True
+
     def path_at(self, page_num, x, y, tol=3.0):
+        self.open_forms(page_num)
         page = self.doc[page_num]
         return pdf_paths.hit_test(self.get_paths(page_num), (x, y), tol,
                                   page.rect * page.derotation_matrix)
@@ -2145,6 +2273,7 @@ class PDFEditor:
             return None
 
     def paths_in_rect(self, page_num, rect, touch=False):
+        self.open_forms(page_num)
         return pdf_paths.items_in_rect(self.get_paths(page_num), rect, touch)
 
     def paths_by_index(self, page_num, indices):
@@ -2165,16 +2294,43 @@ class PDFEditor:
         return st
 
     def transform_paths(self, page_num, indices, matrix, group=None):
-        """Secili cizimleri sayfa uzayinda matrix ile donusturur (tasima,
-        olcekleme). Sira numaralari (indeks) degismez."""
+        """Secili cizimleri sayfa uzayinda matrix ile donusturur (tasima, olcekleme). Cizim kendi yerinde
+        yeniden yazilir; sira numarasi degismez. ISTISNA: yeni yeri cizimin KIRPMA ALANININ disina
+        tasiyorsa (HTML -> PDF faturasinda sayfanin alt yarisi, hucresi kirpilan tablolar) yerinde
+        kalsa kirpilip gorunmez olurdu (kullanici: "cizgiyi asagi kaydiriyorum, yok oluyor"): o cizim
+        silinir, AYNI gorunumle sayfanin sonuna (kirpmanin disina) yeniden cizilir - en ust katmana gecer.
+        -> secimin yeni sira numaralari (indices ile ayni sirada)."""
         items = self.paths_by_index(page_num, indices)
         if not items:
-            return
+            return list(indices)
         self._push_undo(group)
-        pdf_paths.transform_items(self.doc, self.doc[page_num], items, matrix)
+        page = self.doc[page_num]
+        A = fitz.Matrix(matrix)
+        out_of = []
+        for it in items:
+            if it.clip is not None and (it.bbox.width > 0 or it.bbox.height > 0):   # (yatay cizginin yuksekligi 0)
+                nb = fitz.Rect(it.bbox) * A
+                c = fitz.Rect(it.clip) + (-0.5, -0.5, 0.5, 0.5)
+                if not (c.contains(nb.tl) and c.contains(nb.br)):
+                    out_of.append(it)
+        looks = {it.index: pdf_paths.drawing_of(page, it) for it in out_of}
+        if not out_of or any(v is None for v in looks.values()):
+            # (kirpma disina cikmiyor ya da gorunumu okunamadi: yerinde donustur - eski davranis)
+            pdf_paths.transform_items(self.doc, page, items, A)
+            return list(indices)
+        moved = {it.index for it in out_of}
+        pdf_paths.transform_and_drop(self.doc, page, [it for it in items if it.index not in moved], A, out_of)
+        page = self.doc[page_num]
+        for it in sorted(out_of, key=lambda it: it.index):
+            pdf_paths.redraw(page, looks[it.index], A)
+        self._invalidate()
+        n = len(self.get_paths(page_num))
+        gone = sorted(moved)
+        tail = {idx: n - len(gone) + k for k, idx in enumerate(gone)}
+        return [tail[i] if i in tail else i - sum(1 for g in gone if g < i) for i in indices]
 
     def move_paths(self, page_num, indices, dx, dy, group=None):
-        self.transform_paths(page_num, indices, fitz.Matrix(1, 0, 0, 1, dx, dy), group)
+        return self.transform_paths(page_num, indices, fitz.Matrix(1, 0, 0, 1, dx, dy), group)
 
     def scale_paths(self, page_num, indices, old_bbox, new_bbox):
         """Secimi old_bbox'tan new_bbox'a olcekler (tutamacla boyutlandirma)."""
@@ -2183,7 +2339,7 @@ class PDFEditor:
         sy = n.height / o.height if o.height > 1e-6 else 1.0
         m = fitz.Matrix(1, 0, 0, 1, -o.x0, -o.y0) * fitz.Matrix(sx, 0, 0, sy, 0, 0) \
             * fitz.Matrix(1, 0, 0, 1, n.x0, n.y0)
-        self.transform_paths(page_num, indices, m)
+        return self.transform_paths(page_num, indices, m)
 
     def set_line_points(self, page_num, index, p1, p2, bend=None):
         """Cizginin uclari (ve bukme noktasi: None = duz cizgi)."""

@@ -89,7 +89,7 @@ def _real_cells(boxes):
 def _visible_spans(engine, pno):
     """Aktarilacak yazilar: sayfada gercekten gorunenler (bkz. PDFEditor.visible_spans), egik
     olanlar (filigran) haric."""
-    return [s for s in engine.visible_spans(pno) if not s.rotated]
+    return [s for s in split_at_rules(engine.doc[pno], engine.visible_spans(pno)) if not s.rotated]
 
 
 # ---------------------------------------------------------------- gorunum (boyut, renk, hiza)
@@ -361,6 +361,15 @@ def _picture(doc, xref, width_pt=0.0, height_pt=0.0):
                 and info.get("colorspace") in (1, 3) and info.get("image")):
             return bytes(info["image"])
         if mask is not None:
+            if (mask.width, mask.height) != (pix.width, pix.height):
+                # Maske resimle ayni boyda olmak zorunda degil (PDF'te gecerli; Revora'nin kucultmesi resmi
+                # kucultup maskeyi tam boyda birakiyor): resmin boyuna olceklenir. Yoksa maske uygulanamiyor,
+                # saydam koseler SIYAH cikiyordu (kucultulmus beton raporunun logolari, Word / Excel'e aktar).
+                try:
+                    mask = fitz.Pixmap(mask, pix.width, pix.height, None)
+                except Exception:
+                    mask = None
+        if mask is not None:
             try:
                 pix = fitz.Pixmap(pix, mask)
             except Exception:
@@ -531,12 +540,80 @@ def _fit_size(size, lines, room):
     return min(size, s)
 
 
+def vertical_rules(page):
+    """Sayfadaki DIKEY cizgiler (tablo hucre sinirlari) -> [(x, y0, y1)]: dikey cizgi ya da ince dikey
+    dolgu serit (HTML -> PDF araclari kenarligi boyle cizer)."""
+    out = []
+    try:
+        draws = page.get_drawings()
+    except Exception:
+        return out
+    for d in draws:
+        r = d["rect"]
+        if r.width < 2.5 and r.height > 3:
+            out.append(((r.x0 + r.x1) / 2, r.y0, r.y1))
+            continue
+        for it in d["items"]:
+            if it[0] == "l" and abs(it[1].x - it[2].x) < 0.6 and abs(it[1].y - it[2].y) > 3:
+                out.append(((it[1].x + it[2].x) / 2, min(it[1].y, it[2].y), max(it[1].y, it[2].y)))
+    return out
+
+
+def split_at_rules(page, spans, rules=None):
+    """Ortasindan DIKEY bir hucre cizgisi gecen yazi parcasini cizginin iki yanindan boler. Dar hucrede
+    saga dayali yazi ile yanindaki hucrenin sola dayali yazisi arasi cok kisa olunca MuPDF ikisini TEK
+    yazi okuyor (araya bosluk koyarak): e-Arsiv faturasinda "1Adet" (Miktar) + "1.988,63TL" (Birim
+    Fiyat) tek hucreye dusuyordu. Harf konumlari sayfanin o bolgesinden okunur."""
+    if rules is None:
+        rules = vertical_rules(page)
+    if not rules:
+        return list(spans)
+    from pdf_engine import Span
+    out = []
+    for sp in spans:
+        b = sp.bbox
+        cuts = [] if sp.rotated else sorted({round(x, 2) for x, y0, y1 in rules if b.x0 + 1.0 < x < b.x1 - 1.0
+                                             and min(y1, b.y1) - max(y0, b.y0) > 0.6 * b.height})
+        if not cuts:
+            out.append(sp)
+            continue
+        chars = []
+        try:
+            for blk in page.get_text("rawdict", clip=fitz.Rect(b) + (-0.5, -0.5, 0.5, 0.5))["blocks"]:
+                for ln in blk.get("lines", []):
+                    for s2 in ln["spans"]:
+                        for c in s2["chars"]:
+                            if abs(c["origin"][1] - sp.origin[1]) < 0.6:
+                                chars.append(c)
+        except Exception:
+            chars = []
+        if not chars:
+            out.append(sp)
+            continue
+        chars.sort(key=lambda c: c["origin"][0])
+        bounds = [b.x0 - 1.0] + cuts + [b.x1 + 1.0]
+        made = []
+        for i in range(len(bounds) - 1):
+            grp = [c for c in chars if bounds[i] <= (c["bbox"][0] + c["bbox"][2]) / 2 < bounds[i + 1]]
+            text = "".join(c["c"] for c in grp)
+            if not text.strip():
+                continue
+            r = fitz.Rect(grp[0]["bbox"])
+            for c in grp[1:]:
+                r |= fitz.Rect(c["bbox"])
+            made.append(Span(text, r, sp.font, sp.size, sp.color, sp.page_num,
+                             (grp[0]["origin"][0], sp.origin[1]), sp.direction, sp.alpha, sp.flags,
+                             sp.ascender, sp.descender))
+        out.extend(made if len(made) > 1 else [sp])
+    return out
+
+
 def split_rotated(engine, pno):
     """Gorunen yazilar -> (duz, dikey, aktarilmayan). Dikey: saga / sola TAM 90 derece donmus, opak
     yazi (tablo yan basligi, kenar notu). Aktarilmayan: egik ya da yari saydam donuk yazi (filigran)
     ve bas asagi (180 derece) yazi - Excel hucresinde karsiligi yok."""
     flat, vert, skipped = [], [], []
-    for sp in engine.visible_spans(pno):
+    for sp in split_at_rules(engine.doc[pno], engine.visible_spans(pno)):
         if not sp.rotated:
             flat.append(sp)
             continue
